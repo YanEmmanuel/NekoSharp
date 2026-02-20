@@ -168,19 +168,19 @@ internal static class Program
         sb.AppendLine();
         sb.AppendLine("    public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)");
         sb.AppendLine("    {");
-        sb.AppendLine("         
+        sb.AppendLine("        // TODO: Implement manga metadata scraping");
         sb.AppendLine($"        return Task.FromResult(new Manga {{ Name = \"{siteName}\" }});");
         sb.AppendLine("    }");
         sb.AppendLine();
         sb.AppendLine("    public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)");
         sb.AppendLine("    {");
-        sb.AppendLine("         
+        sb.AppendLine("        // TODO: Implement chapter list scraping");
         sb.AppendLine("        return Task.FromResult(new List<Chapter>());");
         sb.AppendLine("    }");
         sb.AppendLine();
         sb.AppendLine("    public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)");
         sb.AppendLine("    {");
-        sb.AppendLine("         
+        sb.AppendLine("        // TODO: Implement page image scraping");
         sb.AppendLine("        return Task.FromResult(new List<Page>());");
         sb.AppendLine("    }");
         sb.AppendLine("}");

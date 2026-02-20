@@ -59,7 +59,7 @@ public class DownloadService : IDownloadService
         };
 
         client.DefaultRequestHeaders.Add("User-Agent", UserAgentProvider.Default);
-        client.DefaultRequestHeaders.Add("Accept", "image/avif,image/webp,image/apng,image *;q=0.8");
+        client.DefaultRequestHeaders.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
         client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
 
         return client;

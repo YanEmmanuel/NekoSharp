@@ -969,7 +969,7 @@ public class MainWindow
 
                 using var request = new HttpRequestMessage(HttpMethod.Get, url);
                 request.Headers.Add("Referer", referer);
-                request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image *;q=0.8");
+                request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
 
                 using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
                 response.EnsureSuccessStatusCode();
