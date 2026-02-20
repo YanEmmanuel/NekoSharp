@@ -337,8 +337,291 @@ public class MainWindow
 
         group.Add(imageFormatRow);
 
+        var compressionRow = Adw.ActionRow.New();
+        compressionRow.SetTitle("Compressão da Imagem");
+        compressionRow.SetSubtitle("0% = sem compressão, 100% = compressão máxima");
+
+        var compressionSpin = Gtk.SpinButton.NewWithRange(0, 100, 1);
+        compressionSpin.SetNumeric(true);
+        compressionSpin.SetValue(_vm.ImageCompressionPercent);
+        compressionSpin.OnValueChanged += (_, _) =>
+        {
+            _vm.ImageCompressionPercent = compressionSpin.GetValueAsInt();
+        };
+        compressionRow.AddSuffix(compressionSpin);
+        compressionRow.SetActivatable(false);
+        group.Add(compressionRow);
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(_vm.ImageCompressionPercent))
+            {
+                var val = _vm.ImageCompressionPercent;
+                if (compressionSpin.GetValueAsInt() != val)
+                    compressionSpin.SetValue(val);
+            }
+        };
+
+        // ── Concurrent chapter downloads ──
+        var concurrentRow = Adw.ActionRow.New();
+        concurrentRow.SetTitle("Downloads Simultâneos");
+        concurrentRow.SetSubtitle("Quantidade de capítulos baixados ao mesmo tempo (1-10). Padrão: 3");
+        var concurrentSpin = Gtk.SpinButton.NewWithRange(1, 10, 1);
+        concurrentSpin.SetNumeric(true);
+        concurrentSpin.SetValue(_vm.MaxConcurrentChapters);
+        concurrentSpin.OnValueChanged += (_, _) =>
+        {
+            _vm.MaxConcurrentChapters = concurrentSpin.GetValueAsInt();
+        };
+        concurrentRow.AddSuffix(concurrentSpin);
+        concurrentRow.SetActivatable(false);
+        group.Add(concurrentRow);
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(_vm.MaxConcurrentChapters))
+            {
+                var val = _vm.MaxConcurrentChapters;
+                if (concurrentSpin.GetValueAsInt() != val)
+                    concurrentSpin.SetValue(val);
+            }
+        };
+
         page.Add(group);
+
+        // ── SmartStitch Settings Group ──
+        page.Add(BuildSmartStitchSettingsGroup());
+
         return page;
+    }
+
+    private Adw.PreferencesGroup BuildSmartStitchSettingsGroup()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("SmartStitch");
+        group.SetDescription("Pós-processamento: junta páginas verticalmente e recorta em painéis inteligentes. Desativado por padrão.");
+
+        // ── Enable switch ──
+        var enableRow = Adw.ActionRow.New();
+        enableRow.SetTitle("Ativar SmartStitch");
+        enableRow.SetSubtitle("Após o download, as imagens serão unidas e recortadas automaticamente");
+        var enableSwitch = Gtk.Switch.New();
+        enableSwitch.SetValign(Gtk.Align.Center);
+        enableSwitch.SetActive(_vm.SmartStitchEnabled);
+        enableSwitch.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "active")
+                _vm.SmartStitchEnabled = enableSwitch.GetActive();
+        };
+        enableRow.AddSuffix(enableSwitch);
+        enableRow.SetActivatableWidget(enableSwitch);
+        group.Add(enableRow);
+
+        // Container for all SmartStitch sub-settings (hidden when disabled)
+        var detailRows = new List<Adw.ActionRow>();
+
+        // ── Split Height ──
+        var splitHeightRow = Adw.ActionRow.New();
+        splitHeightRow.SetTitle("Altura de Corte (px)");
+        splitHeightRow.SetSubtitle("Altura aproximada de cada painel de saída. Padrão: 5000");
+        var splitHeightSpin = Gtk.SpinButton.NewWithRange(100, 50000, 100);
+        splitHeightSpin.SetNumeric(true);
+        splitHeightSpin.SetValue(_vm.SmartStitchSplitHeight);
+        splitHeightSpin.OnValueChanged += (_, _) => _vm.SmartStitchSplitHeight = splitHeightSpin.GetValueAsInt();
+        splitHeightRow.AddSuffix(splitHeightSpin);
+        splitHeightRow.SetActivatable(false);
+        group.Add(splitHeightRow);
+        detailRows.Add(splitHeightRow);
+
+        // ── Detector Type ──
+        var detectorRow = Adw.ComboRow.New();
+        detectorRow.SetTitle("Tipo de Detector");
+        detectorRow.SetSubtitle("Pixel Comparison evita cortar por falas/SFX; Direto corta exatamente");
+        var detectorModel = Gtk.StringList.New(new[] { "Direto (sem detecção)", "Smart Pixel Comparison" });
+        detectorRow.SetModel(detectorModel);
+        detectorRow.SetSelected((uint)_vm.SmartStitchDetectorType);
+        detectorRow.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "selected")
+                _vm.SmartStitchDetectorType = (StitchDetectorType)detectorRow.GetSelected();
+        };
+        group.Add(detectorRow);
+        // detectorRow is always visible when SS is enabled
+
+        // ── Sensitivity ──
+        var sensitivityRow = Adw.ActionRow.New();
+        sensitivityRow.SetTitle("Sensibilidade (%)");
+        sensitivityRow.SetSubtitle("0 = corta em qualquer lugar, 100 = exige pixels idênticos. Padrão: 90");
+        var sensitivitySpin = Gtk.SpinButton.NewWithRange(0, 100, 1);
+        sensitivitySpin.SetNumeric(true);
+        sensitivitySpin.SetValue(_vm.SmartStitchSensitivity);
+        sensitivitySpin.OnValueChanged += (_, _) => _vm.SmartStitchSensitivity = sensitivitySpin.GetValueAsInt();
+        sensitivityRow.AddSuffix(sensitivitySpin);
+        sensitivityRow.SetActivatable(false);
+        group.Add(sensitivityRow);
+        detailRows.Add(sensitivityRow);
+
+        // ── Scan Step ──
+        var scanStepRow = Adw.ActionRow.New();
+        scanStepRow.SetTitle("Scan Step (px)");
+        scanStepRow.SetSubtitle("Passo de busca quando a linha atual não pode ser cortada. Padrão: 5");
+        var scanStepSpin = Gtk.SpinButton.NewWithRange(1, 100, 1);
+        scanStepSpin.SetNumeric(true);
+        scanStepSpin.SetValue(_vm.SmartStitchScanStep);
+        scanStepSpin.OnValueChanged += (_, _) => _vm.SmartStitchScanStep = scanStepSpin.GetValueAsInt();
+        scanStepRow.AddSuffix(scanStepSpin);
+        scanStepRow.SetActivatable(false);
+        group.Add(scanStepRow);
+        detailRows.Add(scanStepRow);
+
+        // ── Ignorable Pixels ──
+        var ignorableRow = Adw.ActionRow.New();
+        ignorableRow.SetTitle("Margem Ignorável (px)");
+        ignorableRow.SetSubtitle("Pixels na borda a ignorar durante detecção. Padrão: 0");
+        var ignorableSpin = Gtk.SpinButton.NewWithRange(0, 500, 1);
+        ignorableSpin.SetNumeric(true);
+        ignorableSpin.SetValue(_vm.SmartStitchIgnorablePixels);
+        ignorableSpin.OnValueChanged += (_, _) => _vm.SmartStitchIgnorablePixels = ignorableSpin.GetValueAsInt();
+        ignorableRow.AddSuffix(ignorableSpin);
+        ignorableRow.SetActivatable(false);
+        group.Add(ignorableRow);
+        detailRows.Add(ignorableRow);
+
+        // ── Width Enforcement ──
+        var widthEnfRow = Adw.ComboRow.New();
+        widthEnfRow.SetTitle("Forçar Largura");
+        widthEnfRow.SetSubtitle("Nenhum mantém original, Automático usa a menor largura, Manual define um valor");
+        var widthEnfModel = Gtk.StringList.New(new[] { "Nenhum", "Automático", "Manual" });
+        widthEnfRow.SetModel(widthEnfModel);
+        widthEnfRow.SetSelected((uint)_vm.SmartStitchWidthEnforcement);
+        widthEnfRow.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "selected")
+                _vm.SmartStitchWidthEnforcement = (StitchWidthEnforcement)widthEnfRow.GetSelected();
+        };
+        group.Add(widthEnfRow);
+        detailRows.Add(widthEnfRow);
+
+        // ── Custom Width ──
+        var customWidthRow = Adw.ActionRow.New();
+        customWidthRow.SetTitle("Largura Customizada (px)");
+        customWidthRow.SetSubtitle("Usado quando 'Forçar Largura' está em Manual. Padrão: 720");
+        var customWidthSpin = Gtk.SpinButton.NewWithRange(1, 10000, 10);
+        customWidthSpin.SetNumeric(true);
+        customWidthSpin.SetValue(_vm.SmartStitchCustomWidth);
+        customWidthSpin.OnValueChanged += (_, _) => _vm.SmartStitchCustomWidth = customWidthSpin.GetValueAsInt();
+        customWidthRow.AddSuffix(customWidthSpin);
+        customWidthRow.SetActivatable(false);
+        group.Add(customWidthRow);
+        detailRows.Add(customWidthRow);
+
+        // ── Output Format ──
+        var outFmtRow = Adw.ComboRow.New();
+        outFmtRow.SetTitle("Formato de Saída (Stitch)");
+        outFmtRow.SetSubtitle("Formato das imagens recortadas pelo SmartStitch");
+        var outFmtModel = Gtk.StringList.New(new[] { "Original", "JPEG", "PNG", "WebP" });
+        outFmtRow.SetModel(outFmtModel);
+        outFmtRow.SetSelected((uint)_vm.SmartStitchOutputFormat);
+        outFmtRow.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "selected")
+                _vm.SmartStitchOutputFormat = (ImageFormat)outFmtRow.GetSelected();
+        };
+        group.Add(outFmtRow);
+        detailRows.Add(outFmtRow);
+
+        // ── Lossy Quality ──
+        var lossyRow = Adw.ActionRow.New();
+        lossyRow.SetTitle("Qualidade (Lossy)");
+        lossyRow.SetSubtitle("Qualidade para JPEG/WebP. 1-100. Padrão: 100");
+        var lossySpin = Gtk.SpinButton.NewWithRange(1, 100, 1);
+        lossySpin.SetNumeric(true);
+        lossySpin.SetValue(_vm.SmartStitchLossyQuality);
+        lossySpin.OnValueChanged += (_, _) => _vm.SmartStitchLossyQuality = lossySpin.GetValueAsInt();
+        lossyRow.AddSuffix(lossySpin);
+        lossyRow.SetActivatable(false);
+        group.Add(lossyRow);
+        detailRows.Add(lossyRow);
+
+        // ── Visibility logic: show/hide sub-rows based on enabled state ──
+        void UpdateSmartStitchVisibility()
+        {
+            var enabled = _vm.SmartStitchEnabled;
+            foreach (var row in detailRows)
+                row.SetVisible(enabled);
+
+            // Custom width only visible when enforcement = Manual
+            customWidthRow.SetVisible(enabled && _vm.SmartStitchWidthEnforcement == StitchWidthEnforcement.Manual);
+
+            // Sensitivity/ScanStep/Ignorable only relevant for PixelComparison
+            var isPixel = _vm.SmartStitchDetectorType == StitchDetectorType.PixelComparison;
+            sensitivityRow.SetVisible(enabled && isPixel);
+            scanStepRow.SetVisible(enabled && isPixel);
+            ignorableRow.SetVisible(enabled && isPixel);
+
+            // Lossy quality only relevant for JPEG/WebP
+            var isLossy = _vm.SmartStitchOutputFormat == ImageFormat.Jpeg ||
+                          _vm.SmartStitchOutputFormat == ImageFormat.WebP;
+            lossyRow.SetVisible(enabled && isLossy);
+        }
+
+        UpdateSmartStitchVisibility();
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            switch (args.PropertyName)
+            {
+                case nameof(_vm.SmartStitchEnabled):
+                    if (enableSwitch.GetActive() != _vm.SmartStitchEnabled)
+                        enableSwitch.SetActive(_vm.SmartStitchEnabled);
+                    UpdateSmartStitchVisibility();
+                    break;
+                case nameof(_vm.SmartStitchSplitHeight):
+                    if (splitHeightSpin.GetValueAsInt() != _vm.SmartStitchSplitHeight)
+                        splitHeightSpin.SetValue(_vm.SmartStitchSplitHeight);
+                    break;
+                case nameof(_vm.SmartStitchDetectorType):
+                    var dtVal = (uint)_vm.SmartStitchDetectorType;
+                    if (detectorRow.GetSelected() != dtVal)
+                        detectorRow.SetSelected(dtVal);
+                    UpdateSmartStitchVisibility();
+                    break;
+                case nameof(_vm.SmartStitchSensitivity):
+                    if (sensitivitySpin.GetValueAsInt() != _vm.SmartStitchSensitivity)
+                        sensitivitySpin.SetValue(_vm.SmartStitchSensitivity);
+                    break;
+                case nameof(_vm.SmartStitchScanStep):
+                    if (scanStepSpin.GetValueAsInt() != _vm.SmartStitchScanStep)
+                        scanStepSpin.SetValue(_vm.SmartStitchScanStep);
+                    break;
+                case nameof(_vm.SmartStitchIgnorablePixels):
+                    if (ignorableSpin.GetValueAsInt() != _vm.SmartStitchIgnorablePixels)
+                        ignorableSpin.SetValue(_vm.SmartStitchIgnorablePixels);
+                    break;
+                case nameof(_vm.SmartStitchWidthEnforcement):
+                    var weVal = (uint)_vm.SmartStitchWidthEnforcement;
+                    if (widthEnfRow.GetSelected() != weVal)
+                        widthEnfRow.SetSelected(weVal);
+                    UpdateSmartStitchVisibility();
+                    break;
+                case nameof(_vm.SmartStitchCustomWidth):
+                    if (customWidthSpin.GetValueAsInt() != _vm.SmartStitchCustomWidth)
+                        customWidthSpin.SetValue(_vm.SmartStitchCustomWidth);
+                    break;
+                case nameof(_vm.SmartStitchOutputFormat):
+                    var ofVal = (uint)_vm.SmartStitchOutputFormat;
+                    if (outFmtRow.GetSelected() != ofVal)
+                        outFmtRow.SetSelected(ofVal);
+                    UpdateSmartStitchVisibility();
+                    break;
+                case nameof(_vm.SmartStitchLossyQuality):
+                    if (lossySpin.GetValueAsInt() != _vm.SmartStitchLossyQuality)
+                        lossySpin.SetValue(_vm.SmartStitchLossyQuality);
+                    break;
+            }
+        };
+
+        return group;
     }
 
     private Gtk.Widget BuildContentArea()
@@ -890,11 +1173,24 @@ public class MainWindow
                 break;
             case nameof(ChapterViewModel.DownloadStatus):
                 UpdateChapterStatusCssClass(widgets.StatusLabel, chapterVm.DownloadStatus);
-                 
-                widgets.ProgressBar.SetVisible(chapterVm.DownloadStatus == ChapterDownloadStatus.Downloading);
+                widgets.ProgressBar.SetVisible(
+                    chapterVm.DownloadStatus == ChapterDownloadStatus.Downloading ||
+                    chapterVm.DownloadStatus == ChapterDownloadStatus.Stitching);
                 break;
             case nameof(ChapterViewModel.DownloadProgress):
                 widgets.ProgressBar.SetFraction(chapterVm.DownloadProgress / 100.0);
+                break;
+            case nameof(ChapterViewModel.IsStitching):
+                if (chapterVm.IsStitching)
+                {
+                    widgets.ProgressBar.AddCssClass("stitching-progress");
+                    widgets.ProgressBar.SetVisible(true);
+                    widgets.ProgressBar.Pulse();
+                }
+                else
+                {
+                    widgets.ProgressBar.RemoveCssClass("stitching-progress");
+                }
                 break;
             case nameof(ChapterViewModel.IsSelected):
                 widgets.CheckButton.SetActive(chapterVm.IsSelected);
@@ -909,10 +1205,12 @@ public class MainWindow
         label.RemoveCssClass("success-text");
         label.RemoveCssClass("error-text");
         label.RemoveCssClass("warning-text");
+        label.RemoveCssClass("stitching-text");
 
         switch (status)
         {
             case ChapterDownloadStatus.Downloading: label.AddCssClass("accent-text"); break;
+            case ChapterDownloadStatus.Stitching: label.AddCssClass("stitching-text"); break;
             case ChapterDownloadStatus.Completed: label.AddCssClass("success-text"); break;
             case ChapterDownloadStatus.Failed: label.AddCssClass("error-text"); break;
             case ChapterDownloadStatus.Queued: label.AddCssClass("dim-label"); break;

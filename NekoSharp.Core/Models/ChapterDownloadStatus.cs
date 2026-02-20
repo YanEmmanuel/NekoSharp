@@ -4,6 +4,7 @@ public enum ChapterDownloadStatus
 {
     Queued,
     Downloading,
+    Stitching,
     Completed,
     Failed
 }

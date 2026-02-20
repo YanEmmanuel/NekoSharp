@@ -62,29 +62,39 @@ public class LogWindow : Adw.Window
 
     private void OnLogEntriesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        GLib.Functions.IdleAdd(0, () =>
+        // CollectionChanged already fires on the GTK main thread (dispatched by ViewModel's IdleAdd).
+        // No need for another IdleAdd — doing so causes double-dispatch timing issues.
+        switch (e.Action)
         {
-            switch (e.Action)
-            {
-                case NotifyCollectionChangedAction.Add:
-                    if (e.NewItems != null)
-                    {
-                        foreach (LogEntryViewModel logVm in e.NewItems)
-                            AddLogEntryWidget(logVm);
-                    }
-                    break;
+            case NotifyCollectionChangedAction.Add:
+                if (e.NewItems != null)
+                {
+                    foreach (LogEntryViewModel logVm in e.NewItems)
+                        AddLogEntryWidget(logVm);
+                }
+                break;
 
-                case NotifyCollectionChangedAction.Reset:
-                    ClearLogEntryWidgets();
-                    break;
-
-                 
-                default:
+            case NotifyCollectionChangedAction.Remove:
+                // Trimming always removes from index 0 — remove first widget
+                if (e.OldStartingIndex == 0)
+                {
+                    var first = _logEntriesBox.GetFirstChild();
+                    if (first != null) _logEntriesBox.Remove(first);
+                }
+                else
+                {
                     RebuildLogEntries();
-                    break;
-            }
-            return false;
-        });
+                }
+                break;
+
+            case NotifyCollectionChangedAction.Reset:
+                ClearLogEntryWidgets();
+                break;
+
+            default:
+                RebuildLogEntries();
+                break;
+        }
     }
 
     private void AddLogEntryWidget(LogEntryViewModel logVm)

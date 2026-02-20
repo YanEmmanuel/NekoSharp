@@ -47,6 +47,22 @@ public partial class MainWindowViewModel : ObservableObject
      
     [ObservableProperty] private DownloadFormat _downloadFormat = DownloadFormat.FolderImages;
     [ObservableProperty] private ImageFormat _selectedImageFormat = ImageFormat.Original;
+    [ObservableProperty] private int _imageCompressionPercent;
+
+    // SmartStitch settings
+    [ObservableProperty] private bool _smartStitchEnabled;
+    [ObservableProperty] private int _smartStitchSplitHeight = 5000;
+    [ObservableProperty] private StitchDetectorType _smartStitchDetectorType = StitchDetectorType.PixelComparison;
+    [ObservableProperty] private int _smartStitchSensitivity = 90;
+    [ObservableProperty] private int _smartStitchScanStep = 5;
+    [ObservableProperty] private int _smartStitchIgnorablePixels;
+    [ObservableProperty] private StitchWidthEnforcement _smartStitchWidthEnforcement = StitchWidthEnforcement.None;
+    [ObservableProperty] private int _smartStitchCustomWidth = 720;
+    [ObservableProperty] private ImageFormat _smartStitchOutputFormat = ImageFormat.Png;
+    [ObservableProperty] private int _smartStitchLossyQuality = 100;
+
+    // Concurrent chapter downloads (1-10, default 3)
+    [ObservableProperty] private int _maxConcurrentChapters = 3;
 
      
     [ObservableProperty] private bool _isLogPanelOpen;
@@ -93,16 +109,45 @@ public partial class MainWindowViewModel : ObservableObject
         {
             var df = await _settingsStore.GetEnumAsync("Download.Format", DownloadFormat.FolderImages);
             var imfmt = await _settingsStore.GetEnumAsync("Download.ImageFormat", ImageFormat.Original);
+            var compression = await _settingsStore.GetIntAsync("Download.ImageCompressionPercent", 0);
             var outDir = await _settingsStore.GetStringAsync("Download.OutputDirectory");
+
+            // SmartStitch settings
+            var ssEnabled = await _settingsStore.GetBoolAsync(SmartStitchSettings.KeyEnabled, false);
+            var ssSplitHeight = await _settingsStore.GetIntAsync(SmartStitchSettings.KeySplitHeight, 5000);
+            var ssDetector = await _settingsStore.GetEnumAsync(SmartStitchSettings.KeyDetectorType, StitchDetectorType.PixelComparison);
+            var ssSensitivity = await _settingsStore.GetIntAsync(SmartStitchSettings.KeySensitivity, 90);
+            var ssScanStep = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyScanStep, 5);
+            var ssIgnorable = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyIgnorablePixels, 0);
+            var ssWidthEnf = await _settingsStore.GetEnumAsync(SmartStitchSettings.KeyWidthEnforcement, StitchWidthEnforcement.None);
+            var ssCustomW = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyCustomWidth, 720);
+            var ssOutFmt = await _settingsStore.GetEnumAsync(SmartStitchSettings.KeyOutputFormat, ImageFormat.Png);
+            var ssLossyQ = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyLossyQuality, 100);
+            var concChapters = await _settingsStore.GetIntAsync("Download.MaxConcurrentChapters", 3);
 
             GLib.Functions.IdleAdd(0, () =>
             {
                 DownloadFormat = df;
                 SelectedImageFormat = imfmt;
+                ImageCompressionPercent = Math.Clamp(compression, 0, 100);
                 if (!string.IsNullOrEmpty(outDir))
                 {
                     OutputDirectory = outDir;
                 }
+
+                SmartStitchEnabled = ssEnabled;
+                SmartStitchSplitHeight = Math.Max(100, ssSplitHeight);
+                SmartStitchDetectorType = ssDetector;
+                SmartStitchSensitivity = Math.Clamp(ssSensitivity, 0, 100);
+                SmartStitchScanStep = Math.Clamp(ssScanStep, 1, 100);
+                SmartStitchIgnorablePixels = Math.Max(0, ssIgnorable);
+                SmartStitchWidthEnforcement = ssWidthEnf;
+                SmartStitchCustomWidth = Math.Max(1, ssCustomW);
+                SmartStitchOutputFormat = ssOutFmt;
+                SmartStitchLossyQuality = Math.Clamp(ssLossyQ, 1, 100);
+
+                MaxConcurrentChapters = Math.Clamp(concChapters, 1, 10);
+
                 return false;
             });
         }));
@@ -185,6 +230,7 @@ public partial class MainWindowViewModel : ObservableObject
     {
         if (Manga == null) return;
 
+        // These run on the main thread (before first await)
         IsDownloading = true;
         CompletedChapters = 0;
         OverallProgress = 0;
@@ -195,55 +241,96 @@ public partial class MainWindowViewModel : ObservableObject
 
         SetStatus($"Baixando {chaptersToDownload.Count} capítulos...", "info");
 
+        // Capture current settings so they don't change mid-download
+        var manga = Manga;
+        var outputDir = OutputDirectory;
+        var format = DownloadFormat;
+        var totalCount = chaptersToDownload.Count;
+        var completedCount = 0;
+
         try
         {
-            Directory.CreateDirectory(OutputDirectory);
+            Directory.CreateDirectory(outputDir);
 
-            for (int i = 0; i < chaptersToDownload.Count; i++)
+            // Parallel chapter downloads with concurrency limit
+            var semaphore = new SemaphoreSlim(MaxConcurrentChapters);
+            var tasks = chaptersToDownload.Select((chapterVm, index) => Task.Run(async () =>
             {
-                _cts.Token.ThrowIfCancellationRequested();
-
-                var chapterVm = chaptersToDownload[i];
-                chapterVm.SetDownloading();
-
+                await semaphore.WaitAsync(_cts!.Token);
                 try
                 {
-                    var capturedIndex = i;
+                    _cts!.Token.ThrowIfCancellationRequested();
+
+                    // All ViewModel mutations dispatched to GTK main thread
+                    GLib.Functions.IdleAdd(0, () => { chapterVm.SetDownloading(); return false; });
+
                     var progress = new Progress<DownloadProgress>(p =>
                     {
                         GLib.Functions.IdleAdd(0, () =>
                         {
-                            chapterVm.UpdateProgress(p.CurrentPage, p.TotalPages);
-                            UpdateOverallProgress(capturedIndex, chaptersToDownload.Count, p);
+                            chapterVm.UpdateProgress(p);
                             return false;
                         });
                     });
 
                     await _downloadService.DownloadChapterAsync(
-                        Manga, chapterVm.Chapter, OutputDirectory, DownloadFormat, progress, _cts.Token);
+                        manga!, chapterVm.Chapter, outputDir, format, progress, _cts!.Token);
 
-                    chapterVm.SetCompleted();
-                    CompletedChapters = i + 1;
+                    var count = Interlocked.Increment(ref completedCount);
+                    GLib.Functions.IdleAdd(0, () =>
+                    {
+                        chapterVm.SetCompleted();
+                        CompletedChapters = count;
+                        OverallProgress = (double)count / totalCount * 100;
+                        OverallProgressText = $"Cap. {count}/{totalCount}";
+                        return false;
+                    });
                 }
-                catch (OperationCanceledException) { chapterVm.SetFailed("Cancelado"); throw; }
-                catch (Exception ex) { chapterVm.SetFailed(ex.Message); }
-            }
+                catch (OperationCanceledException)
+                {
+                    GLib.Functions.IdleAdd(0, () => { chapterVm.SetFailed("Cancelado"); return false; });
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var msg = ex.Message;
+                    GLib.Functions.IdleAdd(0, () => { chapterVm.SetFailed(msg); return false; });
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, _cts!.Token)).ToList();
 
-            SetStatus($"Download completo! {CompletedChapters}/{chaptersToDownload.Count} capítulos salvos em {OutputDirectory}", "success");
+            try { await Task.WhenAll(tasks); }
+            catch (OperationCanceledException) { throw; }
+            catch { /* individual errors already handled per-chapter */ }
+
+            // After Task.WhenAll we're on thread pool — dispatch UI updates
+            GLib.Functions.IdleAdd(0, () =>
+            {
+                SetStatus($"Download completo! {CompletedChapters}/{totalCount} capítulos salvos em {outputDir}", "success");
+                return false;
+            });
         }
         catch (OperationCanceledException)
         {
-            SetStatus("Download cancelado.", "warning");
+            GLib.Functions.IdleAdd(0, () => { SetStatus("Download cancelado.", "warning"); return false; });
         }
         catch (Exception ex)
         {
-            SetStatus($"Erro no download: {ex.Message}", "error");
+            var msg = ex.Message;
+            GLib.Functions.IdleAdd(0, () => { SetStatus($"Erro no download: {msg}", "error"); return false; });
         }
         finally
         {
-            IsDownloading = false;
-            _cts?.Dispose();
-            _cts = null;
+            GLib.Functions.IdleAdd(0, () =>
+            {
+                IsDownloading = false;
+                _cts?.Dispose();
+                _cts = null;
+                return false;
+            });
         }
     }
 
@@ -288,13 +375,6 @@ public partial class MainWindowViewModel : ObservableObject
         SetStatus("Cole a URL de um mangá e clique em Fetch para começar.", "info");
     }
 
-    private void UpdateOverallProgress(int chapterIndex, int totalChapters, DownloadProgress pageProgress)
-    {
-        var chapterWeight = 100.0 / totalChapters;
-        OverallProgress = chapterIndex * chapterWeight + chapterWeight * (pageProgress.Percentage / 100.0);
-        OverallProgressText = $"Cap. {chapterIndex + 1}/{totalChapters} · Pág. {pageProgress.CurrentPage}/{pageProgress.TotalPages}";
-    }
-
     private void SetStatus(string message, string type)
     {
         StatusMessage = message;
@@ -315,5 +395,80 @@ public partial class MainWindowViewModel : ObservableObject
     partial void OnOutputDirectoryChanged(string value)
     {
         _settingsStore.SetStringAsync("Download.OutputDirectory", value);
+    }
+
+    partial void OnImageCompressionPercentChanged(int value)
+    {
+        var normalized = Math.Clamp(value, 0, 100);
+        if (value != normalized)
+        {
+            ImageCompressionPercent = normalized;
+            return;
+        }
+
+        _settingsStore.SetIntAsync("Download.ImageCompressionPercent", normalized);
+    }
+
+    // ── SmartStitch settings persistence ──
+
+    partial void OnSmartStitchEnabledChanged(bool value)
+        => _settingsStore.SetBoolAsync(SmartStitchSettings.KeyEnabled, value);
+
+    partial void OnSmartStitchSplitHeightChanged(int value)
+    {
+        var v = Math.Max(100, value);
+        if (v != value) { SmartStitchSplitHeight = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeySplitHeight, v);
+    }
+
+    partial void OnSmartStitchDetectorTypeChanged(StitchDetectorType value)
+        => _settingsStore.SetEnumAsync(SmartStitchSettings.KeyDetectorType, value);
+
+    partial void OnSmartStitchSensitivityChanged(int value)
+    {
+        var v = Math.Clamp(value, 0, 100);
+        if (v != value) { SmartStitchSensitivity = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeySensitivity, v);
+    }
+
+    partial void OnSmartStitchScanStepChanged(int value)
+    {
+        var v = Math.Clamp(value, 1, 100);
+        if (v != value) { SmartStitchScanStep = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeyScanStep, v);
+    }
+
+    partial void OnSmartStitchIgnorablePixelsChanged(int value)
+    {
+        var v = Math.Max(0, value);
+        if (v != value) { SmartStitchIgnorablePixels = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeyIgnorablePixels, v);
+    }
+
+    partial void OnSmartStitchWidthEnforcementChanged(StitchWidthEnforcement value)
+        => _settingsStore.SetEnumAsync(SmartStitchSettings.KeyWidthEnforcement, value);
+
+    partial void OnSmartStitchCustomWidthChanged(int value)
+    {
+        var v = Math.Max(1, value);
+        if (v != value) { SmartStitchCustomWidth = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeyCustomWidth, v);
+    }
+
+    partial void OnSmartStitchOutputFormatChanged(ImageFormat value)
+        => _settingsStore.SetEnumAsync(SmartStitchSettings.KeyOutputFormat, value);
+
+    partial void OnSmartStitchLossyQualityChanged(int value)
+    {
+        var v = Math.Clamp(value, 1, 100);
+        if (v != value) { SmartStitchLossyQuality = v; return; }
+        _settingsStore.SetIntAsync(SmartStitchSettings.KeyLossyQuality, v);
+    }
+
+    partial void OnMaxConcurrentChaptersChanged(int value)
+    {
+        var v = Math.Clamp(value, 1, 10);
+        if (v != value) { MaxConcurrentChapters = v; return; }
+        _settingsStore.SetIntAsync("Download.MaxConcurrentChapters", v);
     }
 }

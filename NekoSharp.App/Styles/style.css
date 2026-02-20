@@ -42,8 +42,21 @@
 .error-text { color: @error_color; }
 .warning-text { color: @warning_color; }
 
+.stitching-text {
+    color: #9370DB;
+    font-weight: bold;
+}
+
 .chapter-progress {
     min-width: 100px;
+}
+
+.stitching-progress > trough > progress {
+    background-color: #9370DB;
+}
+
+.stitching-progress {
+    --gtk-accent-bg-color: #9370DB;
 }
 
  

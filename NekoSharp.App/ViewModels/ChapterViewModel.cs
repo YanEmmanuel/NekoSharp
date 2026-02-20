@@ -22,6 +22,9 @@ public partial class ChapterViewModel : ObservableObject
     [ObservableProperty]
     private string _progressText = string.Empty;
 
+    [ObservableProperty]
+    private bool _isStitching;
+
     public string DisplayTitle => string.IsNullOrEmpty(Chapter.Title)
         ? $"Chapter {Chapter.Number}"
         : $"Ch. {Chapter.Number} — {Chapter.Title}";
@@ -31,16 +34,31 @@ public partial class ChapterViewModel : ObservableObject
         Chapter = chapter;
     }
 
-    public void UpdateProgress(int current, int total)
+    public void UpdateProgress(DownloadProgress progress)
     {
-        DownloadProgress = total > 0 ? (double)current / total * 100 : 0;
-        ProgressText = $"{current}/{total}";
+        if (progress.IsStitching)
+        {
+            IsStitching = true;
+            DownloadStatus = ChapterDownloadStatus.Stitching;
+            DownloadProgress = 100;
+            ProgressText = progress.StitchingStatus;
+            Status = progress.StitchingStatus;
+        }
+        else
+        {
+            IsStitching = false;
+            DownloadStatus = ChapterDownloadStatus.Downloading;
+            DownloadProgress = progress.TotalPages > 0 ? (double)progress.CurrentPage / progress.TotalPages * 100 : 0;
+            ProgressText = $"{progress.CurrentPage}/{progress.TotalPages}";
+            Status = $"Downloading... {ProgressText}";
+        }
     }
 
     public void SetDownloading()
     {
         DownloadStatus = ChapterDownloadStatus.Downloading;
         Status = "Downloading...";
+        IsStitching = false;
     }
 
     public void SetCompleted()
@@ -48,12 +66,14 @@ public partial class ChapterViewModel : ObservableObject
         DownloadStatus = ChapterDownloadStatus.Completed;
         Status = "Done ✓";
         DownloadProgress = 100;
+        IsStitching = false;
     }
 
     public void SetFailed(string error)
     {
         DownloadStatus = ChapterDownloadStatus.Failed;
         Status = $"Failed: {error}";
+        IsStitching = false;
     }
 
     public void Reset()
@@ -62,5 +82,6 @@ public partial class ChapterViewModel : ObservableObject
         Status = "Pending";
         DownloadProgress = 0;
         ProgressText = string.Empty;
+        IsStitching = false;
     }
 }

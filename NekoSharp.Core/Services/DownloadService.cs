@@ -7,6 +7,7 @@ using SixLabors.ImageSharp.Formats.Jpeg;
 using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Webp;
 using SixLabors.ImageSharp.Processing;
+using SixLabors.ImageSharp.Processing.Processors.Quantization;
 
 namespace NekoSharp.Core.Services;
 
@@ -80,6 +81,11 @@ public class DownloadService : IDownloadService
             ? await _settings.GetEnumAsync("Download.ImageFormat", ImageFormat.Original)
             : ImageFormat.Original;
 
+        var compressionPercent = _settings != null
+            ? await _settings.GetIntAsync("Download.ImageCompressionPercent", 0)
+            : 0;
+        compressionPercent = Math.Clamp(compressionPercent, 0, 100);
+
         if (chapter.Pages.Count == 0)
         {
             chapter.Pages = await scraper.GetPagesAsync(chapter, ct);
@@ -135,6 +141,16 @@ public class DownloadService : IDownloadService
                                        !string.Equals(originalExtension, targetExtension, StringComparison.OrdinalIgnoreCase) && 
                                        !(originalExtension == ".jpeg" && targetExtension == ".jpg");
 
+                if (targetStartFormat == ImageFormat.Original && compressionPercent > 0)
+                {
+                    needsConversion = CanReencodeExtension(originalExtension);
+                }
+
+                if (targetStartFormat != ImageFormat.Original && compressionPercent > 0)
+                {
+                    needsConversion = true;
+                }
+
                 if (!needsConversion)
                 {
                     await DownloadFileWithRetryAsync(page.ImageUrl, filePath, manga.Url, ct);
@@ -145,7 +161,7 @@ public class DownloadService : IDownloadService
                     try
                     {
                         await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, manga.Url, ct);
-                        await ConvertImageAsync(tempFile, filePath, targetStartFormat, ct);
+                        await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
                     }
                     finally
                     {
@@ -169,6 +185,34 @@ public class DownloadService : IDownloadService
         });
 
         await Task.WhenAll(tasks);
+
+        // SmartStitch post-processing (runs on the downloaded images before CBZ packaging)
+        if (_settings != null)
+        {
+            var stitchSettings = await SmartStitchService.LoadSettingsAsync(_settings);
+            if (stitchSettings.Enabled)
+            {
+                progress?.Report(new DownloadProgress
+                {
+                    CurrentPage = totalPages,
+                    TotalPages = totalPages,
+                    IsStitching = true,
+                    StitchingStatus = "SmartStitch: Processando..."
+                });
+
+                _log?.Info($"[SmartStitch] Running post-processing on chapter {chapter.Number}...");
+                var stitcher = new SmartStitchService(_log);
+                await stitcher.ProcessAsync(tempDir, stitchSettings, ct);
+
+                progress?.Report(new DownloadProgress
+                {
+                    CurrentPage = totalPages,
+                    TotalPages = totalPages,
+                    IsStitching = true,
+                    StitchingStatus = "SmartStitch: Concluído ✓"
+                });
+            }
+        }
 
         if (format == DownloadFormat.Cbz)
         {
@@ -204,22 +248,44 @@ public class DownloadService : IDownloadService
         }
     }
 
-    private async Task ConvertImageAsync(string inputPath, string outputPath, ImageFormat format, CancellationToken ct)
+    private async Task ConvertImageAsync(string inputPath, string outputPath, ImageFormat format, int compressionPercent, CancellationToken ct)
     {
         try
         {
             using var image = await Image.LoadAsync(inputPath, ct);
+            var quality = Math.Clamp(100 - compressionPercent, 1, 100);
+            var pngLevel = Math.Clamp((int)Math.Round(compressionPercent / 100.0 * 9), 0, 9);
+            var maxColors = Math.Clamp(256 - (int)Math.Round(compressionPercent * 2.4), 16, 256);
+
+            ApplyAggressiveResize(image, compressionPercent);
             
             switch (format)
             {
                 case ImageFormat.Jpeg:
-                    await image.SaveAsJpegAsync(outputPath, new JpegEncoder { Quality = 85 }, ct);
+                    await image.SaveAsJpegAsync(outputPath, new JpegEncoder { Quality = quality }, ct);
                     break;
                 case ImageFormat.Png:
-                    await image.SaveAsPngAsync(outputPath, new PngEncoder(), ct);
+                    if (compressionPercent > 0)
+                    {
+                        image.Mutate(ctx => ctx.Quantize(new WuQuantizer(new QuantizerOptions
+                        {
+                            MaxColors = maxColors,
+                            Dither = null
+                        })));
+                    }
+
+                    await image.SaveAsPngAsync(outputPath, new PngEncoder
+                    {
+                        CompressionLevel = (PngCompressionLevel)pngLevel
+                    }, ct);
                     break;
                 case ImageFormat.WebP:
-                    await image.SaveAsWebpAsync(outputPath, new WebpEncoder { Quality = 80 }, ct);
+                    await image.SaveAsWebpAsync(outputPath, new WebpEncoder
+                    {
+                        Quality = quality,
+                        Method = WebpEncodingMethod.BestQuality,
+                        FileFormat = WebpFileFormatType.Lossy
+                    }, ct);
                     break;
                 default:
                     File.Copy(inputPath, outputPath, true);
@@ -276,5 +342,34 @@ public class DownloadService : IDownloadService
         {
             return ".jpg";
         }
+    }
+
+    private static bool CanReencodeExtension(string extension)
+    {
+        return extension is ".jpg" or ".jpeg" or ".png" or ".webp";
+    }
+
+    private static void ApplyAggressiveResize(Image image, int compressionPercent)
+    {
+        if (compressionPercent <= 0)
+            return;
+
+        if (compressionPercent < 45)
+            return;
+
+        var intensity = (compressionPercent - 45) / 55.0;
+        var scale = 1.0 - (0.75 * intensity);
+        var width = Math.Max(1, (int)Math.Round(image.Width * scale));
+        var height = Math.Max(1, (int)Math.Round(image.Height * scale));
+
+        if (width == image.Width && height == image.Height)
+            return;
+
+        image.Mutate(ctx => ctx.Resize(new ResizeOptions
+        {
+            Size = new Size(width, height),
+            Mode = ResizeMode.Stretch,
+            Sampler = KnownResamplers.Bicubic
+        }));
     }
 }
