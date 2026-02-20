@@ -1,0 +1,72 @@
+name: Build NekoSharp
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore NekoSharp.sln
+
+      - name: Build (Release)
+        run: dotnet build NekoSharp.sln --configuration Release --no-restore
+
+      - name: Test (Release)
+        run: dotnet test NekoSharp.sln --configuration Release --no-build --verbosity normal
+
+      - name: Publish App (linux-x64)
+        run: dotnet publish NekoSharp.App/NekoSharp.App.csproj --configuration Release --runtime linux-x64 --self-contained false -p:PublishSingleFile=true -o artifacts/linux-x64
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NekoSharp-linux-x64
+          path: artifacts/linux-x64
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore NekoSharp.sln
+
+      - name: Build (Release)
+        run: dotnet build NekoSharp.sln --configuration Release --no-restore
+
+      - name: Test (Release)
+        run: dotnet test NekoSharp.sln --configuration Release --no-build --verbosity normal
+
+      - name: Publish App (win-x64)
+        run: dotnet publish NekoSharp.App/NekoSharp.App.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/win-x64
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NekoSharp-win-x64
+          path: artifacts/win-x64

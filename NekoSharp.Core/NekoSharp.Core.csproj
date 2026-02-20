@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>NekoSharp.Core</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="AngleSharp" Version="1.4.0" />
+        <PackageReference Include="HtmlAgilityPack" Version="1.12.1" />
+        <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.2" />
+        <PackageReference Include="PuppeteerSharp" Version="21.1.1" />
+        <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    </ItemGroup>
+
+
+</Project>

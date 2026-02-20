@@ -1,0 +1,59 @@
+.manga-cover {
+    border-radius: 12px;
+    background-color: @view_bg_color;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    transition: box-shadow 0.2s ease;
+}
+
+.manga-cover:hover {
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+
+.log-box {
+    background-color: @view_bg_color;
+    padding: 12px;
+}
+
+.log-entry {
+    font-family: "Cascadia Code", "JetBrains Mono", monospace;
+    font-size: 12px;
+    padding: 4px 0;
+    border-bottom: 1px solid alpha(@borders, 0.5);
+}
+
+.status-bar {
+    background-color: @headerbar_bg_color;
+    border-top: 1px solid @borders;
+    padding: 4px 12px;
+    font-size: 12px;
+}
+
+.dim-label {
+    color: alpha(currentColor, 0.55);
+    font-size: small;
+}
+
+.accent-text {
+    color: @accent_color;
+    font-weight: bold;
+}
+
+.success-text { color: @success_color; }
+.error-text { color: @error_color; }
+.warning-text { color: @warning_color; }
+
+.chapter-progress {
+    min-width: 100px;
+}
+
+ 
+.flatpak-button {
+    min-height: 36px;
+    padding: 0 14px;
+    border-radius: 8px;
+}
+
+.flatpak-primary {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+}
