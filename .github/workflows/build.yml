@@ -1,72 +1,329 @@
-name: Build NekoSharp
+name: Build NekoSharp (Windows GTK Portable)
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: 10.0.x
+  SOLUTION_FILE: NekoSharp.sln
+  APP_PROJECT: NekoSharp.App/NekoSharp.App.csproj
+  CONFIGURATION: Release
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  NUGET_XMLDOC_MODE: skip
+
 jobs:
-  build-linux:
-    name: Build Linux
-    runs-on: ubuntu-latest
+  ci:
+    name: CI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET 10
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 10.0.x
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            **/*.csproj
+            Directory.Packages.props
+            global.json
+            NuGet.config
+
+      - name: Show .NET info
+        run: dotnet --info
 
       - name: Restore
-        run: dotnet restore NekoSharp.sln
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
 
-      - name: Build (Release)
-        run: dotnet build NekoSharp.sln --configuration Release --no-restore
+      - name: Build
+        run: >
+          dotnet build ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.CONFIGURATION }}
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
 
-      - name: Test (Release)
-        run: dotnet test NekoSharp.sln --configuration Release --no-build --verbosity normal
+      - name: Test
+        run: >
+          dotnet test ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.CONFIGURATION }}
+          --no-build
+          --verbosity normal
+          --logger trx
+          --results-directory test-results
 
-      - name: Publish App (linux-x64)
-        run: dotnet publish NekoSharp.App/NekoSharp.App.csproj --configuration Release --runtime linux-x64 --self-contained false -p:PublishSingleFile=true -o artifacts/linux-x64
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ runner.os }}
+          path: test-results/**/*.trx
+          if-no-files-found: warn
+          retention-days: 7
+
+  publish-windows:
+    name: Publish Windows (win-x64 + GTK runtime)
+    needs: ci
+    if: github.event_name != 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            **/*.csproj
+            Directory.Packages.props
+            global.json
+            NuGet.config
+
+      - name: Setup MSYS2 (UCRT64 + GTK)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-libadwaita
+
+      - name: Restore
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+      - name: Publish app (Windows optimized)
+        run: |
+          $publishDir = "out/win-x64"
+
+          dotnet publish ${{ env.APP_PROJECT }} `
+            --configuration ${{ env.CONFIGURATION }} `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:PublishReadyToRun=true `
+            -p:ContinuousIntegrationBuild=true `
+            -o $publishDir
+
+      - name: Validate publish output
+        run: |
+          $publishDir = "out/win-x64"
+          if (-not (Test-Path $publishDir)) { throw "Publish dir not found: $publishDir" }
+
+          $exe = Get-ChildItem -Path $publishDir -Filter *.exe -File | Select-Object -First 1
+          if (-not $exe) { throw "No .exe found in $publishDir" }
+
+          "APP_EXE_NAME=$($exe.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "App EXE: $($exe.Name)"
+
+      - name: Bundle GTK runtime (portable package)
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $pkgRoot = "package/NekoSharp-win-x64-portable"
+          $gtkRoot = "C:\msys64\ucrt64"
+
+          # Estrutura
+          New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
+          New-Item -ItemType Directory -Force -Path "$pkgRoot\gtk" | Out-Null
+
+          # Copia app publicado
+          Copy-Item "out/win-x64\*" $pkgRoot -Recurse -Force
+
+          function Copy-IfExists {
+            param(
+              [string]$Source,
+              [string]$Dest
+            )
+            if (Test-Path $Source) {
+              New-Item -ItemType Directory -Force -Path (Split-Path $Dest -Parent) | Out-Null
+              Copy-Item $Source $Dest -Recurse -Force
+            } else {
+              Write-Warning "Missing (skipped): $Source"
+            }
+          }
+
+          # Runtime GTK/libadwaita (UCRT64)
+          Copy-IfExists "$gtkRoot\bin" "$pkgRoot\gtk\bin"
+          Copy-IfExists "$gtkRoot\etc\gtk-4.0" "$pkgRoot\gtk\etc\gtk-4.0"
+          Copy-IfExists "$gtkRoot\etc\fonts" "$pkgRoot\gtk\etc\fonts"
+
+          # Plugins / modules
+          Copy-IfExists "$gtkRoot\lib\gdk-pixbuf-2.0" "$pkgRoot\gtk\lib\gdk-pixbuf-2.0"
+          Copy-IfExists "$gtkRoot\lib\gio" "$pkgRoot\gtk\lib\gio"
+          Copy-IfExists "$gtkRoot\lib\gtk-4.0" "$pkgRoot\gtk\lib\gtk-4.0"
+
+          # Dados necessários
+          Copy-IfExists "$gtkRoot\share\glib-2.0" "$pkgRoot\gtk\share\glib-2.0"
+          Copy-IfExists "$gtkRoot\share\icons" "$pkgRoot\gtk\share\icons"
+          Copy-IfExists "$gtkRoot\share\themes" "$pkgRoot\gtk\share\themes"
+          Copy-IfExists "$gtkRoot\share\locale" "$pkgRoot\gtk\share\locale"
+          Copy-IfExists "$gtkRoot\share\libadwaita-1" "$pkgRoot\gtk\share\libadwaita-1"
+
+          # Recompila schemas (garante arquivo consistente no pacote)
+          $glibCompileSchemas = "$gtkRoot\bin\glib-compile-schemas.exe"
+          $schemaDir = "$pkgRoot\gtk\share\glib-2.0\schemas"
+          if (Test-Path $glibCompileSchemas -and (Test-Path $schemaDir)) {
+            & $glibCompileSchemas $schemaDir
+            if ($LASTEXITCODE -ne 0) { throw "glib-compile-schemas failed" }
+          }
+
+          # Regera loaders.cache do gdk-pixbuf (paths corretos pro pacote)
+          $queryLoaders = "$gtkRoot\bin\gdk-pixbuf-query-loaders.exe"
+          $pixbufBase = "$pkgRoot\gtk\lib\gdk-pixbuf-2.0"
+          if (Test-Path $queryLoaders -and (Test-Path $pixbufBase)) {
+            $vdir = Get-ChildItem $pixbufBase -Directory | Select-Object -First 1
+            if ($vdir) {
+              $loaderDir = Join-Path $vdir.FullName "loaders"
+              $cacheFile = Join-Path $vdir.FullName "loaders.cache"
+              if (Test-Path $loaderDir) {
+                $content = & $queryLoaders "$loaderDir\*.dll"
+                $content | Set-Content -Path $cacheFile -Encoding ascii
+              }
+            }
+          }
+
+      - name: Create Windows launcher (.cmd)
+        run: |
+          $pkgRoot = "package/NekoSharp-win-x64-portable"
+          $cmdPath = Join-Path $pkgRoot "Run-NekoSharp.cmd"
+
+          @"
+          @echo off
+          setlocal
+
+          set "APPDIR=%~dp0"
+          set "GTKDIR=%APPDIR%gtk"
+
+          set "PATH=%GTKDIR%\bin;%PATH%"
+          set "XDG_DATA_DIRS=%GTKDIR%\share"
+          set "GSETTINGS_SCHEMA_DIR=%GTKDIR%\share\glib-2.0\schemas"
+          set "GDK_PIXBUF_MODULEDIR=%GTKDIR%\lib\gdk-pixbuf-2.0\2.10.0\loaders"
+          set "GIO_MODULE_DIR=%GTKDIR%\lib\gio\modules"
+          set "GTK_DATA_PREFIX=%GTKDIR%"
+
+          REM Se algum usuário tiver problema gráfico/driver, teste descomentar:
+          REM set "GSK_RENDERER=cairo"
+
+          start "" "%APPDIR%${{ env.APP_EXE_NAME }}"
+          exit /b %errorlevel%
+          "@ | Set-Content -Path $cmdPath -Encoding ascii
+
+      - name: Create checksums
+        run: |
+          $pkgRoot = "package/NekoSharp-win-x64-portable"
+          $distDir = "dist"
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          $zipPath = Join-Path $distDir "NekoSharp-win-x64-portable-gtk.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "$pkgRoot\*" -DestinationPath $zipPath -Force
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zipPath -Leaf)" | Set-Content -Path (Join-Path $distDir "SHA256SUMS-win-x64.txt") -Encoding utf8
+
+          Get-ChildItem $distDir | Select-Object Name, Length | Format-Table -AutoSize
+          Get-Content (Join-Path $distDir "SHA256SUMS-win-x64.txt")
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NekoSharp-win-x64-portable-gtk
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-linux:
+    name: Publish Linux (linux-x64)
+    needs: ci
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            **/*.csproj
+            Directory.Packages.props
+            global.json
+            NuGet.config
+
+      - name: Restore
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+      - name: Publish app (linux-x64)
+        run: |
+          dotnet publish ${{ env.APP_PROJECT }} `
+            --configuration ${{ env.CONFIGURATION }} `
+            --runtime linux-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishSingleFile=true `
+            -p:ContinuousIntegrationBuild=true `
+            -o out/linux-x64
+
+      - name: Package Linux (.tar.gz)
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          tar -C out/linux-x64 -czf dist/NekoSharp-linux-x64.tar.gz .
+          if ($LASTEXITCODE -ne 0) { throw "tar failed" }
+
+      - name: SHA256 (Linux)
+        run: |
+          $file = Get-Item "dist/NekoSharp-linux-x64.tar.gz"
+          $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($file.Name)" | Set-Content -Path "dist/SHA256SUMS-linux-x64.txt" -Encoding utf8
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
           name: NekoSharp-linux-x64
-          path: artifacts/linux-x64
-
-  build-windows:
-    name: Build Windows
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
-
-      - name: Restore
-        run: dotnet restore NekoSharp.sln
-
-      - name: Build (Release)
-        run: dotnet build NekoSharp.sln --configuration Release --no-restore
-
-      - name: Test (Release)
-        run: dotnet test NekoSharp.sln --configuration Release --no-build --verbosity normal
-
-      - name: Publish App (win-x64)
-        run: dotnet publish NekoSharp.App/NekoSharp.App.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o artifacts/win-x64
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: NekoSharp-win-x64
-          path: artifacts/win-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
