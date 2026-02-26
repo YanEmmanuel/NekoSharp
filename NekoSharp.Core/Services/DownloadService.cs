@@ -186,7 +186,6 @@ public class DownloadService : IDownloadService
 
         await Task.WhenAll(tasks);
 
-        // SmartStitch post-processing (runs on the downloaded images before CBZ packaging)
         if (_settings != null)
         {
             var stitchSettings = await SmartStitchService.LoadSettingsAsync(_settings);

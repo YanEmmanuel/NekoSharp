@@ -15,7 +15,6 @@ public sealed class ProviderUpdateService
     public const string SettingsManifestUrlKey = "Providers.DynamicUpdates.ManifestUrl";
     public const string SettingsLastCheckUtcKey = "Providers.DynamicUpdates.LastCheckUtc";
 
-    // Manifesto oficial de providers externos no repositório principal do projeto.
     public const string DefaultManifestUrl = "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/main/providers/manifest.json";
     private const string LegacyManifestUrl = "https://raw.githubusercontent.com/yan/NekoSharp/main/providers/manifest.json";
 

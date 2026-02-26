@@ -54,12 +54,6 @@ public class MainWindow
     private Gtk.Label _statusIconLabel = null!;
     private Gtk.Label _statusMessageLabel = null!;
     private Gtk.Label _outputDirLabel = null!;
-    private Gtk.Label _mediocreAuthStatusLabel = null!;
-    private Gtk.Label _mediocreAuthUserLabel = null!;
-    private Gtk.Label _mediocreAuthUpdatedLabel = null!;
-    private Gtk.Button _connectMediocreAuthBtn = null!;
-    private Gtk.Button _clearMediocreAuthBtn = null!;
-    private Gtk.Button _refreshMediocreAuthBtn = null!;
 
     private readonly HttpClient _httpClient;
 
@@ -91,9 +85,6 @@ public class MainWindow
         _window.SetContent(mainBox);
 
         BindViewModel();
-
-        if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
-            _vm.RefreshMediocreAuthStateCommand.Execute(null);
     }
 
     public void Present() => _window.Present();
@@ -371,7 +362,6 @@ public class MainWindow
             }
         };
 
-        // ── Concurrent chapter downloads ──
         var concurrentRow = Adw.ActionRow.New();
         concurrentRow.SetTitle("Downloads Simultâneos");
         concurrentRow.SetSubtitle("Quantidade de capítulos baixados ao mesmo tempo (1-10). Padrão: 3");
@@ -398,103 +388,9 @@ public class MainWindow
 
         page.Add(group);
 
-        // ── SmartStitch Settings Group ──
         page.Add(BuildSmartStitchSettingsGroup());
-        page.Add(BuildMediocreAuthSettingsGroup());
 
         return page;
-    }
-
-    private Adw.PreferencesGroup BuildMediocreAuthSettingsGroup()
-    {
-        var group = Adw.PreferencesGroup.New();
-        group.SetTitle("MediocreScan (login obrigatório)");
-        group.SetDescription("Autenticação interativa para acessar a API autenticada do provedor.");
-
-        var statusRow = Adw.ActionRow.New();
-        statusRow.SetTitle("Status da Sessão");
-        _mediocreAuthStatusLabel = Gtk.Label.New(_vm.MediocreAuthStatus);
-        _mediocreAuthStatusLabel.AddCssClass("dim-label");
-        statusRow.AddSuffix(_mediocreAuthStatusLabel);
-        statusRow.SetActivatable(false);
-        group.Add(statusRow);
-
-        var userRow = Adw.ActionRow.New();
-        userRow.SetTitle("Usuário");
-        _mediocreAuthUserLabel = Gtk.Label.New(string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser);
-        _mediocreAuthUserLabel.AddCssClass("dim-label");
-        userRow.AddSuffix(_mediocreAuthUserLabel);
-        userRow.SetActivatable(false);
-        group.Add(userRow);
-
-        var updatedRow = Adw.ActionRow.New();
-        updatedRow.SetTitle("Última Atualização");
-        _mediocreAuthUpdatedLabel = Gtk.Label.New(_vm.MediocreAuthLastUpdated);
-        _mediocreAuthUpdatedLabel.AddCssClass("dim-label");
-        updatedRow.AddSuffix(_mediocreAuthUpdatedLabel);
-        updatedRow.SetActivatable(false);
-        group.Add(updatedRow);
-
-        var actionsRow = Adw.ActionRow.New();
-        actionsRow.SetTitle("Ações");
-
-        var actionsBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
-
-        _connectMediocreAuthBtn = Gtk.Button.NewWithLabel("Conectar/Login");
-        _connectMediocreAuthBtn.AddCssClass("suggested-action");
-        _connectMediocreAuthBtn.OnClicked += (_, _) =>
-        {
-            if (_vm.ConnectMediocreAuthCommand.CanExecute(null))
-                _vm.ConnectMediocreAuthCommand.Execute(null);
-        };
-        actionsBox.Append(_connectMediocreAuthBtn);
-
-        _clearMediocreAuthBtn = Gtk.Button.NewWithLabel("Limpar sessão");
-        _clearMediocreAuthBtn.OnClicked += (_, _) =>
-        {
-            if (_vm.ClearMediocreAuthCommand.CanExecute(null))
-                _vm.ClearMediocreAuthCommand.Execute(null);
-        };
-        actionsBox.Append(_clearMediocreAuthBtn);
-
-        _refreshMediocreAuthBtn = Gtk.Button.NewWithLabel("Atualizar status");
-        _refreshMediocreAuthBtn.OnClicked += (_, _) =>
-        {
-            if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
-                _vm.RefreshMediocreAuthStateCommand.Execute(null);
-        };
-        actionsBox.Append(_refreshMediocreAuthBtn);
-
-        actionsRow.AddSuffix(actionsBox);
-        actionsRow.SetActivatable(false);
-        group.Add(actionsRow);
-
-        void UpdateMediocreAuthWidgets()
-        {
-            _mediocreAuthStatusLabel.SetText(_vm.MediocreAuthStatus);
-            _mediocreAuthUserLabel.SetText(string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser);
-            _mediocreAuthUpdatedLabel.SetText(_vm.MediocreAuthLastUpdated);
-
-            var sensitive = !_vm.IsMediocreAuthBusy;
-            _connectMediocreAuthBtn.SetSensitive(sensitive);
-            _clearMediocreAuthBtn.SetSensitive(sensitive);
-            _refreshMediocreAuthBtn.SetSensitive(sensitive);
-        }
-
-        UpdateMediocreAuthWidgets();
-
-        _vm.PropertyChanged += (_, args) =>
-        {
-            if (args.PropertyName == nameof(_vm.MediocreAuthStatus) ||
-                args.PropertyName == nameof(_vm.MediocreAuthUser) ||
-                args.PropertyName == nameof(_vm.MediocreAuthLastUpdated) ||
-                args.PropertyName == nameof(_vm.IsMediocreAuthBusy))
-            {
-                UpdateMediocreAuthWidgets();
-            }
-        };
-
-        return group;
     }
 
     private Adw.PreferencesGroup BuildSmartStitchSettingsGroup()
@@ -503,7 +399,6 @@ public class MainWindow
         group.SetTitle("SmartStitch");
         group.SetDescription("Pós-processamento: junta páginas verticalmente e recorta em painéis inteligentes. Desativado por padrão.");
 
-        // ── Enable switch ──
         var enableRow = Adw.ActionRow.New();
         enableRow.SetTitle("Ativar SmartStitch");
         enableRow.SetSubtitle("Após o download, as imagens serão unidas e recortadas automaticamente");
@@ -519,10 +414,8 @@ public class MainWindow
         enableRow.SetActivatableWidget(enableSwitch);
         group.Add(enableRow);
 
-        // Container for all SmartStitch sub-settings (hidden when disabled)
         var detailRows = new List<Adw.ActionRow>();
 
-        // ── Split Height ──
         var splitHeightRow = Adw.ActionRow.New();
         splitHeightRow.SetTitle("Altura de Corte (px)");
         splitHeightRow.SetSubtitle("Altura aproximada de cada painel de saída. Padrão: 5000");
@@ -535,7 +428,6 @@ public class MainWindow
         group.Add(splitHeightRow);
         detailRows.Add(splitHeightRow);
 
-        // ── Detector Type ──
         var detectorRow = Adw.ComboRow.New();
         detectorRow.SetTitle("Tipo de Detector");
         detectorRow.SetSubtitle("Comparação de pixels evita cortar por falas/SFX; Direto corta exatamente");
@@ -548,9 +440,7 @@ public class MainWindow
                 _vm.SmartStitchDetectorType = (StitchDetectorType)detectorRow.GetSelected();
         };
         group.Add(detectorRow);
-        // detectorRow is always visible when SS is enabled
 
-        // ── Sensitivity ──
         var sensitivityRow = Adw.ActionRow.New();
         sensitivityRow.SetTitle("Sensibilidade (%)");
         sensitivityRow.SetSubtitle("0 = corta em qualquer lugar, 100 = exige pixels idênticos. Padrão: 90");
@@ -563,7 +453,6 @@ public class MainWindow
         group.Add(sensitivityRow);
         detailRows.Add(sensitivityRow);
 
-        // ── Scan Step ──
         var scanStepRow = Adw.ActionRow.New();
         scanStepRow.SetTitle("Passo de varredura (px)");
         scanStepRow.SetSubtitle("Passo de busca quando a linha atual não pode ser cortada. Padrão: 5");
@@ -576,7 +465,6 @@ public class MainWindow
         group.Add(scanStepRow);
         detailRows.Add(scanStepRow);
 
-        // ── Ignorable Pixels ──
         var ignorableRow = Adw.ActionRow.New();
         ignorableRow.SetTitle("Margem Ignorável (px)");
         ignorableRow.SetSubtitle("Pixels na borda a ignorar durante detecção. Padrão: 0");
@@ -589,7 +477,6 @@ public class MainWindow
         group.Add(ignorableRow);
         detailRows.Add(ignorableRow);
 
-        // ── Width Enforcement ──
         var widthEnfRow = Adw.ComboRow.New();
         widthEnfRow.SetTitle("Forçar Largura");
         widthEnfRow.SetSubtitle("Nenhum mantém original, Automático usa a menor largura, Manual define um valor");
@@ -604,7 +491,6 @@ public class MainWindow
         group.Add(widthEnfRow);
         detailRows.Add(widthEnfRow);
 
-        // ── Custom Width ──
         var customWidthRow = Adw.ActionRow.New();
         customWidthRow.SetTitle("Largura Customizada (px)");
         customWidthRow.SetSubtitle("Usado quando 'Forçar Largura' está em Manual. Padrão: 720");
@@ -617,7 +503,6 @@ public class MainWindow
         group.Add(customWidthRow);
         detailRows.Add(customWidthRow);
 
-        // ── Output Format ──
         var outFmtRow = Adw.ComboRow.New();
         outFmtRow.SetTitle("Formato de Saída (Stitch)");
         outFmtRow.SetSubtitle("Formato das imagens recortadas pelo SmartStitch");
@@ -632,7 +517,6 @@ public class MainWindow
         group.Add(outFmtRow);
         detailRows.Add(outFmtRow);
 
-        // ── Lossy Quality ──
         var lossyRow = Adw.ActionRow.New();
         lossyRow.SetTitle("Qualidade (com perdas)");
         lossyRow.SetSubtitle("Qualidade para JPEG/WebP. 1-100. Padrão: 100");
@@ -645,23 +529,19 @@ public class MainWindow
         group.Add(lossyRow);
         detailRows.Add(lossyRow);
 
-        // ── Visibility logic: show/hide sub-rows based on enabled state ──
         void UpdateSmartStitchVisibility()
         {
             var enabled = _vm.SmartStitchEnabled;
             foreach (var row in detailRows)
                 row.SetVisible(enabled);
 
-            // Custom width only visible when enforcement = Manual
             customWidthRow.SetVisible(enabled && _vm.SmartStitchWidthEnforcement == StitchWidthEnforcement.Manual);
 
-            // Sensitivity/ScanStep/Ignorable only relevant for PixelComparison
             var isPixel = _vm.SmartStitchDetectorType == StitchDetectorType.PixelComparison;
             sensitivityRow.SetVisible(enabled && isPixel);
             scanStepRow.SetVisible(enabled && isPixel);
             ignorableRow.SetVisible(enabled && isPixel);
 
-            // Lossy quality only relevant for JPEG/WebP
             var isLossy = _vm.SmartStitchOutputFormat == ImageFormat.Jpeg ||
                           _vm.SmartStitchOutputFormat == ImageFormat.WebP;
             lossyRow.SetVisible(enabled && isLossy);

@@ -49,7 +49,6 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private ImageFormat _selectedImageFormat = ImageFormat.Original;
     [ObservableProperty] private int _imageCompressionPercent;
 
-    // SmartStitch settings
     [ObservableProperty] private bool _smartStitchEnabled;
     [ObservableProperty] private int _smartStitchSplitHeight = 5000;
     [ObservableProperty] private StitchDetectorType _smartStitchDetectorType = StitchDetectorType.PixelComparison;
@@ -61,10 +60,8 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private ImageFormat _smartStitchOutputFormat = ImageFormat.Png;
     [ObservableProperty] private int _smartStitchLossyQuality = 100;
 
-    // Concurrent chapter downloads (1-10, default 3)
     [ObservableProperty] private int _maxConcurrentChapters = 3;
 
-    // MediocreScan auth state
     [ObservableProperty] private bool _isMediocreAuthBusy;
     [ObservableProperty] private string _mediocreAuthStatus = "Desconectado";
     [ObservableProperty] private string _mediocreAuthUser = string.Empty;
@@ -118,7 +115,6 @@ public partial class MainWindowViewModel : ObservableObject
             var compression = await _settingsStore.GetIntAsync("Download.ImageCompressionPercent", 0);
             var outDir = await _settingsStore.GetStringAsync("Download.OutputDirectory");
 
-            // SmartStitch settings
             var ssEnabled = await _settingsStore.GetBoolAsync(SmartStitchSettings.KeyEnabled, false);
             var ssSplitHeight = await _settingsStore.GetIntAsync(SmartStitchSettings.KeySplitHeight, 5000);
             var ssDetector = await _settingsStore.GetEnumAsync(SmartStitchSettings.KeyDetectorType, StitchDetectorType.PixelComparison);
@@ -238,7 +234,6 @@ public partial class MainWindowViewModel : ObservableObject
     {
         if (Manga == null) return;
 
-        // These run on the main thread (before first await)
         IsDownloading = true;
         CompletedChapters = 0;
         OverallProgress = 0;
@@ -249,7 +244,6 @@ public partial class MainWindowViewModel : ObservableObject
 
         SetStatus($"Baixando {chaptersToDownload.Count} capítulos...", "info");
 
-        // Capture current settings so they don't change mid-download
         var manga = Manga;
         var outputDir = OutputDirectory;
         var format = DownloadFormat;
@@ -260,7 +254,6 @@ public partial class MainWindowViewModel : ObservableObject
         {
             Directory.CreateDirectory(outputDir);
 
-            // Parallel chapter downloads with concurrency limit
             var semaphore = new SemaphoreSlim(MaxConcurrentChapters);
             var tasks = chaptersToDownload.Select((chapterVm, index) => Task.Run(async () =>
             {
@@ -269,7 +262,6 @@ public partial class MainWindowViewModel : ObservableObject
                 {
                     _cts!.Token.ThrowIfCancellationRequested();
 
-                    // All ViewModel mutations dispatched to GTK main thread
                     GLib.Functions.IdleAdd(0, () => { chapterVm.SetDownloading(); return false; });
 
                     var progress = new Progress<DownloadProgress>(p =>
@@ -314,7 +306,6 @@ public partial class MainWindowViewModel : ObservableObject
             catch (OperationCanceledException) { throw; }
             catch { /* individual errors already handled per-chapter */ }
 
-            // After Task.WhenAll we're on thread pool — dispatch UI updates
             GLib.Functions.IdleAdd(0, () =>
             {
                 SetStatus($"Download completo! {CompletedChapters}/{totalCount} capítulos salvos em {outputDir}", "success");
@@ -433,7 +424,6 @@ public partial class MainWindowViewModel : ObservableObject
         _settingsStore.SetIntAsync("Download.ImageCompressionPercent", normalized);
     }
 
-    // ── SmartStitch settings persistence ──
 
     partial void OnSmartStitchEnabledChanged(bool value)
         => _settingsStore.SetBoolAsync(SmartStitchSettings.KeyEnabled, value);

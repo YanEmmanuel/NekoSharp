@@ -69,8 +69,6 @@ public class LogWindow : Adw.Window
 
     private void OnLogEntriesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
-        // CollectionChanged already fires on the GTK main thread (dispatched by ViewModel's IdleAdd).
-        // No need for another IdleAdd — doing so causes double-dispatch timing issues.
         switch (e.Action)
         {
             case NotifyCollectionChangedAction.Add:
@@ -82,7 +80,6 @@ public class LogWindow : Adw.Window
                 break;
 
             case NotifyCollectionChangedAction.Remove:
-                // Trimming always removes from index 0 — remove first widget
                 if (e.OldStartingIndex == 0)
                 {
                     var first = _logEntriesBox.GetFirstChild();
