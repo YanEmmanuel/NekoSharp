@@ -150,131 +150,26 @@ jobs:
           "APP_EXE_NAME=$($exe.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "App EXE: $($exe.Name)"
 
-      - name: Bundle GTK runtime (portable package)
+      - name: Prepare portable package (shared script)
         run: |
-          $ErrorActionPreference = "Stop"
-
+          $publishDir = "out/win-x64"
           $pkgRoot = "package/NekoSharp-win-x64-portable"
-          $gtkRoot = $null
 
-          $candidateRoots = @()
-          if ($env:MSYS2_ROOT) { $candidateRoots += (Join-Path $env:MSYS2_ROOT "ucrt64") }
-          if ($env:RUNNER_TEMP) { $candidateRoots += (Join-Path $env:RUNNER_TEMP "msys64\ucrt64") }
-          $candidateRoots += @(
-            "C:\msys64\ucrt64",
-            "D:\a\_temp\msys64\ucrt64"
-          )
+          ./tools/windows/package-portable-gtk.ps1 `
+            -PublishDir $publishDir `
+            -PackageRoot $pkgRoot `
+            -ExeName $env:APP_EXE_NAME
 
-          $glibFromPath = Get-Command glib-compile-schemas.exe -ErrorAction SilentlyContinue
-          if ($glibFromPath) {
-            $rootFromPath = Split-Path (Split-Path $glibFromPath.Source -Parent) -Parent
-            $candidateRoots = @($rootFromPath) + $candidateRoots
-          }
-          $candidateRoots = $candidateRoots | Where-Object { $_ } | Select-Object -Unique
-
-          foreach ($candidate in $candidateRoots) {
-            if (Test-Path (Join-Path $candidate "bin\glib-compile-schemas.exe")) {
-              $gtkRoot = $candidate
-              break
-            }
-          }
-          if (-not $gtkRoot) {
-            throw "Could not locate MSYS2 UCRT64 root. Checked: $($candidateRoots -join ', ')"
-          }
-          Write-Host "Using GTK root: $gtkRoot"
-
-          New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
-          New-Item -ItemType Directory -Force -Path "$pkgRoot\gtk" | Out-Null
-
-          # App publicado
-          Copy-Item "out/win-x64\*" $pkgRoot -Recurse -Force
-
-          function Copy-OneOf {
-            param(
-              [string[]]$Sources,
-              [string]$Dest,
-              [switch]$Required
-            )
-
-            foreach ($source in $Sources) {
-              if (Test-Path $source) {
-                New-Item -ItemType Directory -Force -Path (Split-Path $Dest -Parent) | Out-Null
-                Copy-Item $source $Dest -Recurse -Force
-                return
-              }
-            }
-
-            if ($Required) {
-              throw "None of the required paths exist for $Dest. Checked: $($Sources -join ', ')"
-            } else {
-              Write-Warning "Missing (skipped): $($Sources -join ', ')"
-            }
-          }
-
-          # Runtime GTK/libadwaita (UCRT64)
-          Copy-OneOf @("$gtkRoot\bin") "$pkgRoot\gtk\bin" -Required
-          Copy-OneOf @("$gtkRoot\etc\gtk-4.0", "$gtkRoot\share\gtk-4.0") "$pkgRoot\gtk\etc\gtk-4.0"
-          Copy-OneOf @("$gtkRoot\etc\fonts", "$gtkRoot\share\fontconfig") "$pkgRoot\gtk\etc\fonts"
-
-          # Plugins/modules
-          Copy-OneOf @("$gtkRoot\lib\gdk-pixbuf-2.0") "$pkgRoot\gtk\lib\gdk-pixbuf-2.0"
-          Copy-OneOf @("$gtkRoot\lib\gio") "$pkgRoot\gtk\lib\gio"
-          Copy-OneOf @("$gtkRoot\lib\gtk-4.0") "$pkgRoot\gtk\lib\gtk-4.0"
-
-          # Dados
-          Copy-OneOf @("$gtkRoot\share\glib-2.0") "$pkgRoot\gtk\share\glib-2.0"
-          Copy-OneOf @("$gtkRoot\share\icons") "$pkgRoot\gtk\share\icons"
-          Copy-OneOf @("$gtkRoot\share\themes") "$pkgRoot\gtk\share\themes"
-          Copy-OneOf @("$gtkRoot\share\locale") "$pkgRoot\gtk\share\locale"
-          Copy-OneOf @("$gtkRoot\share\libadwaita-1") "$pkgRoot\gtk\share\libadwaita-1"
-
-          # Recompila schemas no pacote (ok ser feito no CI)
-          $glibCompileSchemas = "$gtkRoot\bin\glib-compile-schemas.exe"
-          $schemaDir = "$pkgRoot\gtk\share\glib-2.0\schemas"
-          if ((Test-Path $glibCompileSchemas) -and (Test-Path $schemaDir)) {
-            & $glibCompileSchemas $schemaDir
-            if ($LASTEXITCODE -ne 0) { throw "glib-compile-schemas failed" }
-          } else {
-            Write-Warning "Skipping glib-compile-schemas (tool or schema dir not found)"
-          }
-
-      - name: Create Windows launcher (.cmd)
+      - name: Windows native smoke test
         run: |
           $pkgRoot = "package/NekoSharp-win-x64-portable"
-          $cmdPath = Join-Path $pkgRoot "Run-NekoSharp.cmd"
+          $exe = Get-ChildItem -Path $pkgRoot -Filter *.exe -File | Select-Object -First 1
+          if (-not $exe) { throw "No .exe found in $pkgRoot" }
 
-          @"
-          @echo off
-          setlocal
-
-          set "APPDIR=%~dp0"
-          set "GTKDIR=%APPDIR%gtk"
-
-          set "PATH=%GTKDIR%\bin;%PATH%"
-          set "XDG_DATA_DIRS=%GTKDIR%\share"
-          set "GSETTINGS_SCHEMA_DIR=%GTKDIR%\share\glib-2.0\schemas"
-          set "GTK_DATA_PREFIX=%GTKDIR%"
-          set "GIO_MODULE_DIR=%GTKDIR%\lib\gio\modules"
-
-          REM Detecta o diretório de loaders dinamicamente
-          set "GDK_PIXBUF_MODULEDIR="
-          for /d %%D in ("%GTKDIR%\lib\gdk-pixbuf-2.0\*\loaders") do set "GDK_PIXBUF_MODULEDIR=%%~fD"
-          if not defined GDK_PIXBUF_MODULEDIR set "GDK_PIXBUF_MODULEDIR=%GTKDIR%\lib\gdk-pixbuf-2.0\2.10.0\loaders"
-
-          REM Tenta gerar loaders.cache localmente (ajuda portabilidade)
-          if exist "%GTKDIR%\bin\gdk-pixbuf-query-loaders.exe" (
-            "%GTKDIR%\bin\gdk-pixbuf-query-loaders.exe" > "%GDK_PIXBUF_MODULEDIR%\loaders.cache" 2>nul
-            if exist "%GDK_PIXBUF_MODULEDIR%\loaders.cache" (
-              set "GDK_PIXBUF_MODULE_FILE=%GDK_PIXBUF_MODULEDIR%\loaders.cache"
-            )
-          )
-
-          REM Se algum PC tiver problema com driver/renderização, teste:
-          REM set "GSK_RENDERER=cairo"
-
-          start "" "%APPDIR%${{ env.APP_EXE_NAME }}"
-          exit /b %errorlevel%
-          "@ | Set-Content -Path $cmdPath -Encoding ascii
+          & $exe.FullName --native-smoke
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows native smoke test failed with exit code $LASTEXITCODE"
+          }
 
       - name: Package (zip) + checksums
         run: |

@@ -6,9 +6,29 @@ namespace NekoSharp.App;
 
 class Program
 {
+    private const string AppId = "io.github.nekosharp";
+    private const string NativeSmokeArg = "--native-smoke";
+    private const int StartupFailureExitCode = 1;
+    private const int NativeSmokeFailureExitCode = 2;
+
     public static int Main(string[] args)
     {
-        var application = Adw.Application.New("io.github.nekosharp", Gio.ApplicationFlags.FlagsNone);
+        try
+        {
+            WindowsGtkBootstrap.Configure();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[Startup] Windows GTK bootstrap failed: {ex.Message}");
+            return StartupFailureExitCode;
+        }
+
+        if (args.Any(arg => string.Equals(arg, NativeSmokeArg, StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunNativeSmoke();
+        }
+
+        var application = Adw.Application.New(AppId, Gio.ApplicationFlags.FlagsNone);
 
         application.OnActivate += (sender, args) =>
         {
@@ -52,6 +72,20 @@ class Program
         return application.RunWithSynchronizationContext(args);
     }
 
+    private static int RunNativeSmoke()
+    {
+        try
+        {
+            _ = Adw.Application.New($"{AppId}.native-smoke", Gio.ApplicationFlags.FlagsNone);
+            Console.WriteLine("[NativeSmoke] GTK/libadwaita loaded successfully.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[NativeSmoke] Failed to initialize GTK/libadwaita: {ex}");
+            return NativeSmokeFailureExitCode;
+        }
+    }
 
     private static void LoadCss()
     {

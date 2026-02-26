@@ -122,7 +122,16 @@ dotnet publish .\NekoSharp.App\NekoSharp.App.csproj `
   -o out/win-x64
 ```
 
-Observação: para Windows, o binário precisa do runtime nativo GTK4/libadwaita. O pacote portátil com runtime embutido é gerado automaticamente pelos workflows de CI/release.
+Observações (Windows):
+
+- O pacote portátil gerado pelo CI/release já inclui o runtime GTK4/libadwaita.
+- Abrir o `.exe` diretamente é suportado, desde que a pasta `gtk` esteja ao lado do executável.
+- `Run-NekoSharp.cmd` continua suportado para iniciar o app com ambiente configurado.
+- Diagnóstico rápido de carregamento nativo:
+
+```powershell
+.\NekoSharp.App.exe --native-smoke
+```
 
 ## Fluxo de Uso da Aplicação
 
