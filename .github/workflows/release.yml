@@ -151,7 +151,7 @@ jobs:
 
           $glibCompileSchemas = "$gtkRoot\bin\glib-compile-schemas.exe"
           $schemaDir = "$pkgRoot\gtk\share\glib-2.0\schemas"
-          if (Test-Path $glibCompileSchemas -and (Test-Path $schemaDir)) {
+          if ((Test-Path $glibCompileSchemas) -and (Test-Path $schemaDir)) {
             & $glibCompileSchemas $schemaDir
             if ($LASTEXITCODE -ne 0) { throw "glib-compile-schemas failed" }
           }
