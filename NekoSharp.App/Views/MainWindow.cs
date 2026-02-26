@@ -54,6 +54,12 @@ public class MainWindow
     private Gtk.Label _statusIconLabel = null!;
     private Gtk.Label _statusMessageLabel = null!;
     private Gtk.Label _outputDirLabel = null!;
+    private Gtk.Label _mediocreAuthStatusLabel = null!;
+    private Gtk.Label _mediocreAuthUserLabel = null!;
+    private Gtk.Label _mediocreAuthUpdatedLabel = null!;
+    private Gtk.Button _connectMediocreAuthBtn = null!;
+    private Gtk.Button _clearMediocreAuthBtn = null!;
+    private Gtk.Button _refreshMediocreAuthBtn = null!;
 
     private readonly HttpClient _httpClient;
 
@@ -85,6 +91,9 @@ public class MainWindow
         _window.SetContent(mainBox);
 
         BindViewModel();
+
+        if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
+            _vm.RefreshMediocreAuthStateCommand.Execute(null);
     }
 
     public void Present() => _window.Present();
@@ -391,8 +400,101 @@ public class MainWindow
 
         // ── SmartStitch Settings Group ──
         page.Add(BuildSmartStitchSettingsGroup());
+        page.Add(BuildMediocreAuthSettingsGroup());
 
         return page;
+    }
+
+    private Adw.PreferencesGroup BuildMediocreAuthSettingsGroup()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("MediocreScan (login obrigatório)");
+        group.SetDescription("Autenticação interativa para acessar a API autenticada do provider.");
+
+        var statusRow = Adw.ActionRow.New();
+        statusRow.SetTitle("Status da Sessão");
+        _mediocreAuthStatusLabel = Gtk.Label.New(_vm.MediocreAuthStatus);
+        _mediocreAuthStatusLabel.AddCssClass("dim-label");
+        statusRow.AddSuffix(_mediocreAuthStatusLabel);
+        statusRow.SetActivatable(false);
+        group.Add(statusRow);
+
+        var userRow = Adw.ActionRow.New();
+        userRow.SetTitle("Usuário");
+        _mediocreAuthUserLabel = Gtk.Label.New(string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser);
+        _mediocreAuthUserLabel.AddCssClass("dim-label");
+        userRow.AddSuffix(_mediocreAuthUserLabel);
+        userRow.SetActivatable(false);
+        group.Add(userRow);
+
+        var updatedRow = Adw.ActionRow.New();
+        updatedRow.SetTitle("Última Atualização");
+        _mediocreAuthUpdatedLabel = Gtk.Label.New(_vm.MediocreAuthLastUpdated);
+        _mediocreAuthUpdatedLabel.AddCssClass("dim-label");
+        updatedRow.AddSuffix(_mediocreAuthUpdatedLabel);
+        updatedRow.SetActivatable(false);
+        group.Add(updatedRow);
+
+        var actionsRow = Adw.ActionRow.New();
+        actionsRow.SetTitle("Ações");
+
+        var actionsBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
+
+        _connectMediocreAuthBtn = Gtk.Button.NewWithLabel("Conectar/Login");
+        _connectMediocreAuthBtn.AddCssClass("suggested-action");
+        _connectMediocreAuthBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ConnectMediocreAuthCommand.CanExecute(null))
+                _vm.ConnectMediocreAuthCommand.Execute(null);
+        };
+        actionsBox.Append(_connectMediocreAuthBtn);
+
+        _clearMediocreAuthBtn = Gtk.Button.NewWithLabel("Limpar sessão");
+        _clearMediocreAuthBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ClearMediocreAuthCommand.CanExecute(null))
+                _vm.ClearMediocreAuthCommand.Execute(null);
+        };
+        actionsBox.Append(_clearMediocreAuthBtn);
+
+        _refreshMediocreAuthBtn = Gtk.Button.NewWithLabel("Atualizar status");
+        _refreshMediocreAuthBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
+                _vm.RefreshMediocreAuthStateCommand.Execute(null);
+        };
+        actionsBox.Append(_refreshMediocreAuthBtn);
+
+        actionsRow.AddSuffix(actionsBox);
+        actionsRow.SetActivatable(false);
+        group.Add(actionsRow);
+
+        void UpdateMediocreAuthWidgets()
+        {
+            _mediocreAuthStatusLabel.SetText(_vm.MediocreAuthStatus);
+            _mediocreAuthUserLabel.SetText(string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser);
+            _mediocreAuthUpdatedLabel.SetText(_vm.MediocreAuthLastUpdated);
+
+            var sensitive = !_vm.IsMediocreAuthBusy;
+            _connectMediocreAuthBtn.SetSensitive(sensitive);
+            _clearMediocreAuthBtn.SetSensitive(sensitive);
+            _refreshMediocreAuthBtn.SetSensitive(sensitive);
+        }
+
+        UpdateMediocreAuthWidgets();
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(_vm.MediocreAuthStatus) ||
+                args.PropertyName == nameof(_vm.MediocreAuthUser) ||
+                args.PropertyName == nameof(_vm.MediocreAuthLastUpdated) ||
+                args.PropertyName == nameof(_vm.IsMediocreAuthBusy))
+            {
+                UpdateMediocreAuthWidgets();
+            }
+        };
+
+        return group;
     }
 
     private Adw.PreferencesGroup BuildSmartStitchSettingsGroup()

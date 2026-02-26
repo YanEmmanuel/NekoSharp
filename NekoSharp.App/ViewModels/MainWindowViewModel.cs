@@ -64,6 +64,12 @@ public partial class MainWindowViewModel : ObservableObject
     // Concurrent chapter downloads (1-10, default 3)
     [ObservableProperty] private int _maxConcurrentChapters = 3;
 
+    // MediocreScan auth state
+    [ObservableProperty] private bool _isMediocreAuthBusy;
+    [ObservableProperty] private string _mediocreAuthStatus = "Desconectado";
+    [ObservableProperty] private string _mediocreAuthUser = string.Empty;
+    [ObservableProperty] private string _mediocreAuthLastUpdated = "-";
+
      
     [ObservableProperty] private bool _isLogPanelOpen;
     [ObservableProperty] private int _logCount;
@@ -205,6 +211,8 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     private bool CanFetch() => !IsFetching && !IsDownloading;
+
+    private bool CanRunMediocreAuthAction() => !IsMediocreAuthBusy && !IsFetching && !IsDownloading;
 
     [RelayCommand(CanExecute = nameof(CanDownload))]
     private async Task DownloadSelectedAsync()
@@ -470,5 +478,112 @@ public partial class MainWindowViewModel : ObservableObject
         var v = Math.Clamp(value, 1, 10);
         if (v != value) { MaxConcurrentChapters = v; return; }
         _settingsStore.SetIntAsync("Download.MaxConcurrentChapters", v);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
+    private async Task ConnectMediocreAuthAsync()
+    {
+        var provider = GetMediocreAuthProvider();
+        if (provider is null)
+        {
+            SetStatus("Provider MediocreScan não está disponível.", "warning");
+            return;
+        }
+
+        IsMediocreAuthBusy = true;
+        try
+        {
+            SetStatus("Abrindo login do MediocreScan no navegador...", "info");
+            await provider.LoginInteractivelyAsync();
+            await RefreshMediocreAuthStateAsync();
+            SetStatus("Login do MediocreScan concluído.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha no login do MediocreScan: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsMediocreAuthBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
+    private async Task ClearMediocreAuthAsync()
+    {
+        var provider = GetMediocreAuthProvider();
+        if (provider is null)
+        {
+            SetStatus("Provider MediocreScan não está disponível.", "warning");
+            return;
+        }
+
+        IsMediocreAuthBusy = true;
+        try
+        {
+            await provider.ClearAuthAsync();
+            await RefreshMediocreAuthStateAsync();
+            SetStatus("Sessão do MediocreScan removida.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao limpar sessão do MediocreScan: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsMediocreAuthBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
+    private async Task RefreshMediocreAuthStateAsync()
+    {
+        var provider = GetMediocreAuthProvider();
+        if (provider is null)
+        {
+            MediocreAuthStatus = "Indisponível";
+            MediocreAuthUser = string.Empty;
+            MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+            return;
+        }
+
+        IsMediocreAuthBusy = true;
+        try
+        {
+            var state = await provider.GetAuthStateAsync();
+            MediocreAuthStatus = state.IsAuthenticated
+                ? "Conectado"
+                : state.IsExpired ? "Expirado" : "Desconectado";
+
+            MediocreAuthUser = !string.IsNullOrWhiteSpace(state.UserDisplayName)
+                ? state.UserDisplayName!
+                : !string.IsNullOrWhiteSpace(state.UserEmail) ? state.UserEmail! : string.Empty;
+
+            MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+        }
+        catch (Exception ex)
+        {
+            MediocreAuthStatus = "Erro";
+            MediocreAuthUser = ex.Message;
+            MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+        }
+        finally
+        {
+            IsMediocreAuthBusy = false;
+        }
+    }
+
+    partial void OnIsMediocreAuthBusyChanged(bool value)
+    {
+        ConnectMediocreAuthCommand.NotifyCanExecuteChanged();
+        ClearMediocreAuthCommand.NotifyCanExecuteChanged();
+        RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
+    }
+
+    private IInteractiveAuthProvider? GetMediocreAuthProvider()
+    {
+        return _scraperManager.Scrapers
+            .FirstOrDefault(s => s.Name.Equals("MediocreScan", StringComparison.OrdinalIgnoreCase))
+            as IInteractiveAuthProvider;
     }
 }
