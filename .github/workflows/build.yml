@@ -122,7 +122,7 @@ jobs:
             mingw-w64-ucrt-x86_64-libadwaita
 
       - name: Restore (win-x64)
-        run: dotnet restore ${{ env.APP_PROJECT }} -r win-x64
+        run: dotnet restore ${{ env.APP_PROJECT }} -r win-x64 -p:PublishReadyToRun=true
 
       - name: Publish app (Windows optimized)
         run: |
@@ -307,11 +307,21 @@ jobs:
           $publishDir = "out/linux-x64"
           if (-not (Test-Path $publishDir)) { throw "Publish dir not found: $publishDir" }
 
-          $bin = Get-ChildItem -Path $publishDir -File | Where-Object { $_.Extension -eq "" } | Select-Object -First 1
+          $expectedBin = [System.IO.Path]::GetFileNameWithoutExtension($env:APP_PROJECT)
+          $expectedBinPath = Join-Path $publishDir $expectedBin
+          $bin = if (Test-Path $expectedBinPath -PathType Leaf) { Get-Item $expectedBinPath } else { $null }
+
+          if (-not $bin) {
+            $bin = Get-ChildItem -Path $publishDir -File |
+              Where-Object { $_.Name -notmatch '\.(dll|json|pdb|xml|so|a|dylib)$' } |
+              Sort-Object Name |
+              Select-Object -First 1
+          }
+
           if (-not $bin) { throw "No Linux executable found in $publishDir" }
 
           "APP_BIN_NAME=$($bin.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "App binary: $($bin.Name)"
+          Write-Host "App binary: $($bin.Name) (expected: $expectedBin)"
 
       - name: Create Linux launcher (.sh)
         run: |
