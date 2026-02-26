@@ -15,12 +15,58 @@ concurrency:
 
 env:
   DOTNET_VERSION: 10.0.x
+  SOLUTION_FILE: NekoSharp.sln
   APP_PROJECT: NekoSharp.App/NekoSharp.App.csproj
   CONFIGURATION: Release
 
 jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            **/*.csproj
+            Directory.Packages.props
+            global.json
+            NuGet.config
+
+      - name: Restore (solution)
+        run: dotnet restore ${{ env.SOLUTION_FILE }}
+
+      - name: Build
+        run: >
+          dotnet build ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.CONFIGURATION }}
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Test
+        run: >
+          dotnet test ${{ env.SOLUTION_FILE }}
+          --configuration ${{ env.CONFIGURATION }}
+          --no-build
+          --verbosity normal
+
   build-windows:
     name: Build Windows (portable GTK)
+    needs: verify
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -152,6 +198,7 @@ jobs:
 
   build-linux:
     name: Build Linux
+    needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -186,6 +233,34 @@ jobs:
             -p:PublishSingleFile=true `
             -p:ContinuousIntegrationBuild=true `
             -o out/linux-x64
+
+      - name: Validate publish output (linux)
+        run: |
+          $publishDir = "out/linux-x64"
+          if (-not (Test-Path $publishDir)) { throw "Publish dir not found: $publishDir" }
+
+          $bin = Get-ChildItem -Path $publishDir -File | Where-Object { $_.Extension -eq "" } | Select-Object -First 1
+          if (-not $bin) { throw "No Linux executable found in $publishDir" }
+
+          "APP_BIN_NAME=$($bin.Name)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "App binary: $($bin.Name)"
+
+      - name: Create Linux launcher (.sh)
+        run: |
+          $publishDir = "out/linux-x64"
+          $launcherPath = Join-Path $publishDir "Run-NekoSharp.sh"
+
+          $launcher = @(
+            '#!/usr/bin/env bash',
+            'set -euo pipefail',
+            'APPDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+            'exec "$APPDIR/__APP_BIN__" "$@"'
+          ) -join "`n"
+          $launcher = $launcher.Replace("__APP_BIN__", $env:APP_BIN_NAME)
+
+          $launcher | Set-Content -Path $launcherPath -Encoding ascii
+          chmod +x $launcherPath
+          chmod +x (Join-Path $publishDir $env:APP_BIN_NAME)
 
       - name: Create tar.gz + sha256
         run: |

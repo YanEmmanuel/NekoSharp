@@ -61,6 +61,40 @@ dotnet run --project ./NekoSharp.App
 dotnet run --project ./NekoSharp.Tools -- new-scraper
 ```
 
+## Build e Release (Windows + Linux)
+
+O repositório já possui workflows para CI e release multiplataforma:
+
+- `.github/workflows/build.yml`
+  - valida `restore + build + test` em `windows-latest` e `ubuntu-latest`
+  - publica artefatos de app para `win-x64` e `linux-x64`
+- `.github/workflows/release.yml`
+  - em tag `v*`, valida novamente build/test em Windows e Linux
+  - gera assets de release para os dois sistemas
+
+### Publish local Linux (linux-x64)
+
+```bash
+dotnet restore ./NekoSharp.App/NekoSharp.App.csproj -r linux-x64
+dotnet publish ./NekoSharp.App/NekoSharp.App.csproj \
+  -c Release -r linux-x64 --self-contained true \
+  -p:PublishSingleFile=true \
+  -o out/linux-x64
+```
+
+### Publish local Windows (win-x64)
+
+```powershell
+dotnet restore .\NekoSharp.App\NekoSharp.App.csproj -r win-x64
+dotnet publish .\NekoSharp.App\NekoSharp.App.csproj `
+  -c Release -r win-x64 --self-contained true `
+  -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true `
+  -o out/win-x64
+```
+
+Observação: para Windows, o binário precisa do runtime nativo GTK4/libadwaita. O pacote portátil com runtime embutido é gerado automaticamente pelos workflows de CI/release.
+
 ## Fluxo de Uso da Aplicação
 
 1. Abra o app.
