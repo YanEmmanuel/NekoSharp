@@ -106,9 +106,10 @@ Copy-OneOf @("$gtkRoot\bin") "$packageRootFull\gtk\bin" -Required
 Copy-OneOf @("$gtkRoot\lib\gio") "$packageRootFull\gtk\lib\gio" -Required
 Copy-OneOf @("$gtkRoot\lib\gdk-pixbuf-2.0") "$packageRootFull\gtk\lib\gdk-pixbuf-2.0" -Required
 Copy-OneOf @("$gtkRoot\share\glib-2.0") "$packageRootFull\gtk\share\glib-2.0" -Required
-Copy-OneOf @("$gtkRoot\share\libadwaita-1") "$packageRootFull\gtk\share\libadwaita-1" -Required
 
 # Optional runtime folders
+# libadwaita styles may be compiled into the DLL in some MSYS2 builds.
+Copy-OneOf @("$gtkRoot\share\libadwaita-1") "$packageRootFull\gtk\share\libadwaita-1"
 # GTK module dir can be absent in some MSYS2 layouts where optional modules are split packages.
 Copy-OneOf @("$gtkRoot\lib\gtk-4.0") "$packageRootFull\gtk\lib\gtk-4.0"
 Copy-OneOf @("$gtkRoot\etc\gtk-4.0", "$gtkRoot\share\gtk-4.0") "$packageRootFull\gtk\etc\gtk-4.0"
