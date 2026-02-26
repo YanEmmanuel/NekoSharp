@@ -14,7 +14,7 @@ public partial class ChapterViewModel : ObservableObject
     private double _downloadProgress;
 
     [ObservableProperty]
-    private string _status = "Pending";
+    private string _status = "Pendente";
 
     [ObservableProperty]
     private ChapterDownloadStatus _downloadStatus = ChapterDownloadStatus.Queued;
@@ -26,8 +26,8 @@ public partial class ChapterViewModel : ObservableObject
     private bool _isStitching;
 
     public string DisplayTitle => string.IsNullOrEmpty(Chapter.Title)
-        ? $"Chapter {Chapter.Number}"
-        : $"Ch. {Chapter.Number} — {Chapter.Title}";
+        ? $"Capítulo {Chapter.Number}"
+        : $"Capítulo {Chapter.Number} — {Chapter.Title}";
 
     public ChapterViewModel(Chapter chapter)
     {
@@ -50,21 +50,21 @@ public partial class ChapterViewModel : ObservableObject
             DownloadStatus = ChapterDownloadStatus.Downloading;
             DownloadProgress = progress.TotalPages > 0 ? (double)progress.CurrentPage / progress.TotalPages * 100 : 0;
             ProgressText = $"{progress.CurrentPage}/{progress.TotalPages}";
-            Status = $"Downloading... {ProgressText}";
+            Status = $"Baixando... {ProgressText}";
         }
     }
 
     public void SetDownloading()
     {
         DownloadStatus = ChapterDownloadStatus.Downloading;
-        Status = "Downloading...";
+        Status = "Baixando...";
         IsStitching = false;
     }
 
     public void SetCompleted()
     {
         DownloadStatus = ChapterDownloadStatus.Completed;
-        Status = "Done ✓";
+        Status = "Concluído ✓";
         DownloadProgress = 100;
         IsStitching = false;
     }
@@ -72,14 +72,14 @@ public partial class ChapterViewModel : ObservableObject
     public void SetFailed(string error)
     {
         DownloadStatus = ChapterDownloadStatus.Failed;
-        Status = $"Failed: {error}";
+        Status = $"Falhou: {error}";
         IsStitching = false;
     }
 
     public void Reset()
     {
         DownloadStatus = ChapterDownloadStatus.Queued;
-        Status = "Pending";
+        Status = "Pendente";
         DownloadProgress = 0;
         ProgressText = string.Empty;
         IsStitching = false;

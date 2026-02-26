@@ -14,6 +14,7 @@ O projeto foi desenhado para separar claramente interface, domínio e ferramenta
 ## Recursos Principais
 
 - Descoberta automática de providers via reflexão.
+- Atualização dinâmica de providers externos via manifesto remoto (sem reinstalar o app).
 - Download de capítulos em paralelo com limite configurável.
 - Exportação em:
   - pasta com imagens
@@ -33,6 +34,34 @@ O projeto foi desenhado para separar claramente interface, domínio e ferramenta
 - MangaDex
 - Exyaoi (`3xyaoi.com`)
 - fbsquadx (`fbsquadx.com`)
+
+## Atualização Dinâmica de Providers
+
+O app verifica, ao iniciar, um manifesto remoto de providers e baixa DLLs externas para:
+
+- Linux: `~/.config/NekoSharp/providers`
+- Windows: `%AppData%/NekoSharp/providers`
+
+Configurações usadas no banco de settings:
+
+- `Providers.DynamicUpdates.Enabled` (bool)
+- `Providers.DynamicUpdates.ManifestUrl` (string)
+
+Manifesto padrão esperado:
+
+```json
+{
+  "providers": [
+    {
+      "name": "MeuProvider",
+      "version": "2026.02.26",
+      "assemblyUrl": "https://meu-cdn/providers/MeuProvider.dll",
+      "sha256": "HEX_OPCIONAL",
+      "enabled": true
+    }
+  ]
+}
+```
 
 ## Requisitos
 

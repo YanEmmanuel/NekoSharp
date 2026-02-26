@@ -23,11 +23,30 @@ class Program
             var scraperManager = new ScraperManager();
             var downloadService = new DownloadService(scraperManager, logService: logService, cfStore: cfStore, settingsStore: settingsStore);
             var viewModel = new MainWindowViewModel(scraperManager, downloadService, logService, settingsStore);
+            var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
 
-            scraperManager.DiscoverAndRegisterAll(logService, cfStore);
+            scraperManager.DiscoverAndRegisterAll(logService, cfStore, providerUpdateService.GetInstalledProviderAssemblies());
 
             var window = new MainWindow(viewModel, (Adw.Application)sender, logService);
             window.Present();
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var result = await providerUpdateService.UpdateProvidersAsync();
+                    logService.Info($"[ProviderUpdate] {result.Message}");
+
+                    if (result.DownloadedCount > 0)
+                    {
+                        logService.Info("[ProviderUpdate] Novos providers foram baixados. Reinicie o app para carregar as novas versões.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logService.Warn($"[ProviderUpdate] Falha ao verificar atualizações dinâmicas: {ex.Message}");
+                }
+            });
         };
 
         return application.RunWithSynchronizationContext(args);

@@ -8,7 +8,6 @@ using NekoSharp.Core.Models;
 
 namespace NekoSharp.Core.Services;
 
-
 public sealed class SmartStitchService
 {
     private readonly LogService? _log;
@@ -18,68 +17,74 @@ public sealed class SmartStitchService
         _log = logService;
     }
 
-    
     public async Task ProcessAsync(
         string inputDirectory,
         SmartStitchSettings settings,
         CancellationToken ct = default)
     {
-        if (!settings.Enabled) return;
+        if (!settings.Enabled)
+            return;
 
-        _log?.Info($"[SmartStitch] Starting processing in {inputDirectory}");
+        _log?.Info($"[SmartStitch] Iniciando processamento em {inputDirectory}");
 
         var imageFiles = GetSortedImageFiles(inputDirectory);
         if (imageFiles.Length == 0)
         {
-            _log?.Warn("[SmartStitch] No images found, skipping.");
+            _log?.Warn("[SmartStitch] Nenhuma imagem encontrada. Ignorando processamento.");
             return;
         }
 
-        _log?.Debug($"[SmartStitch] Found {imageFiles.Length} images to process.");
+        _log?.Debug($"[SmartStitch] {imageFiles.Length} imagem(ns) encontrada(s) para processar.");
 
         var images = await LoadImagesAsync(imageFiles, ct);
+        if (images.Count == 0)
+        {
+            _log?.Warn("[SmartStitch] Nenhuma imagem válida para processar.");
+            return;
+        }
+
+        List<Image<Rgba32>> slices;
         try
         {
-            var slices = await Task.Run(() =>
-            {
-                images = EnforceWidth(images, settings.WidthEnforcement, settings.CustomWidth);
+            images = EnforceWidth(images, settings.WidthEnforcement, settings.CustomWidth);
+            ct.ThrowIfCancellationRequested();
 
-                _log?.Debug("[SmartStitch] Combining images into single strip...");
-                var combined = Combine(images);
+            _log?.Debug("[SmartStitch] Combinando imagens em uma faixa única...");
+            using var combined = Combine(images);
 
-                foreach (var img in images) img.Dispose();
-                images.Clear();
+            _log?.Debug("[SmartStitch] Detectando pontos de corte...");
+            var rawSlicePoints = DetectSlicePoints(combined, settings);
+            var slicePoints = NormalizeSliceLocations(rawSlicePoints, combined.Height);
 
-                ct.ThrowIfCancellationRequested();
-
-                _log?.Debug("[SmartStitch] Detecting slice points...");
-                var slicePoints = DetectSlicePoints(combined, settings);
-
-                _log?.Info($"[SmartStitch] Found {slicePoints.Count - 1} slices.");
-
-                var result = Slice(combined, slicePoints);
-                combined.Dispose();
-
-                ct.ThrowIfCancellationRequested();
-                return result;
-            }, ct);
-
-            _log?.Debug("[SmartStitch] Saving output images...");
-            foreach (var file in imageFiles)
-            {
-                try { File.Delete(file); } catch { /* best effort */ }
-            }
-
-            await SaveSlicesAsync(slices, inputDirectory, settings, ct);
-
-            foreach (var slice in slices) slice.Dispose();
-
-            _log?.Info("[SmartStitch] Processing complete.");
+            _log?.Info($"[SmartStitch] {Math.Max(0, slicePoints.Count - 1)} corte(s) identificado(s).");
+            slices = Slice(combined, slicePoints);
         }
-        catch
+        finally
         {
-            foreach (var img in images) img.Dispose();
-            throw;
+            foreach (var image in images)
+                image.Dispose();
+        }
+
+        if (slices.Count == 0)
+        {
+            _log?.Warn("[SmartStitch] Nenhum recorte gerado. Mantendo imagens originais.");
+            return;
+        }
+
+        var stagingDirectory = Path.Combine(inputDirectory, "__nekosharp_stitch_tmp");
+        try
+        {
+            PrepareStagingDirectory(stagingDirectory);
+            await SaveSlicesAsync(slices, stagingDirectory, settings, ct);
+            ReplaceOutputFiles(imageFiles, stagingDirectory, inputDirectory);
+            _log?.Info("[SmartStitch] Processamento concluído.");
+        }
+        finally
+        {
+            foreach (var slice in slices)
+                slice.Dispose();
+
+            TryDeleteDirectory(stagingDirectory);
         }
     }
 
@@ -104,9 +109,18 @@ public sealed class SmartStitchService
         foreach (var file in files)
         {
             ct.ThrowIfCancellationRequested();
-            var img = await Image.LoadAsync<Rgba32>(file, ct);
-            images.Add(img);
+
+            try
+            {
+                var img = await Image.LoadAsync<Rgba32>(file, ct);
+                images.Add(img);
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn($"[SmartStitch] Ignorando imagem inválida '{Path.GetFileName(file)}': {ex.Message}");
+            }
         }
+
         return images;
     }
 
@@ -122,26 +136,19 @@ public sealed class SmartStitchService
         if (enforcement == StitchWidthEnforcement.None || images.Count == 0)
             return images;
 
-        int targetWidth;
-        if (enforcement == StitchWidthEnforcement.Automatic)
-        {
-            targetWidth = images.Min(img => img.Width);
-        }
-        else 
-        {
-            targetWidth = Math.Max(1, customWidth);
-        }
+        var targetWidth = enforcement == StitchWidthEnforcement.Automatic
+            ? images.Min(img => img.Width)
+            : Math.Max(1, customWidth);
 
-        _log?.Debug($"[SmartStitch] Enforcing width to {targetWidth}px ({enforcement})");
+        _log?.Debug($"[SmartStitch] Forçando largura para {targetWidth}px ({enforcement})");
 
-        for (int i = 0; i < images.Count; i++)
+        foreach (var img in images)
         {
-            var img = images[i];
-            if (img.Width == targetWidth) continue;
+            if (img.Width == targetWidth)
+                continue;
 
             var ratio = (double)img.Height / img.Width;
             var newHeight = Math.Max(1, (int)(ratio * targetWidth));
-
             img.Mutate(ctx => ctx.Resize(targetWidth, newHeight, KnownResamplers.Bicubic));
         }
 
@@ -178,14 +185,19 @@ public sealed class SmartStitchService
         return settings.DetectorType switch
         {
             StitchDetectorType.PixelComparison => DetectPixelComparison(
-                combined, settings.SplitHeight, settings.Sensitivity,
-                settings.ScanStep, settings.IgnorablePixels),
+                combined,
+                settings.SplitHeight,
+                settings.Sensitivity,
+                settings.ScanStep,
+                settings.IgnorablePixels),
             _ => DetectDirectSlicing(combined.Height, settings.SplitHeight)
         };
     }
 
     private static List<int> DetectDirectSlicing(int totalHeight, int splitHeight)
     {
+        splitHeight = Math.Max(1, splitHeight);
+
         var locations = new List<int> { 0 };
         var row = splitHeight;
         while (row < totalHeight)
@@ -193,16 +205,21 @@ public sealed class SmartStitchService
             locations.Add(row);
             row += splitHeight;
         }
-        if (locations[^1] != totalHeight - 1)
-            locations.Add(totalHeight - 1);
+
+        if (locations[^1] != totalHeight)
+            locations.Add(totalHeight);
+
         return locations;
     }
 
-   
     private List<int> DetectPixelComparison(
-        Image<Rgba32> combined, int splitHeight,
-        int sensitivity, int scanStep, int ignorablePixels)
+        Image<Rgba32> combined,
+        int splitHeight,
+        int sensitivity,
+        int scanStep,
+        int ignorablePixels)
     {
+        splitHeight = Math.Max(1, splitHeight);
         scanStep = Math.Clamp(scanStep, 1, 100);
         sensitivity = Math.Clamp(sensitivity, 0, 100);
 
@@ -216,8 +233,8 @@ public sealed class SmartStitchService
         {
             var row = splitHeight;
             var moveUp = true;
-            var startX = ignorablePixels + 1;
-            var endX = width - ignorablePixels;
+            var startX = Math.Max(1, ignorablePixels + 1);
+            var endX = width - Math.Max(0, ignorablePixels);
 
             while (row > 0 && row < height)
             {
@@ -261,15 +278,28 @@ public sealed class SmartStitchService
             }
         });
 
-        if (sliceLocations[^1] != height - 1)
-            sliceLocations.Add(height - 1);
-
+        sliceLocations.Add(height);
         return sliceLocations;
+    }
+
+    private static List<int> NormalizeSliceLocations(IEnumerable<int> rawLocations, int totalHeight)
+    {
+        var normalized = rawLocations
+            .Where(point => point > 0 && point < totalHeight)
+            .Distinct()
+            .OrderBy(point => point)
+            .ToList();
+
+        normalized.Insert(0, 0);
+
+        if (normalized[^1] != totalHeight)
+            normalized.Add(totalHeight);
+
+        return normalized;
     }
 
     private static int ToGray(Rgba32 pixel)
     {
-        // ITU-R BT.601 luma
         return (int)(0.299 * pixel.R + 0.587 * pixel.G + 0.114 * pixel.B);
     }
 
@@ -279,21 +309,27 @@ public sealed class SmartStitchService
 
     private static List<Image<Rgba32>> Slice(Image<Rgba32> combined, List<int> sliceLocations)
     {
+        if (sliceLocations.Count < 2)
+            return [combined.Clone()];
+
         var slices = new List<Image<Rgba32>>();
         var maxWidth = combined.Width;
 
-        for (int i = 1; i < sliceLocations.Count; i++)
+        for (var i = 1; i < sliceLocations.Count; i++)
         {
-            var upper = sliceLocations[i - 1];
-            var lower = sliceLocations[i];
+            var upper = Math.Clamp(sliceLocations[i - 1], 0, combined.Height);
+            var lower = Math.Clamp(sliceLocations[i], 0, combined.Height);
             var sliceHeight = lower - upper;
 
-            if (sliceHeight <= 0) continue;
+            if (sliceHeight <= 0)
+                continue;
 
             var rect = new Rectangle(0, upper, maxWidth, sliceHeight);
-            var slice = combined.Clone(ctx => ctx.Crop(rect));
-            slices.Add(slice);
+            slices.Add(combined.Clone(ctx => ctx.Crop(rect)));
         }
+
+        if (slices.Count == 0)
+            slices.Add(combined.Clone());
 
         return slices;
     }
@@ -308,9 +344,10 @@ public sealed class SmartStitchService
         SmartStitchSettings settings,
         CancellationToken ct)
     {
+        Directory.CreateDirectory(outputDirectory);
         var quality = Math.Clamp(settings.LossyQuality, 1, 100);
 
-        for (int i = 0; i < slices.Count; i++)
+        for (var i = 0; i < slices.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
 
@@ -336,7 +373,7 @@ public sealed class SmartStitchService
                         FileFormat = WebpFileFormatType.Lossy
                     }, ct);
                     break;
-                default: // PNG
+                default:
                     await slices[i].SaveAsPngAsync(filePath, new PngEncoder
                     {
                         CompressionLevel = PngCompressionLevel.DefaultCompression
@@ -345,7 +382,55 @@ public sealed class SmartStitchService
             }
         }
 
-        _log?.Debug($"[SmartStitch] Saved {slices.Count} sliced images to {outputDirectory}");
+        _log?.Debug($"[SmartStitch] {slices.Count} imagem(ns) recortada(s) salva(s) em {outputDirectory}");
+    }
+
+    private static void PrepareStagingDirectory(string stagingDirectory)
+    {
+        if (Directory.Exists(stagingDirectory))
+            Directory.Delete(stagingDirectory, true);
+
+        Directory.CreateDirectory(stagingDirectory);
+    }
+
+    private static void ReplaceOutputFiles(string[] originalFiles, string stagingDirectory, string outputDirectory)
+    {
+        var stagedFiles = Directory.GetFiles(stagingDirectory)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (stagedFiles.Length == 0)
+            throw new InvalidOperationException("Nenhum arquivo foi gerado pelo SmartStitch.");
+
+        var stagedNames = stagedFiles
+            .Select(Path.GetFileName)
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var stagedPath in stagedFiles)
+        {
+            var fileName = Path.GetFileName(stagedPath);
+            var targetPath = Path.Combine(outputDirectory, fileName);
+            File.Move(stagedPath, targetPath, true);
+        }
+
+        foreach (var originalPath in originalFiles)
+        {
+            var fileName = Path.GetFileName(originalPath);
+            if (!stagedNames.Contains(fileName))
+            {
+                try { File.Delete(originalPath); } catch { }
+            }
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+            return;
+
+        try { Directory.Delete(path, true); } catch { }
     }
 
     #endregion

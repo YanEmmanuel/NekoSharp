@@ -13,14 +13,14 @@ public static class DownloadPaths
     public static string GetChapterDirectory(string outputDirectory, Manga manga, Chapter chapter)
     {
         var safeMangaName = SanitizeFileName(manga.Name);
-        var safeChapterName = SanitizeFileName($"Chapter {chapter.Number:000} - {chapter.Title}");
+        var safeChapterName = SanitizeFileName($"Capitulo {chapter.Number:000} - {chapter.Title}");
         return Path.Combine(outputDirectory, safeMangaName, safeChapterName);
     }
 
     public static string GetChapterArchivePath(string outputDirectory, Manga manga, Chapter chapter, string extension)
     {
         var safeMangaName = SanitizeFileName(manga.Name);
-        var safeChapterName = SanitizeFileName($"Chapter {chapter.Number:000} - {chapter.Title}");
+        var safeChapterName = SanitizeFileName($"Capitulo {chapter.Number:000} - {chapter.Title}");
         var fileName = $"{safeChapterName}{extension}";
         return Path.Combine(outputDirectory, safeMangaName, fileName);
     }

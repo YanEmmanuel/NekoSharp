@@ -1,4 +1,5 @@
 using System.Collections.Specialized;
+using System.Text;
 using NekoSharp.App.ViewModels;
 
 namespace NekoSharp.App.Views;
@@ -49,9 +50,15 @@ public class LogWindow : Adw.Window
          
         var clearBtn = Gtk.Button.New();
         clearBtn.SetIconName("edit-clear-all-symbolic");
-        clearBtn.SetTooltipText("Clear Logs");
+        clearBtn.SetTooltipText("Limpar logs");
         clearBtn.OnClicked += (s, e) => _vm.LogEntries.Clear();
         headerBar.PackEnd(clearBtn);
+
+        var copyBtn = Gtk.Button.New();
+        copyBtn.SetIconName("edit-copy-symbolic");
+        copyBtn.SetTooltipText("Copiar logs");
+        copyBtn.OnClicked += (_, _) => CopyLogsToClipboard();
+        headerBar.PackEnd(copyBtn);
 
         SetContent(contentBox);
 
@@ -95,6 +102,8 @@ public class LogWindow : Adw.Window
                 RebuildLogEntries();
                 break;
         }
+
+        ScrollToBottom();
     }
 
     private void AddLogEntryWidget(LogEntryViewModel logVm)
@@ -143,7 +152,7 @@ public class LogWindow : Adw.Window
          
         if (logVm.HasDetails)
         {
-            var detailsExpander = Gtk.Expander.New("Details");
+            var detailsExpander = Gtk.Expander.New("Detalhes");
             var detailsLabel = Gtk.Label.New(logVm.Details);
             detailsLabel.SetWrap(true);
             detailsLabel.SetSelectable(true);
@@ -177,12 +186,56 @@ public class LogWindow : Adw.Window
         {
             AddLogEntryWidget(logVm);
         }
+
+        ScrollToBottom();
+    }
+
+    private void CopyLogsToClipboard()
+    {
+        var display = Gdk.Display.GetDefault();
+        if (display == null)
+            return;
+
+        var clipboard = display.GetClipboard();
+        var sb = new StringBuilder();
+
+        foreach (var entry in _vm.LogEntries)
+        {
+            sb.Append('[')
+                .Append(entry.Timestamp)
+                .Append("] ")
+                .Append(entry.Level)
+                .Append(" - ")
+                .Append(entry.Message);
+
+            if (!string.IsNullOrWhiteSpace(entry.Details))
+            {
+                sb.AppendLine();
+                sb.Append("    ").Append(entry.Details);
+            }
+
+            sb.AppendLine();
+        }
+
+        clipboard.SetText(sb.ToString().TrimEnd());
     }
 
     private void ScrollToBottom()
     {
-         
+        ScrollToBottomNow();
+
+        GLib.Functions.IdleAdd(0, () =>
+        {
+            ScrollToBottomNow();
+            return false;
+        });
+    }
+
+    private void ScrollToBottomNow()
+    {
         var vadj = _scrolledWindow.GetVadjustment();
-        vadj.SetValue(vadj.GetUpper() - vadj.GetPageSize());
+        var target = Math.Max(0, vadj.GetUpper() - vadj.GetPageSize());
+        if (Math.Abs(vadj.GetValue() - target) > 0.5)
+            vadj.SetValue(target);
     }
 }

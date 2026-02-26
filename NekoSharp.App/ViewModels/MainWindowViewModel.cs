@@ -35,7 +35,7 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private bool _isErrorState;
 
      
-    [ObservableProperty] private string _statusMessage = "Cole a URL de um mangá e clique em Fetch para começar.";
+    [ObservableProperty] private string _statusMessage = "Cole a URL de um mangá e clique em Buscar para começar.";
     [ObservableProperty] private string _statusType = "info";
 
      
@@ -76,7 +76,7 @@ public partial class MainWindowViewModel : ObservableObject
 
      
     [ObservableProperty] private string _outputDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "MangaDownloads");
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DownloadsMangas");
 
     public ObservableCollection<ChapterViewModel> Chapters { get; } = [];
     public ObservableCollection<LogEntryViewModel> LogEntries { get; } = [];
@@ -171,7 +171,7 @@ public partial class MainWindowViewModel : ObservableObject
         var scraper = _scraperManager.GetScraperForUrl(MangaUrl);
         if (scraper == null)
         {
-            SetStatus($"Nenhum scraper encontrado para essa URL. Sites suportados: {SupportedSites}", "error");
+            SetStatus($"Nenhum provedor encontrado para essa URL. Sites suportados: {SupportedSites}", "error");
             return;
         }
 
@@ -357,6 +357,22 @@ public partial class MainWindowViewModel : ObservableObject
         foreach (var c in Chapters) c.IsSelected = false;
     }
 
+    [RelayCommand(CanExecute = nameof(CanInvertChapterOrder))]
+    private void InvertChapterOrder()
+    {
+        if (Chapters.Count < 2)
+            return;
+
+        var ordered = Chapters.Reverse().ToList();
+        Chapters.Clear();
+        foreach (var chapter in ordered)
+            Chapters.Add(chapter);
+
+        SetStatus("Ordem dos capítulos invertida.", "info");
+    }
+
+    private bool CanInvertChapterOrder() => IsMangaLoaded && !IsDownloading && !IsFetching && Chapters.Count > 1;
+
     [RelayCommand]
     private void ToggleLogPanel() => IsLogPanelOpen = !IsLogPanelOpen;
 
@@ -380,7 +396,7 @@ public partial class MainWindowViewModel : ObservableObject
         IsMangaLoaded = false;
         IsFetching = false;
         IsDownloading = false;
-        SetStatus("Cole a URL de um mangá e clique em Fetch para começar.", "info");
+        SetStatus("Cole a URL de um mangá e clique em Buscar para começar.", "info");
     }
 
     private void SetStatus(string message, string type)
@@ -486,7 +502,7 @@ public partial class MainWindowViewModel : ObservableObject
         var provider = GetMediocreAuthProvider();
         if (provider is null)
         {
-            SetStatus("Provider MediocreScan não está disponível.", "warning");
+            SetStatus("Provedor MediocreScan não está disponível.", "warning");
             return;
         }
 
@@ -514,7 +530,7 @@ public partial class MainWindowViewModel : ObservableObject
         var provider = GetMediocreAuthProvider();
         if (provider is null)
         {
-            SetStatus("Provider MediocreScan não está disponível.", "warning");
+            SetStatus("Provedor MediocreScan não está disponível.", "warning");
             return;
         }
 

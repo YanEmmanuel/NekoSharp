@@ -10,7 +10,7 @@ namespace NekoSharp.Core.Providers.MediocreScan;
 
 public sealed class MediocreScanScraper : IScraper, IInteractiveAuthProvider
 {
-    public string Name => "MediocreScan";
+    public string Name => "Mediocre Scan";
     public string BaseUrl => _authProfile.SiteBaseUrl;
 
     private readonly HttpClient _http;
@@ -73,7 +73,7 @@ public sealed class MediocreScanScraper : IScraper, IInteractiveAuthProvider
 
         var name = GetString(obra, "nome") ?? $"Obra {obraId}";
         var description = GetString(obra, "sinopse") ?? GetString(obra, "descricao") ?? string.Empty;
-        var coverUrl = BuildCoverUrl(obraId, GetString(obra, "capa"));
+        var coverUrl = BuildCoverUrl(obraId, GetString(obra, "imagem"));
 
         _log?.Debug($"[MediocreScan] Resolved obra={obraId} for manga info");
 

@@ -146,7 +146,7 @@ public class MainWindow
 
         _logToggleBtn = Gtk.Button.New();
         _logToggleBtn.SetIconName("utilities-terminal-symbolic");
-        _logToggleBtn.SetTooltipText("Toggle Logs");
+        _logToggleBtn.SetTooltipText("Abrir logs");
         _logToggleBtn.OnClicked += (_, _) => 
         {
             _logWindow.Present();
@@ -173,7 +173,7 @@ public class MainWindow
         providersRow.SetHalign(Gtk.Align.End);
 
         _providersButton = Gtk.MenuButton.New();
-        _providersButton.SetLabel("Providers");
+        _providersButton.SetLabel("Provedores");
         _providersButton.SetTooltipText("Sites suportados");
         _providersButton.AddCssClass("flatpak-button");
         _providersPopover = BuildProvidersPopover();
@@ -253,7 +253,7 @@ public class MainWindow
         box.SetMarginStart(12);
         box.SetMarginEnd(12);
 
-        var title = Gtk.Label.New("Providers suportados");
+        var title = Gtk.Label.New("Provedores suportados");
         title.SetHalign(Gtk.Align.Start);
         title.AddCssClass("heading");
         box.Append(title);
@@ -300,7 +300,7 @@ public class MainWindow
         };
 
         var formatRow = Adw.ComboRow.New();
-        formatRow.SetTitle("Formato de Download");
+        formatRow.SetTitle("Formato de download");
         formatRow.SetSubtitle("Escolha o formato de saída");
         var model = Gtk.StringList.New(new[] { "Pasta (imagens)", "CBZ (zip)" });
         formatRow.SetModel(model);
@@ -409,7 +409,7 @@ public class MainWindow
     {
         var group = Adw.PreferencesGroup.New();
         group.SetTitle("MediocreScan (login obrigatório)");
-        group.SetDescription("Autenticação interativa para acessar a API autenticada do provider.");
+        group.SetDescription("Autenticação interativa para acessar a API autenticada do provedor.");
 
         var statusRow = Adw.ActionRow.New();
         statusRow.SetTitle("Status da Sessão");
@@ -538,8 +538,8 @@ public class MainWindow
         // ── Detector Type ──
         var detectorRow = Adw.ComboRow.New();
         detectorRow.SetTitle("Tipo de Detector");
-        detectorRow.SetSubtitle("Pixel Comparison evita cortar por falas/SFX; Direto corta exatamente");
-        var detectorModel = Gtk.StringList.New(new[] { "Direto (sem detecção)", "Smart Pixel Comparison" });
+        detectorRow.SetSubtitle("Comparação de pixels evita cortar por falas/SFX; Direto corta exatamente");
+        var detectorModel = Gtk.StringList.New(new[] { "Direto (sem detecção)", "Comparação de pixels" });
         detectorRow.SetModel(detectorModel);
         detectorRow.SetSelected((uint)_vm.SmartStitchDetectorType);
         detectorRow.OnNotify += (_, args) =>
@@ -565,7 +565,7 @@ public class MainWindow
 
         // ── Scan Step ──
         var scanStepRow = Adw.ActionRow.New();
-        scanStepRow.SetTitle("Scan Step (px)");
+        scanStepRow.SetTitle("Passo de varredura (px)");
         scanStepRow.SetSubtitle("Passo de busca quando a linha atual não pode ser cortada. Padrão: 5");
         var scanStepSpin = Gtk.SpinButton.NewWithRange(1, 100, 1);
         scanStepSpin.SetNumeric(true);
@@ -634,7 +634,7 @@ public class MainWindow
 
         // ── Lossy Quality ──
         var lossyRow = Adw.ActionRow.New();
-        lossyRow.SetTitle("Qualidade (Lossy)");
+        lossyRow.SetTitle("Qualidade (com perdas)");
         lossyRow.SetSubtitle("Qualidade para JPEG/WebP. 1-100. Padrão: 100");
         var lossySpin = Gtk.SpinButton.NewWithRange(1, 100, 1);
         lossySpin.SetNumeric(true);
@@ -844,15 +844,24 @@ public class MainWindow
         var selectionBar = Gtk.Box.New(Gtk.Orientation.Horizontal, 12);
         selectionBar.SetHalign(Gtk.Align.End);  
         
-        var selectAllBtn = Gtk.Button.NewWithLabel("Select All");
+        var selectAllBtn = Gtk.Button.NewWithLabel("Selecionar todos");
         selectAllBtn.AddCssClass("flat");
         selectAllBtn.OnClicked += (_, _) => _vm.SelectAllCommand.Execute(null);
         selectionBar.Append(selectAllBtn);
         
-        var deselectAllBtn = Gtk.Button.NewWithLabel("Deselect All");
+        var deselectAllBtn = Gtk.Button.NewWithLabel("Limpar seleção");
         deselectAllBtn.AddCssClass("flat");
         deselectAllBtn.OnClicked += (_, _) => _vm.DeselectAllCommand.Execute(null);
         selectionBar.Append(deselectAllBtn);
+
+        var invertOrderBtn = Gtk.Button.NewWithLabel("Inverter ordem");
+        invertOrderBtn.AddCssClass("flat");
+        invertOrderBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.InvertChapterOrderCommand.CanExecute(null))
+                _vm.InvertChapterOrderCommand.Execute(null);
+        };
+        selectionBar.Append(invertOrderBtn);
         
         box.Append(selectionBar);
 
@@ -918,10 +927,10 @@ public class MainWindow
         var actionsBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 12);
         actionsBox.SetMarginBottom(24);
 
-        _downloadSelectedBtn = Gtk.Button.NewWithLabel("Download");  
+        _downloadSelectedBtn = Gtk.Button.NewWithLabel("Baixar selecionados");
         _downloadSelectedBtn.AddCssClass("suggested-action");
         _downloadSelectedBtn.AddCssClass("pill");
-        _downloadSelectedBtn.SetTooltipText("Download selected chapters");
+        _downloadSelectedBtn.SetTooltipText("Baixar capítulos selecionados");
         _downloadSelectedBtn.OnClicked += (_, _) =>
         {
             if (_vm.DownloadSelectedCommand.CanExecute(null))
@@ -929,7 +938,7 @@ public class MainWindow
         };
         actionsBox.Append(_downloadSelectedBtn);
 
-        _downloadAllBtn = Gtk.Button.NewWithLabel("Download All");
+        _downloadAllBtn = Gtk.Button.NewWithLabel("Baixar todos");
         _downloadAllBtn.AddCssClass("pill"); 
         _downloadAllBtn.OnClicked += (_, _) =>
         {
@@ -938,7 +947,7 @@ public class MainWindow
         };
         actionsBox.Append(_downloadAllBtn);
         
-        _cancelBtn = Gtk.Button.NewWithLabel("Cancel");
+        _cancelBtn = Gtk.Button.NewWithLabel("Cancelar");
         _cancelBtn.AddCssClass("destructive-action");
         _cancelBtn.AddCssClass("pill");
         _cancelBtn.SetVisible(false);
@@ -998,7 +1007,7 @@ public class MainWindow
     {
          
         var group = Adw.PreferencesGroup.New();
-        group.SetTitle("Chapters");
+        group.SetTitle("Capítulos");
         
         _chapterListBox = Gtk.Box.New(Gtk.Orientation.Vertical, 0);
         _chapterListBox.AddCssClass("boxed-list"); 
@@ -1083,7 +1092,7 @@ public class MainWindow
                 break;
 
             case nameof(MainWindowViewModel.TotalChapters):
-                _chapterBadgeLabel.SetText($"{_vm.TotalChapters} chapters");
+                _chapterBadgeLabel.SetText($"{_vm.TotalChapters} capítulos");
                 break;
 
             case nameof(MainWindowViewModel.MangaCoverUrl):
@@ -1391,7 +1400,7 @@ public class MainWindow
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Cover] Failed to load cover: {ex.Message}");
+            Console.Error.WriteLine($"[Cover] Falha ao carregar capa: {ex.Message}");
         }
     }
 
@@ -1420,7 +1429,7 @@ public class MainWindow
     private async Task ChooseOutputFolderAsync(Adw.ActionRow row)
     {
         var dialog = Gtk.FileDialog.New();
-        dialog.SetTitle("Choose download folder");
+        dialog.SetTitle("Escolher pasta de download");
         try
         {
             var file = await dialog.SelectFolderAsync(_window);

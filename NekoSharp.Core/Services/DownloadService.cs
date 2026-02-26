@@ -75,7 +75,7 @@ public class DownloadService : IDownloadService
         CancellationToken ct = default)
     {
         var scraper = _scraperManager.GetScraperForUrl(manga.Url)
-                      ?? throw new InvalidOperationException($"No scraper found for URL: {manga.Url}");
+                      ?? throw new InvalidOperationException($"Nenhum provedor encontrado para a URL: {manga.Url}");
                       
         var targetStartFormat = _settings != null 
             ? await _settings.GetEnumAsync("Download.ImageFormat", ImageFormat.Original)
@@ -200,17 +200,36 @@ public class DownloadService : IDownloadService
                     StitchingStatus = "SmartStitch: Processando..."
                 });
 
-                _log?.Info($"[SmartStitch] Running post-processing on chapter {chapter.Number}...");
+                _log?.Info($"[SmartStitch] Executando pós-processamento no capítulo {chapter.Number}...");
                 var stitcher = new SmartStitchService(_log);
-                await stitcher.ProcessAsync(tempDir, stitchSettings, ct);
 
-                progress?.Report(new DownloadProgress
+                try
                 {
-                    CurrentPage = totalPages,
-                    TotalPages = totalPages,
-                    IsStitching = true,
-                    StitchingStatus = "SmartStitch: Concluído ✓"
-                });
+                    await stitcher.ProcessAsync(tempDir, stitchSettings, ct);
+
+                    progress?.Report(new DownloadProgress
+                    {
+                        CurrentPage = totalPages,
+                        TotalPages = totalPages,
+                        IsStitching = true,
+                        StitchingStatus = "SmartStitch: Concluído ✓"
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _log?.Warn($"[SmartStitch] Falhou no capítulo {chapter.Number}. Mantendo imagens originais. Motivo: {ex.Message}");
+                    progress?.Report(new DownloadProgress
+                    {
+                        CurrentPage = totalPages,
+                        TotalPages = totalPages,
+                        IsStitching = true,
+                        StitchingStatus = "SmartStitch: Falhou, mantendo imagens originais."
+                    });
+                }
             }
         }
 
@@ -294,7 +313,7 @@ public class DownloadService : IDownloadService
         }
         catch (Exception ex)
         {
-            _log?.Error($"Failed to convert image {inputPath} to {format}: {ex}");
+            _log?.Error($"Falha ao converter imagem {inputPath} para {format}: {ex}");
             File.Copy(inputPath, outputPath, true);
         }
     }
