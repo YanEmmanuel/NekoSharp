@@ -15,10 +15,25 @@ public sealed class ProviderUpdateService
     public const string SettingsManifestUrlKey = "Providers.DynamicUpdates.ManifestUrl";
     public const string SettingsLastCheckUtcKey = "Providers.DynamicUpdates.LastCheckUtc";
 
-    public const string DefaultManifestUrl = "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/main/providers/manifest.json";
-    private const string LegacyManifestUrl = "https://raw.githubusercontent.com/yan/NekoSharp/main/providers/manifest.json";
+    public const string DefaultManifestUrl = "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/master/providers/manifest.json";
+    private const string OfficialManifestUrlMain = "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/main/providers/manifest.json";
+    private const string OfficialManifestUrlLegacyOwnerMaster = "https://raw.githubusercontent.com/yan/NekoSharp/master/providers/manifest.json";
+    private const string OfficialManifestUrlLegacyOwnerMain = "https://raw.githubusercontent.com/yan/NekoSharp/main/providers/manifest.json";
 
     private const string InstalledVersionPrefix = "Providers.DynamicUpdates.InstalledVersion.";
+    private static readonly string[] LegacyManifestUrls =
+    [
+        OfficialManifestUrlMain,
+        OfficialManifestUrlLegacyOwnerMain
+    ];
+
+    private static readonly string[] OfficialManifestUrls =
+    [
+        DefaultManifestUrl,
+        OfficialManifestUrlMain,
+        OfficialManifestUrlLegacyOwnerMaster,
+        OfficialManifestUrlLegacyOwnerMain
+    ];
 
     private readonly ISettingsStore _settingsStore;
     private readonly LogService? _log;
@@ -69,28 +84,46 @@ public sealed class ProviderUpdateService
         }
 
         var manifestUrl = await _settingsStore.GetStringAsync(SettingsManifestUrlKey, DefaultManifestUrl);
-        if (string.Equals(manifestUrl, LegacyManifestUrl, StringComparison.OrdinalIgnoreCase))
-        {
-            manifestUrl = DefaultManifestUrl;
-            await _settingsStore.SetStringAsync(SettingsManifestUrlKey, manifestUrl);
-        }
-
         if (string.IsNullOrWhiteSpace(manifestUrl))
         {
             await _settingsStore.SetStringAsync(SettingsLastCheckUtcKey, checkedAtUtc.ToString("O"));
             return new ProviderUpdateResult(0, 0, "Manifesto de atualização de providers não configurado.", checkedAtUtc);
         }
 
-        List<ProviderPackageManifest> packages;
-        try
+        manifestUrl = manifestUrl.Trim();
+        if (IsLegacyManifestUrl(manifestUrl))
         {
-            packages = await FetchManifestAsync(manifestUrl, ct);
+            manifestUrl = DefaultManifestUrl;
+            await _settingsStore.SetStringAsync(SettingsManifestUrlKey, manifestUrl);
         }
-        catch (Exception ex)
+
+        var manifestCandidates = BuildManifestCandidates(manifestUrl);
+        List<ProviderPackageManifest>? packages = null;
+        var fetchErrors = new List<string>();
+
+        foreach (var manifestCandidate in manifestCandidates)
         {
-            _log?.Warn($"[ProviderUpdate] Falha ao carregar manifesto ({manifestUrl}): {ex.Message}");
+            try
+            {
+                packages = await FetchManifestAsync(manifestCandidate, ct);
+                break;
+            }
+            catch (Exception ex)
+            {
+                fetchErrors.Add($"{manifestCandidate}: {ex.Message}");
+                _log?.Warn($"[ProviderUpdate] Falha ao carregar manifesto ({manifestCandidate}): {ex.Message}");
+            }
+        }
+
+        if (packages is null)
+        {
             await _settingsStore.SetStringAsync(SettingsLastCheckUtcKey, checkedAtUtc.ToString("O"));
-            return new ProviderUpdateResult(0, 0, $"Falha ao carregar manifesto de providers: {ex.Message}", checkedAtUtc);
+
+            var errorMessage = fetchErrors.Count > 0
+                ? string.Join(" | ", fetchErrors)
+                : "erro desconhecido ao carregar manifesto.";
+
+            return new ProviderUpdateResult(0, 0, $"Falha ao carregar manifesto de providers: {errorMessage}", checkedAtUtc);
         }
 
         if (packages.Count == 0)
@@ -161,30 +194,44 @@ public sealed class ProviderUpdateService
         response.EnsureSuccessStatusCode();
 
         var content = await response.Content.ReadAsStringAsync(ct);
-        using var document = JsonDocument.Parse(content);
+        if (string.IsNullOrWhiteSpace(content))
+            throw new InvalidOperationException($"Manifesto vazio em '{manifestUrl}'.");
 
-        if (!document.RootElement.TryGetProperty("providers", out var providersNode) ||
-            providersNode.ValueKind != JsonValueKind.Array)
+        JsonDocument document;
+        try
         {
-            return [];
+            document = JsonDocument.Parse(content);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException($"Manifesto inválido (JSON) em '{manifestUrl}': {ex.Message}", ex);
         }
 
-        var packages = new List<ProviderPackageManifest>();
-        foreach (var item in providersNode.EnumerateArray())
+        using (document)
         {
-            if (item.ValueKind != JsonValueKind.Object)
-                continue;
+            if (!document.RootElement.TryGetProperty("providers", out var providersNode) ||
+                providersNode.ValueKind != JsonValueKind.Array)
+            {
+                return [];
+            }
 
-            var name = GetString(item, "name", "provider", "id") ?? string.Empty;
-            var version = GetString(item, "version", "tag", "release") ?? "latest";
-            var assemblyUrl = GetString(item, "assemblyUrl", "downloadUrl", "url") ?? string.Empty;
-            var sha256 = GetString(item, "sha256", "checksum", "hash");
-            var enabled = GetBool(item, "enabled") ?? true;
+            var packages = new List<ProviderPackageManifest>();
+            foreach (var item in providersNode.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object)
+                    continue;
 
-            packages.Add(new ProviderPackageManifest(name, version, assemblyUrl, sha256, enabled));
+                var name = GetString(item, "name", "provider", "id") ?? string.Empty;
+                var version = GetString(item, "version", "tag", "release") ?? "latest";
+                var assemblyUrl = GetString(item, "assemblyUrl", "downloadUrl", "url") ?? string.Empty;
+                var sha256 = GetString(item, "sha256", "checksum", "hash");
+                var enabled = GetBool(item, "enabled") ?? true;
+
+                packages.Add(new ProviderPackageManifest(name, version, assemblyUrl, sha256, enabled));
+            }
+
+            return packages;
         }
-
-        return packages;
     }
 
     private async Task DownloadAssemblyAsync(ProviderPackageManifest package, string targetPath, CancellationToken ct)
@@ -259,6 +306,37 @@ public sealed class ProviderUpdateService
         }
 
         return null;
+    }
+
+    private static bool IsLegacyManifestUrl(string manifestUrl)
+    {
+        return LegacyManifestUrls.Contains(manifestUrl, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOfficialManifestUrl(string manifestUrl)
+    {
+        return OfficialManifestUrls.Contains(manifestUrl, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IReadOnlyList<string> BuildManifestCandidates(string configuredManifestUrl)
+    {
+        if (!IsOfficialManifestUrl(configuredManifestUrl))
+            return [configuredManifestUrl];
+
+        var result = new List<string>
+        {
+            configuredManifestUrl
+        };
+
+        foreach (var officialUrl in OfficialManifestUrls)
+        {
+            if (result.Contains(officialUrl, StringComparer.OrdinalIgnoreCase))
+                continue;
+
+            result.Add(officialUrl);
+        }
+
+        return result;
     }
 
     private static string SanitizeFileSegment(string value)
