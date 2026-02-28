@@ -5,6 +5,12 @@ namespace NekoSharp.Tools;
 
 internal static class Program
 {
+    private enum ScraperTemplateKind
+    {
+        Standard,
+        WordPressMadara
+    }
+
     private static readonly string RootDir = Directory.GetCurrentDirectory();
     private static readonly string ProvidersDir = Path.Combine(RootDir, "NekoSharp.Core", "Providers");
 
@@ -49,11 +55,13 @@ internal static class Program
         var siteName = Ask("Nome do site (ex: MangaDex)", "MySite");
         var className = Ask("Nome da classe Scraper", $"{siteName}Scraper");
         var baseUrl = Ask("Base URL do site", "https://example.com");
+        var templateKind = AskTemplateKind();
 
         AnsiConsole.WriteLine();
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Cyan1);
         table.AddColumn("Campo");
         table.AddColumn("Valor");
+        table.AddRow("Tipo", GetTemplateKindLabel(templateKind));
         table.AddRow("Site", siteName);
         table.AddRow("Classe", className);
         table.AddRow("Namespace", $"NekoSharp.Core.Providers.{siteName}");
@@ -83,7 +91,7 @@ internal static class Program
             .Start("Criando provider...", _ =>
             {
                 Directory.CreateDirectory(targetDir);
-                WriteScraper(scraperFile, siteName, className, baseUrl);
+                WriteScraper(scraperFile, siteName, className, baseUrl, templateKind);
             });
 
         AnsiConsole.MarkupLine("[green]✔ Provider criado![/]");
@@ -92,7 +100,10 @@ internal static class Program
         var rule = new Rule("[cyan]Próximo passo[/]").LeftJustified();
         AnsiConsole.Write(rule);
         AnsiConsole.MarkupLine($"  Edite: [cyan]{Markup.Escape(scraperFile)}[/]");
-        AnsiConsole.MarkupLine("  Implemente os métodos TODO.");
+        if (templateKind == ScraperTemplateKind.Standard)
+            AnsiConsole.MarkupLine("  Implemente os métodos TODO.");
+        else
+            AnsiConsole.MarkupLine("  Ajuste os seletores com overrides no template, se necessário.");
         AnsiConsole.MarkupLine("  O provider será registrado automaticamente ao iniciar o app.");
         AnsiConsole.WriteLine();
 
@@ -128,13 +139,52 @@ internal static class Program
                 .ShowDefaultValue());
     }
 
+    private static ScraperTemplateKind AskTemplateKind()
+    {
+        var choice = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[cyan]Tipo de scaffold[/]")
+                .AddChoices(
+                    "Padrão (IScraper completo)",
+                    "Template Madara (somente provider baseado em template)"));
+
+        return choice.StartsWith("Template Madara", StringComparison.OrdinalIgnoreCase)
+            ? ScraperTemplateKind.WordPressMadara
+            : ScraperTemplateKind.Standard;
+    }
+
+    private static string GetTemplateKindLabel(ScraperTemplateKind templateKind)
+    {
+        return templateKind switch
+        {
+            ScraperTemplateKind.WordPressMadara => "Template Madara",
+            _ => "Padrão"
+        };
+    }
+
     private static void WriteBanner()
     {
         AnsiConsole.Write(new FigletText("NekoSharp").Centered().Color(Color.Cyan1));
         AnsiConsole.WriteLine();
     }
 
-    private static void WriteScraper(string filePath, string siteName, string className, string baseUrl)
+    private static void WriteScraper(
+        string filePath,
+        string siteName,
+        string className,
+        string baseUrl,
+        ScraperTemplateKind templateKind)
+    {
+        var source = templateKind switch
+        {
+            ScraperTemplateKind.WordPressMadara => BuildMadaraTemplateProvider(siteName, className, baseUrl),
+            _ => BuildStandardProvider(siteName, className, baseUrl)
+        };
+
+        File.WriteAllText(filePath, source);
+    }
+
+    private static string BuildStandardProvider(string siteName, string className, string baseUrl)
     {
         var sb = new StringBuilder();
         sb.AppendLine("using NekoSharp.Core.Interfaces;");
@@ -185,7 +235,30 @@ internal static class Program
         sb.AppendLine("    }");
         sb.AppendLine("}");
 
-        File.WriteAllText(filePath, sb.ToString());
+        return sb.ToString();
+    }
+
+    private static string BuildMadaraTemplateProvider(string siteName, string className, string baseUrl)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("using NekoSharp.Core.Providers.Templates;");
+        sb.AppendLine("using NekoSharp.Core.Services;");
+        sb.AppendLine();
+        sb.AppendLine($"namespace NekoSharp.Core.Providers.{siteName};");
+        sb.AppendLine();
+        sb.AppendLine($"public sealed class {className} : WordPressMadaraScraper");
+        sb.AppendLine("{");
+        sb.AppendLine($"    public override string Name => \"{siteName}\";");
+        sb.AppendLine();
+        sb.AppendLine($"    public {className}() : this(null, null) {{ }}");
+        sb.AppendLine();
+        sb.AppendLine($"    public {className}(LogService? logService) : this(logService, null) {{ }}");
+        sb.AppendLine();
+        sb.AppendLine($"    public {className}(LogService? logService, CloudflareCredentialStore? cfStore)");
+        sb.AppendLine($"        : base(\"{baseUrl}\", logService, cfStore)");
+        sb.AppendLine("    { }");
+        sb.AppendLine("}");
+
+        return sb.ToString();
     }
 }
-
