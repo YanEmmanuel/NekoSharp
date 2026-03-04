@@ -20,6 +20,7 @@ public partial class MainWindowViewModel : ObservableObject
     private readonly IMangaLibraryService _mangaLibraryService;
     private readonly LogService _logService;
     private readonly ISettingsStore _settingsStore;
+    private readonly CloudflareCredentialStore _cloudflareStore;
     private CancellationTokenSource? _cts;
 
      
@@ -72,6 +73,8 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private string _mediocreAuthPassword = string.Empty;
     [ObservableProperty] private bool _mediocreRememberCredentials = true;
     [ObservableProperty] private bool _hasSavedMediocreCredentials;
+    [ObservableProperty] private bool _isCloudflareCacheBusy;
+    [ObservableProperty] private int _cloudflareCacheEntries;
 
     [ObservableProperty] private bool _isLibraryBusy;
     [ObservableProperty] private int _libraryNewChaptersTotal;
@@ -98,13 +101,15 @@ public partial class MainWindowViewModel : ObservableObject
         IDownloadService downloadService,
         IMangaLibraryService mangaLibraryService,
         LogService logService,
-        ISettingsStore settingsStore)
+        ISettingsStore settingsStore,
+        CloudflareCredentialStore cloudflareStore)
     {
         _scraperManager = scraperManager;
         _downloadService = downloadService;
         _mangaLibraryService = mangaLibraryService;
         _logService = logService;
         _settingsStore = settingsStore;
+        _cloudflareStore = cloudflareStore;
 
         LoadSettings();
 
@@ -124,6 +129,7 @@ public partial class MainWindowViewModel : ObservableObject
         };
 
         _ = RefreshLibraryAsync();
+        _ = RefreshCloudflareCacheInfoAsync();
     }
 
     private void LoadSettings()
@@ -230,6 +236,8 @@ public partial class MainWindowViewModel : ObservableObject
     private bool CanFetch() => !IsFetching && !IsDownloading && !IsLibraryBusy;
 
     private bool CanRunMediocreAuthAction() => !IsMediocreAuthBusy && !IsFetching && !IsDownloading && !IsLibraryBusy;
+
+    private bool CanRunCloudflareCacheAction() => !IsCloudflareCacheBusy && !IsFetching && !IsDownloading && !IsLibraryBusy;
 
     private bool CanRunLibraryAction() => !IsLibraryBusy && !IsFetching && !IsDownloading;
 
@@ -787,6 +795,11 @@ public partial class MainWindowViewModel : ObservableObject
 
     partial void OnIsLibraryBusyChanged(bool value) => NotifyCanExecuteStateChanged();
 
+    partial void OnIsCloudflareCacheBusyChanged(bool value)
+    {
+        NotifyCanExecuteStateChanged();
+    }
+
     partial void OnIsCurrentMangaFollowedChanged(bool value)
     {
         FollowCurrentMangaCommand.NotifyCanExecuteChanged();
@@ -817,6 +830,8 @@ public partial class MainWindowViewModel : ObservableObject
         ClearMediocreAuthCommand.NotifyCanExecuteChanged();
         ClearMediocreSavedCredentialsCommand.NotifyCanExecuteChanged();
         RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
+        RefreshCloudflareCacheInfoCommand.NotifyCanExecuteChanged();
+        ClearCloudflareCacheCommand.NotifyCanExecuteChanged();
     }
 
     [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
@@ -844,6 +859,44 @@ public partial class MainWindowViewModel : ObservableObject
         finally
         {
             IsMediocreAuthBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunCloudflareCacheAction))]
+    private async Task RefreshCloudflareCacheInfoAsync()
+    {
+        IsCloudflareCacheBusy = true;
+        try
+        {
+            CloudflareCacheEntries = await _cloudflareStore.CountAsync();
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao consultar cache Cloudflare: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsCloudflareCacheBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunCloudflareCacheAction))]
+    private async Task ClearCloudflareCacheAsync()
+    {
+        IsCloudflareCacheBusy = true;
+        try
+        {
+            var removed = await _cloudflareStore.ClearAllAsync();
+            CloudflareCacheEntries = await _cloudflareStore.CountAsync();
+            SetStatus($"Cache Cloudflare limpo ({removed} entrada(s) removida(s)).", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao limpar cache Cloudflare: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsCloudflareCacheBusy = false;
         }
     }
 

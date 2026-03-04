@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using PuppeteerSharp;
 using NekoSharp.Core.Models;
 
@@ -39,6 +40,9 @@ public class CloudflareHandler : DelegatingHandler
     private readonly TimeSpan _pollInterval;
 
     private static readonly SemaphoreSlim BrowserLock = new(1, 1);
+    private static readonly ConcurrentDictionary<string, DateTime> FailedChallengeCooldownUntilUtc =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan FailedChallengeCooldown = TimeSpan.FromMinutes(2);
 
     public CloudflareHandler(
         HttpMessageHandler? inner = null,
@@ -57,20 +61,37 @@ public class CloudflareHandler : DelegatingHandler
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken ct)
     {
+        var originalUri = request.RequestUri;
         var host = request.RequestUri?.Host;
+        CloudflareCredentials? storedCreds = null;
 
          
         if (host is not null)
         {
-            var stored = await _store.TryGetAsync(host);
-            if (stored is not null)
+            storedCreds = await _store.TryGetAsync(host);
+            if (storedCreds is not null)
             {
                 _log?.Debug($"[Cloudflare] Injecting saved credentials for {host}");
-                InjectCredentials(request, stored);
+                InjectCredentials(request, storedCreds);
             }
         }
 
         var response = await base.SendAsync(request, ct);
+
+        if (storedCreds is not null && host is not null &&
+            ShouldInvalidateStoredCredentialsAfterSuccess(response, originalUri))
+        {
+            _log?.Warn($"[Cloudflare] Suspicious redirect/response for {host} with stored credentials. Invalidating and retrying naked.");
+            await _store.RemoveAsync(host);
+            response.Dispose();
+
+            var retryNaked = await CloneRequestAsync(request);
+            retryNaked.Headers.Remove("Cookie");
+            retryNaked.Headers.Remove("User-Agent");
+
+            response = await base.SendAsync(retryNaked, ct);
+            storedCreds = null;
+        }
 
          
          
@@ -79,14 +100,13 @@ public class CloudflareHandler : DelegatingHandler
         if (!response.IsSuccessStatusCode && host is not null)
         {
              
-            var hadStored = await _store.TryGetAsync(host);
-            if (hadStored != null)
+            if (storedCreds != null)
             {
                 var code = (int)response.StatusCode;
                  
                  
                  
-                if (code is 403 or 503 or 404 or 520 or 522 or 524)
+                if (code is 403 or 404 or 429 or 503 or 520 or 522 or 524)
                 {
                     bool isChallenge = await IsCloudflareChallenge(response, ct);
                     if (!isChallenge)
@@ -112,6 +132,15 @@ public class CloudflareHandler : DelegatingHandler
         if (!await IsCloudflareChallenge(response, ct))
             return response;
 
+        if (host is not null &&
+            FailedChallengeCooldownUntilUtc.TryGetValue(host, out var cooldownUntilUtc) &&
+            DateTime.UtcNow < cooldownUntilUtc)
+        {
+            var waitSeconds = (int)Math.Ceiling((cooldownUntilUtc - DateTime.UtcNow).TotalSeconds);
+            _log?.Warn($"[Cloudflare] Challenge bypass for {host} is cooling down for {waitSeconds}s after previous failure.");
+            return response;
+        }
+
         _log?.Warn($"[Cloudflare] Challenge detected for {request.RequestUri}");
         _log?.Info("[Cloudflare] Opening Chrome via CDP — please solve the CAPTCHA if prompted…");
 
@@ -136,11 +165,17 @@ public class CloudflareHandler : DelegatingHandler
                     var creds = await SolveWithBrowserAsync(uri.ToString(), ct);
                     if (creds is null)
                     {
+                        if (host is not null)
+                            FailedChallengeCooldownUntilUtc[host] = DateTime.UtcNow.Add(FailedChallengeCooldown);
+
                         _log?.Error("[Cloudflare] Bypass failed — returning original response.");
                         return response;
                     }
 
                     await _store.SaveAsync(creds);
+                    if (host is not null)
+                        FailedChallengeCooldownUntilUtc.TryRemove(host, out _);
+
                     _log?.Info($"[Cloudflare] Bypass succeeded for {uri.Host}. Credentials saved to DB.");
                 }
             }
@@ -459,6 +494,58 @@ public class CloudflareHandler : DelegatingHandler
         }
 
         return clone;
+    }
+
+    private static bool ShouldInvalidateStoredCredentialsAfterSuccess(HttpResponseMessage response, Uri? originalUri)
+    {
+        if (!response.IsSuccessStatusCode || originalUri is null)
+            return false;
+
+        var finalUri = response.RequestMessage?.RequestUri;
+        if (finalUri is null)
+            return false;
+
+        if (IsTrivialCanonicalRedirect(originalUri, finalUri))
+            return false;
+
+        if (!IsLikelyDocumentContent(response))
+            return false;
+
+        return true;
+    }
+
+    private static bool IsTrivialCanonicalRedirect(Uri originalUri, Uri finalUri)
+    {
+        if (!originalUri.Host.Equals(finalUri.Host, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var originalPath = NormalizePath(originalUri.AbsolutePath);
+        var finalPath = NormalizePath(finalUri.AbsolutePath);
+
+        return originalPath.Equals(finalPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return "/";
+
+        var normalized = path.Trim();
+        if (!normalized.StartsWith('/'))
+            normalized = "/" + normalized;
+
+        normalized = normalized.TrimEnd('/');
+        return string.IsNullOrWhiteSpace(normalized) ? "/" : normalized;
+    }
+
+    private static bool IsLikelyDocumentContent(HttpResponseMessage response)
+    {
+        var mediaType = response.Content.Headers.ContentType?.MediaType;
+        if (string.IsNullOrWhiteSpace(mediaType))
+            return true;
+
+        return mediaType.StartsWith("text/html", StringComparison.OrdinalIgnoreCase) ||
+               mediaType.StartsWith("text/plain", StringComparison.OrdinalIgnoreCase);
     }
 
      

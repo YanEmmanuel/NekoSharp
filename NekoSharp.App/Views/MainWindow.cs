@@ -486,11 +486,68 @@ public class MainWindow
         };
 
         page.Add(group);
+        page.Add(BuildCloudflareSettingsGroup());
         page.Add(BuildMediocreAuthSettingsGroup());
 
         page.Add(BuildSmartStitchSettingsGroup());
 
         return page;
+    }
+
+    private Adw.PreferencesGroup BuildCloudflareSettingsGroup()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("Cloudflare");
+        group.SetDescription("Gerencie o cache local de credenciais temporárias.");
+
+        var row = Adw.ActionRow.New();
+        row.SetTitle("Cache de credenciais");
+        row.SetSubtitle(BuildCloudflareCacheSubtitle());
+        row.SetActivatable(false);
+
+        var actions = Gtk.Box.New(Gtk.Orientation.Horizontal, 6);
+
+        var refreshBtn = Gtk.Button.NewWithLabel("Atualizar");
+        refreshBtn.AddCssClass("flatpak-button");
+        refreshBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.RefreshCloudflareCacheInfoCommand.CanExecute(null))
+                _vm.RefreshCloudflareCacheInfoCommand.Execute(null);
+        };
+        actions.Append(refreshBtn);
+
+        var clearBtn = Gtk.Button.NewWithLabel("Limpar cache");
+        clearBtn.AddCssClass("flatpak-button");
+        clearBtn.AddCssClass("destructive-action");
+        clearBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ClearCloudflareCacheCommand.CanExecute(null))
+                _vm.ClearCloudflareCacheCommand.Execute(null);
+        };
+        actions.Append(clearBtn);
+
+        row.AddSuffix(actions);
+        group.Add(row);
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            switch (args.PropertyName)
+            {
+                case nameof(_vm.CloudflareCacheEntries):
+                    row.SetSubtitle(BuildCloudflareCacheSubtitle());
+                    break;
+                case nameof(_vm.IsCloudflareCacheBusy):
+                case nameof(_vm.IsFetching):
+                case nameof(_vm.IsDownloading):
+                case nameof(_vm.IsLibraryBusy):
+                    var enabled = !_vm.IsCloudflareCacheBusy && !_vm.IsFetching && !_vm.IsDownloading && !_vm.IsLibraryBusy;
+                    refreshBtn.SetSensitive(enabled);
+                    clearBtn.SetSensitive(enabled);
+                    break;
+            }
+        };
+
+        return group;
     }
 
     private Adw.PreferencesGroup BuildMediocreAuthSettingsGroup()
@@ -573,6 +630,7 @@ public class MainWindow
 
         var credentialLoginBtn = Gtk.Button.NewWithLabel("Salvar e conectar");
         credentialLoginBtn.AddCssClass("flatpak-button");
+        credentialLoginBtn.AddCssClass("compact-button");
         credentialLoginBtn.AddCssClass("suggested-action");
         credentialLoginBtn.OnClicked += (_, _) =>
         {
@@ -583,6 +641,7 @@ public class MainWindow
 
         var browserLoginBtn = Gtk.Button.NewWithLabel("Login no navegador");
         browserLoginBtn.AddCssClass("flatpak-button");
+        browserLoginBtn.AddCssClass("compact-button");
         browserLoginBtn.OnClicked += (_, _) =>
         {
             if (_vm.ConnectMediocreAuthCommand.CanExecute(null))
@@ -592,6 +651,7 @@ public class MainWindow
 
         var clearSessionBtn = Gtk.Button.NewWithLabel("Limpar sessão");
         clearSessionBtn.AddCssClass("flatpak-button");
+        clearSessionBtn.AddCssClass("compact-button");
         clearSessionBtn.OnClicked += (_, _) =>
         {
             if (_vm.ClearMediocreAuthCommand.CanExecute(null))
@@ -601,6 +661,7 @@ public class MainWindow
 
         var clearSavedBtn = Gtk.Button.NewWithLabel("Esquecer login salvo");
         clearSavedBtn.AddCssClass("flatpak-button");
+        clearSavedBtn.AddCssClass("compact-button");
         clearSavedBtn.OnClicked += (_, _) =>
         {
             if (_vm.ClearMediocreSavedCredentialsCommand.CanExecute(null))
@@ -610,6 +671,7 @@ public class MainWindow
 
         var refreshBtn = Gtk.Button.NewWithLabel("Atualizar status");
         refreshBtn.AddCssClass("flatpak-button");
+        refreshBtn.AddCssClass("compact-button");
         refreshBtn.OnClicked += (_, _) =>
         {
             if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
@@ -674,6 +736,11 @@ public class MainWindow
         var user = string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser;
         var saved = _vm.HasSavedMediocreCredentials ? "sim" : "não";
         return $"Status: {_vm.MediocreAuthStatus} • Usuário: {user} • Login salvo: {saved} • Atualizado: {_vm.MediocreAuthLastUpdated}";
+    }
+
+    private string BuildCloudflareCacheSubtitle()
+    {
+        return $"{_vm.CloudflareCacheEntries} entrada(s) de credenciais Cloudflare no cache local.";
     }
 
     private Adw.PreferencesGroup BuildSmartStitchSettingsGroup()

@@ -59,14 +59,25 @@
     --gtk-accent-bg-color: #9370DB;
 }
 
+button {
+    min-height: 30px;
+    padding: 4px 10px;
+    border-radius: 8px;
+}
+
  
 .flatpak-button {
-    min-height: 36px;
-    padding: 0 14px;
+    min-height: 30px;
+    padding: 2px 10px;
     border-radius: 8px;
 }
 
 .flatpak-primary {
     background-color: @accent_bg_color;
     color: @accent_fg_color;
+}
+
+.compact-button {
+    min-height: 28px;
+    padding: 2px 10px;
 }

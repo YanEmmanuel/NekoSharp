@@ -169,6 +169,39 @@ public sealed class CloudflareCredentialStore : IDisposable
         }
     }
 
+    public async Task<int> CountAsync()
+    {
+        await EnsureInitializedAsync();
+        await _lock.WaitAsync();
+        try
+        {
+            await using var cmd = _connection!.CreateCommand();
+            cmd.CommandText = "SELECT COUNT(*) FROM cf_credentials";
+            var raw = await cmd.ExecuteScalarAsync();
+            return raw is null || raw == DBNull.Value ? 0 : Convert.ToInt32(raw);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task<int> ClearAllAsync()
+    {
+        await EnsureInitializedAsync();
+        await _lock.WaitAsync();
+        try
+        {
+            await using var cmd = _connection!.CreateCommand();
+            cmd.CommandText = "DELETE FROM cf_credentials";
+            return await cmd.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
      
      
      
