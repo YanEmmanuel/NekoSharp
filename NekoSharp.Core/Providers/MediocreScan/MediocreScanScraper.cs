@@ -8,7 +8,7 @@ using NekoSharp.Core.Services;
 
 namespace NekoSharp.Core.Providers.MediocreScan;
 
-public sealed class MediocreScanScraper : IScraper, IInteractiveAuthProvider
+public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 {
     public string Name => "Mediocre Scan";
     public string BaseUrl => _authProfile.SiteBaseUrl;
@@ -199,6 +199,19 @@ public sealed class MediocreScanScraper : IScraper, IInteractiveAuthProvider
 
     public Task<AuthSessionState> LoginInteractivelyAsync(CancellationToken ct = default)
         => _authService.LoginInteractivelyAsync(ct);
+
+    public Task<AuthSessionState> LoginWithCredentialsAsync(
+        string usernameOrEmail,
+        string password,
+        bool rememberCredentials = true,
+        CancellationToken ct = default)
+        => _authService.LoginWithCredentialsAsync(usernameOrEmail, password, rememberCredentials, ct);
+
+    public Task<bool> HasSavedCredentialsAsync(CancellationToken ct = default)
+        => _authService.HasSavedCredentialsAsync(ct);
+
+    public Task ClearSavedCredentialsAsync(CancellationToken ct = default)
+        => _authService.ClearSavedCredentialsAsync(ct);
 
     public Task ClearAuthAsync(CancellationToken ct = default)
         => _authService.ClearAuthAsync(ct);

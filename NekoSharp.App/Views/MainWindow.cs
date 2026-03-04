@@ -486,10 +486,194 @@ public class MainWindow
         };
 
         page.Add(group);
+        page.Add(BuildMediocreAuthSettingsGroup());
 
         page.Add(BuildSmartStitchSettingsGroup());
 
         return page;
+    }
+
+    private Adw.PreferencesGroup BuildMediocreAuthSettingsGroup()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("Autenticação de Providers");
+        group.SetDescription("Configure login automático para providers que exigem autenticação.");
+
+        var statusRow = Adw.ActionRow.New();
+        statusRow.SetTitle("MediocreScan");
+        statusRow.SetSubtitle(BuildMediocreAuthSubtitle());
+        statusRow.SetActivatable(false);
+        group.Add(statusRow);
+
+        var emailRow = Adw.ActionRow.New();
+        emailRow.SetTitle("Email");
+        emailRow.SetSubtitle("Conta usada no MediocreScan");
+        var emailEntry = Gtk.Entry.New();
+        emailEntry.SetHexpand(true);
+        emailEntry.SetPlaceholderText("seuemail@exemplo.com");
+        emailEntry.SetText(_vm.MediocreAuthEmail);
+        emailEntry.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "text")
+                _vm.MediocreAuthEmail = emailEntry.GetText();
+        };
+        emailRow.AddSuffix(emailEntry);
+        emailRow.SetActivatable(false);
+        group.Add(emailRow);
+
+        var passwordRow = Adw.ActionRow.New();
+        passwordRow.SetTitle("Senha");
+        passwordRow.SetSubtitle("A senha é salva localmente para login automático");
+        var passwordEntry = Gtk.PasswordEntry.New();
+        passwordEntry.SetHexpand(true);
+        passwordEntry.SetText(_vm.MediocreAuthPassword);
+        passwordEntry.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "text")
+                _vm.MediocreAuthPassword = passwordEntry.GetText();
+        };
+        passwordRow.AddSuffix(passwordEntry);
+        passwordRow.SetActivatable(false);
+        group.Add(passwordRow);
+
+        var rememberRow = Adw.ActionRow.New();
+        rememberRow.SetTitle("Lembrar credenciais");
+        rememberRow.SetSubtitle("Se ativado, o app tenta logar automaticamente quando necessário");
+        var rememberSwitch = Gtk.Switch.New();
+        rememberSwitch.SetValign(Gtk.Align.Center);
+        rememberSwitch.SetActive(_vm.MediocreRememberCredentials);
+        rememberSwitch.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "active")
+                _vm.MediocreRememberCredentials = rememberSwitch.GetActive();
+        };
+        rememberRow.AddSuffix(rememberSwitch);
+        rememberRow.SetActivatableWidget(rememberSwitch);
+        group.Add(rememberRow);
+
+        var actionsContainer = Gtk.Box.New(Gtk.Orientation.Vertical, 6);
+        actionsContainer.SetMarginTop(4);
+
+        var actionsTitle = Gtk.Label.New("Ações");
+        actionsTitle.SetHalign(Gtk.Align.Start);
+        actionsTitle.AddCssClass("heading");
+        actionsContainer.Append(actionsTitle);
+
+        var actionsSubtitle = Gtk.Label.New("Escolha como autenticar no provider");
+        actionsSubtitle.SetHalign(Gtk.Align.Start);
+        actionsSubtitle.AddCssClass("dim-label");
+        actionsContainer.Append(actionsSubtitle);
+
+        var actionsGrid = Gtk.Grid.New();
+        actionsGrid.SetColumnSpacing(6);
+        actionsGrid.SetRowSpacing(6);
+        actionsGrid.SetHalign(Gtk.Align.Start);
+        actionsGrid.SetHexpand(false);
+        actionsContainer.Append(actionsGrid);
+
+        var credentialLoginBtn = Gtk.Button.NewWithLabel("Salvar e conectar");
+        credentialLoginBtn.AddCssClass("flatpak-button");
+        credentialLoginBtn.AddCssClass("suggested-action");
+        credentialLoginBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.LoginMediocreWithCredentialsCommand.CanExecute(null))
+                _vm.LoginMediocreWithCredentialsCommand.Execute(null);
+        };
+        actionsGrid.Attach(credentialLoginBtn, 0, 0, 1, 1);
+
+        var browserLoginBtn = Gtk.Button.NewWithLabel("Login no navegador");
+        browserLoginBtn.AddCssClass("flatpak-button");
+        browserLoginBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ConnectMediocreAuthCommand.CanExecute(null))
+                _vm.ConnectMediocreAuthCommand.Execute(null);
+        };
+        actionsGrid.Attach(browserLoginBtn, 1, 0, 1, 1);
+
+        var clearSessionBtn = Gtk.Button.NewWithLabel("Limpar sessão");
+        clearSessionBtn.AddCssClass("flatpak-button");
+        clearSessionBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ClearMediocreAuthCommand.CanExecute(null))
+                _vm.ClearMediocreAuthCommand.Execute(null);
+        };
+        actionsGrid.Attach(clearSessionBtn, 0, 1, 1, 1);
+
+        var clearSavedBtn = Gtk.Button.NewWithLabel("Esquecer login salvo");
+        clearSavedBtn.AddCssClass("flatpak-button");
+        clearSavedBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.ClearMediocreSavedCredentialsCommand.CanExecute(null))
+                _vm.ClearMediocreSavedCredentialsCommand.Execute(null);
+        };
+        actionsGrid.Attach(clearSavedBtn, 1, 1, 1, 1);
+
+        var refreshBtn = Gtk.Button.NewWithLabel("Atualizar status");
+        refreshBtn.AddCssClass("flatpak-button");
+        refreshBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
+                _vm.RefreshMediocreAuthStateCommand.Execute(null);
+        };
+        actionsGrid.Attach(refreshBtn, 0, 2, 2, 1);
+
+        foreach (var button in new[] { credentialLoginBtn, browserLoginBtn, clearSessionBtn, clearSavedBtn, refreshBtn })
+        {
+            button.SetHexpand(false);
+            button.SetVexpand(false);
+            button.SetHalign(Gtk.Align.Start);
+            button.SetValign(Gtk.Align.Center);
+        }
+
+        group.Add(actionsContainer);
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            switch (args.PropertyName)
+            {
+                case nameof(_vm.MediocreAuthStatus):
+                case nameof(_vm.MediocreAuthUser):
+                case nameof(_vm.MediocreAuthLastUpdated):
+                case nameof(_vm.HasSavedMediocreCredentials):
+                    statusRow.SetSubtitle(BuildMediocreAuthSubtitle());
+                    break;
+                case nameof(_vm.MediocreAuthEmail):
+                    if (emailEntry.GetText() != _vm.MediocreAuthEmail)
+                        emailEntry.SetText(_vm.MediocreAuthEmail);
+                    break;
+                case nameof(_vm.MediocreAuthPassword):
+                    if (passwordEntry.GetText() != _vm.MediocreAuthPassword)
+                        passwordEntry.SetText(_vm.MediocreAuthPassword);
+                    break;
+                case nameof(_vm.MediocreRememberCredentials):
+                    if (rememberSwitch.GetActive() != _vm.MediocreRememberCredentials)
+                        rememberSwitch.SetActive(_vm.MediocreRememberCredentials);
+                    break;
+                case nameof(_vm.IsMediocreAuthBusy):
+                case nameof(_vm.IsFetching):
+                case nameof(_vm.IsDownloading):
+                case nameof(_vm.IsLibraryBusy):
+                    var canUseAuth = !_vm.IsMediocreAuthBusy && !_vm.IsFetching && !_vm.IsDownloading && !_vm.IsLibraryBusy;
+                    emailEntry.SetSensitive(canUseAuth);
+                    passwordEntry.SetSensitive(canUseAuth);
+                    rememberSwitch.SetSensitive(canUseAuth);
+                    credentialLoginBtn.SetSensitive(canUseAuth);
+                    browserLoginBtn.SetSensitive(canUseAuth);
+                    clearSessionBtn.SetSensitive(canUseAuth);
+                    clearSavedBtn.SetSensitive(canUseAuth);
+                    refreshBtn.SetSensitive(canUseAuth);
+                    break;
+            }
+        };
+
+        return group;
+    }
+
+    private string BuildMediocreAuthSubtitle()
+    {
+        var user = string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser;
+        var saved = _vm.HasSavedMediocreCredentials ? "sim" : "não";
+        return $"Status: {_vm.MediocreAuthStatus} • Usuário: {user} • Login salvo: {saved} • Atualizado: {_vm.MediocreAuthLastUpdated}";
     }
 
     private Adw.PreferencesGroup BuildSmartStitchSettingsGroup()

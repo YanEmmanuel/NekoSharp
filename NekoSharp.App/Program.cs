@@ -48,6 +48,8 @@ class Program
             var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
 
             scraperManager.DiscoverAndRegisterAll(logService, cfStore, providerUpdateService.GetInstalledProviderAssemblies());
+            if (viewModel.RefreshMediocreAuthStateCommand.CanExecute(null))
+                viewModel.RefreshMediocreAuthStateCommand.Execute(null);
 
             var window = new MainWindow(viewModel, (Adw.Application)sender, logService);
             window.Present();

@@ -27,6 +27,12 @@ public sealed class ProviderAuthProfile
 
     public string MeEndpoint { get; init; } = "usuarios/me";
     public string RefreshEndpoint { get; init; } = "auth/refresh";
+    public string? LoginEndpoint { get; init; }
+
+    public string[] LoginUsernameKeys { get; init; } = [];
+    public string[] LoginPasswordKeys { get; init; } = [];
+    public string[] LoginRememberKeys { get; init; } = [];
+    public bool LoginRememberValue { get; init; } = true;
 
     public string[] AccessTokenCookieNames { get; init; } = ["token"];
     public string[] RefreshTokenCookieNames { get; init; } = ["refresh_token"];
@@ -45,7 +51,11 @@ public sealed class ProviderAuthProfile
             ApiHost = "api.mediocretoons.site",
             XAppKeyHeaderValue = "toons-mediocre-app",
             OriginHeaderValue = "https://mediocrescan.com",
-            RefererHeaderValue = "https://mediocrescan.com/"
+            RefererHeaderValue = "https://mediocrescan.com/",
+            LoginEndpoint = "auth/login",
+            LoginUsernameKeys = ["email", "usuario", "username", "login"],
+            LoginPasswordKeys = ["senha", "password"],
+            LoginRememberKeys = ["lembrar", "remember", "remember_me"]
         };
     }
 }

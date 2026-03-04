@@ -125,6 +125,84 @@ public sealed class ProviderAuthStore : IDisposable
         }
     }
 
+    public async Task<ProviderAuthLoginSecret?> TryGetLoginSecretAsync(string providerKey, CancellationToken ct = default)
+    {
+        await EnsureInitializedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            await using var cmd = _connection!.CreateCommand();
+            cmd.CommandText = """
+                SELECT provider_key, username_or_email, password, updated_at_utc
+                FROM provider_auth_login_secrets
+                WHERE provider_key = @provider_key
+            """;
+            cmd.Parameters.AddWithValue("@provider_key", providerKey.ToLowerInvariant());
+
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
+
+            return new ProviderAuthLoginSecret
+            {
+                ProviderKey = reader.GetString(0),
+                UsernameOrEmail = reader.GetString(1),
+                Password = reader.GetString(2),
+                UpdatedAtUtc = DateTime.Parse(reader.GetString(3)).ToUniversalTime()
+            };
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task SaveLoginSecretAsync(
+        string providerKey,
+        string usernameOrEmail,
+        string password,
+        CancellationToken ct = default)
+    {
+        await EnsureInitializedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            await using var cmd = _connection!.CreateCommand();
+            cmd.CommandText = """
+                INSERT OR REPLACE INTO provider_auth_login_secrets
+                (provider_key, username_or_email, password, updated_at_utc)
+                VALUES
+                (@provider_key, @username_or_email, @password, @updated_at_utc)
+            """;
+            cmd.Parameters.AddWithValue("@provider_key", providerKey.ToLowerInvariant());
+            cmd.Parameters.AddWithValue("@username_or_email", usernameOrEmail);
+            cmd.Parameters.AddWithValue("@password", password);
+            cmd.Parameters.AddWithValue("@updated_at_utc", DateTime.UtcNow.ToString("O"));
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    public async Task RemoveLoginSecretAsync(string providerKey, CancellationToken ct = default)
+    {
+        await EnsureInitializedAsync(ct);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            await using var cmd = _connection!.CreateCommand();
+            cmd.CommandText = "DELETE FROM provider_auth_login_secrets WHERE provider_key = @provider_key";
+            cmd.Parameters.AddWithValue("@provider_key", providerKey.ToLowerInvariant());
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
     private async Task EnsureInitializedAsync(CancellationToken ct)
     {
         if (_initialized)
@@ -163,7 +241,14 @@ public sealed class ProviderAuthStore : IDisposable
                     obtained_at_utc TEXT NOT NULL,
                     expires_at_utc  TEXT NULL,
                     user_json       TEXT NULL
-                )
+                );
+
+                CREATE TABLE IF NOT EXISTS provider_auth_login_secrets (
+                    provider_key      TEXT PRIMARY KEY,
+                    username_or_email TEXT NOT NULL,
+                    password          TEXT NOT NULL,
+                    updated_at_utc    TEXT NOT NULL
+                );
             """;
             await cmd.ExecuteNonQueryAsync(ct);
 

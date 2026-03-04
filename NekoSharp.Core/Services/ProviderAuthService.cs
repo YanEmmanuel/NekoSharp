@@ -73,6 +73,12 @@ public sealed class ProviderAuthService : IProviderAuthService
                 return !string.IsNullOrWhiteSpace(refreshed.AccessToken);
             }
 
+            if (await TryLoginUsingSavedCredentialsInternalAsync(ct) is { } relogged)
+            {
+                _log?.Info($"[ProviderAuth] [{_profile.ProviderKey}] Re-login with saved credentials succeeded");
+                return !string.IsNullOrWhiteSpace(relogged.AccessToken);
+            }
+
             _log?.Warn($"[ProviderAuth] [{_profile.ProviderKey}] Refresh after 401 failed. Falling back to interactive login.");
             await LoginInteractivelyInternalAsync(ct);
             return true;
@@ -137,6 +143,46 @@ public sealed class ProviderAuthService : IProviderAuthService
         }
     }
 
+    public async Task<AuthSessionState> LoginWithCredentialsAsync(
+        string usernameOrEmail,
+        string password,
+        bool rememberCredentials = true,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(usernameOrEmail))
+            throw new ArgumentException("Usuário/email é obrigatório.", nameof(usernameOrEmail));
+
+        if (string.IsNullOrWhiteSpace(password))
+            throw new ArgumentException("Senha é obrigatória.", nameof(password));
+
+        await _authLock.WaitAsync(ct);
+        try
+        {
+            var credentials = await LoginWithCredentialsInternalAsync(
+                usernameOrEmail,
+                password,
+                rememberCredentials,
+                ct);
+
+            return await BuildStateFromCredentialsAsync(credentials, "Conectado", ct);
+        }
+        finally
+        {
+            _authLock.Release();
+        }
+    }
+
+    public async Task<bool> HasSavedCredentialsAsync(CancellationToken ct = default)
+    {
+        var secret = await _store.TryGetLoginSecretAsync(_profile.ProviderKey, ct);
+        return secret is not null;
+    }
+
+    public Task ClearSavedCredentialsAsync(CancellationToken ct = default)
+    {
+        return _store.RemoveLoginSecretAsync(_profile.ProviderKey, ct);
+    }
+
     public async Task ClearAuthAsync(CancellationToken ct = default)
     {
         await _store.RemoveAsync(_profile.ProviderKey, ct);
@@ -159,6 +205,9 @@ public sealed class ProviderAuthService : IProviderAuthService
             if (stored is not null && await TryRefreshInternalAsync(stored, ct) is { } refreshed)
                 return refreshed;
 
+            if (await TryLoginUsingSavedCredentialsInternalAsync(ct) is { } relogged)
+                return relogged;
+
             return await LoginInteractivelyInternalAsync(ct);
         }
         finally
@@ -178,6 +227,121 @@ public sealed class ProviderAuthService : IProviderAuthService
         _log?.Info($"[ProviderAuth] [{_profile.ProviderKey}] Interactive login finished");
 
         return validated;
+    }
+
+    private async Task<ProviderAuthCredentials?> TryLoginUsingSavedCredentialsInternalAsync(CancellationToken ct)
+    {
+        var saved = await _store.TryGetLoginSecretAsync(_profile.ProviderKey, ct);
+        if (saved is null)
+            return null;
+
+        try
+        {
+            return await LoginWithCredentialsInternalAsync(
+                saved.UsernameOrEmail,
+                saved.Password,
+                rememberCredentials: true,
+                ct);
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn($"[ProviderAuth] [{_profile.ProviderKey}] Saved credential login failed: {ex.Message}");
+            return null;
+        }
+    }
+
+    private async Task<ProviderAuthCredentials> LoginWithCredentialsInternalAsync(
+        string usernameOrEmail,
+        string password,
+        bool rememberCredentials,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_profile.LoginEndpoint) ||
+            _profile.LoginUsernameKeys.Length == 0 ||
+            _profile.LoginPasswordKeys.Length == 0)
+        {
+            throw new AuthenticationException($"Login por credenciais não é suportado para {_profile.ProviderKey}.");
+        }
+
+        _log?.Info($"[ProviderAuth] [{_profile.ProviderKey}] Trying credential login for '{usernameOrEmail}'.");
+
+        ProviderAuthCredentials? lastSuccess = null;
+        Exception? lastError = null;
+
+        foreach (var payload in BuildCredentialPayloadCandidates(usernameOrEmail, password))
+        {
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, _profile.LoginEndpoint);
+                request.Content = JsonContent.Create(payload);
+                ApplyDefaultHeaders(request, UserAgentProvider.Default, includeContentType: true);
+
+                using var response = await _http.SendAsync(request, ct);
+                var body = await response.Content.ReadAsStringAsync(ct);
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    lastError = new AuthenticationException(
+                        $"Login por credenciais falhou para {_profile.ProviderKey} com status {(int)response.StatusCode}.");
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(body))
+                {
+                    lastError = new AuthenticationException("Resposta vazia no login por credenciais.");
+                    continue;
+                }
+
+                using var doc = JsonDocument.Parse(body);
+                var (accessToken, refreshToken) = ExtractTokensFromLoginResponse(doc.RootElement);
+                if (string.IsNullOrWhiteSpace(accessToken))
+                {
+                    lastError = new AuthenticationException("Resposta de login não contém access token.");
+                    continue;
+                }
+
+                var candidate = new ProviderAuthCredentials
+                {
+                    ProviderKey = _profile.ProviderKey,
+                    AccessToken = accessToken,
+                    RefreshToken = refreshToken,
+                    UserAgent = UserAgentProvider.Default,
+                    Origin = _profile.OriginHeaderValue,
+                    Referer = _profile.RefererHeaderValue,
+                    XAppKey = _profile.XAppKeyHeaderValue,
+                    ObtainedAtUtc = DateTime.UtcNow,
+                    ExpiresAtUtc = TryExtractJwtExpirationUtc(accessToken),
+                    UserJson = null
+                };
+
+                var validated = await ValidateAndEnrichCredentialsAsync(candidate, ct);
+                await _store.SaveAsync(validated, ct);
+
+                if (rememberCredentials)
+                {
+                    await _store.SaveLoginSecretAsync(_profile.ProviderKey, usernameOrEmail, password, ct);
+                }
+                else
+                {
+                    await _store.RemoveLoginSecretAsync(_profile.ProviderKey, ct);
+                }
+
+                _log?.Info($"[ProviderAuth] [{_profile.ProviderKey}] Credential login succeeded.");
+                lastSuccess = validated;
+                break;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                lastError = ex;
+            }
+        }
+
+        if (lastSuccess is not null)
+            return lastSuccess;
+
+        throw new AuthenticationException(
+            $"Falha no login por email/senha de {_profile.ProviderKey}. Verifique suas credenciais.",
+            lastError);
     }
 
     private async Task<ProviderAuthCredentials?> TryRefreshInternalAsync(ProviderAuthCredentials current, CancellationToken ct)
@@ -317,19 +481,53 @@ public sealed class ProviderAuthService : IProviderAuthService
 
     private static void ApplyNonAuthorizationHeaders(HttpRequestMessage request, ProviderAuthCredentials credentials, ProviderAuthProfile profile)
     {
+        ApplyDefaultHeaders(
+            request,
+            profile,
+            userAgent: credentials.UserAgent,
+            origin: credentials.Origin,
+            referer: credentials.Referer,
+            xAppKey: credentials.XAppKey,
+            includeContentType: true);
+    }
+
+    private void ApplyDefaultHeaders(HttpRequestMessage request, string userAgent, bool includeContentType)
+    {
+        ApplyDefaultHeaders(
+            request,
+            _profile,
+            userAgent,
+            _profile.OriginHeaderValue,
+            _profile.RefererHeaderValue,
+            _profile.XAppKeyHeaderValue,
+            includeContentType);
+    }
+
+    private static void ApplyDefaultHeaders(
+        HttpRequestMessage request,
+        ProviderAuthProfile profile,
+        string userAgent,
+        string origin,
+        string referer,
+        string xAppKey,
+        bool includeContentType)
+    {
         request.Headers.Remove("Accept");
         request.Headers.TryAddWithoutValidation("Accept", profile.AcceptHeaderValue);
 
-        request.Content ??= new StringContent(string.Empty, Encoding.UTF8);
-        request.Content.Headers.ContentType = new MediaTypeHeaderValue(profile.ContentTypeHeaderValue);
+        if (includeContentType)
+        {
+            request.Content ??= new StringContent(string.Empty, Encoding.UTF8);
+            request.Content.Headers.ContentType = new MediaTypeHeaderValue(profile.ContentTypeHeaderValue);
+        }
 
         request.Headers.Remove(profile.XAppKeyHeaderName);
-        request.Headers.TryAddWithoutValidation(profile.XAppKeyHeaderName, credentials.XAppKey);
+        request.Headers.TryAddWithoutValidation(profile.XAppKeyHeaderName, xAppKey);
 
         request.Headers.Remove("Origin");
-        request.Headers.TryAddWithoutValidation("Origin", credentials.Origin);
+        request.Headers.TryAddWithoutValidation("Origin", origin);
 
-        request.Headers.Referrer = new Uri(credentials.Referer);
+        request.Headers.Referrer = new Uri(referer);
 
         request.Headers.Remove(profile.CacheControlHeaderName);
         request.Headers.TryAddWithoutValidation(profile.CacheControlHeaderName, profile.CacheControlHeaderValue);
@@ -338,7 +536,7 @@ public sealed class ProviderAuthService : IProviderAuthService
         request.Headers.TryAddWithoutValidation(profile.PragmaHeaderName, profile.PragmaHeaderValue);
 
         request.Headers.Remove("User-Agent");
-        request.Headers.TryAddWithoutValidation("User-Agent", credentials.UserAgent);
+        request.Headers.TryAddWithoutValidation("User-Agent", userAgent);
     }
 
     internal static DateTime? TryExtractJwtExpirationUtc(string? jwt)
@@ -401,6 +599,72 @@ public sealed class ProviderAuthService : IProviderAuthService
             JsonValueKind.False => "false",
             _ => null
         };
+    }
+
+    private IEnumerable<Dictionary<string, object>> BuildCredentialPayloadCandidates(string usernameOrEmail, string password)
+    {
+        var usernameKeys = _profile.LoginUsernameKeys
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var passwordKeys = _profile.LoginPasswordKeys
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        var rememberKeys = _profile.LoginRememberKeys
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        foreach (var userKey in usernameKeys)
+        {
+            foreach (var passKey in passwordKeys)
+            {
+                var payload = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+                {
+                    [userKey] = usernameOrEmail,
+                    [passKey] = password
+                };
+
+                foreach (var rememberKey in rememberKeys)
+                    payload[rememberKey] = _profile.LoginRememberValue;
+
+                yield return payload;
+            }
+        }
+    }
+
+    private static (string? AccessToken, string? RefreshToken) ExtractTokensFromLoginResponse(JsonElement root)
+    {
+        var access = ExtractToken(root, "token", "access_token", "accessToken");
+        var refresh = ExtractToken(root, "refresh_token", "refreshToken");
+        return (access, refresh);
+    }
+
+    private static string? ExtractToken(JsonElement root, params string[] names)
+    {
+        foreach (var name in names)
+        {
+            var direct = TryGetString(root, name);
+            if (!string.IsNullOrWhiteSpace(direct))
+                return direct;
+        }
+
+        if (root.ValueKind == JsonValueKind.Object &&
+            root.TryGetProperty("data", out var data) &&
+            data.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var name in names)
+            {
+                var nested = TryGetString(data, name);
+                if (!string.IsNullOrWhiteSpace(nested))
+                    return nested;
+            }
+        }
+
+        return null;
     }
 
     private static (string? Name, string? Email) TryReadUser(string? userJson)

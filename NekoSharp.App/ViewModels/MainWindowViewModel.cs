@@ -68,6 +68,10 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private string _mediocreAuthStatus = "Desconectado";
     [ObservableProperty] private string _mediocreAuthUser = string.Empty;
     [ObservableProperty] private string _mediocreAuthLastUpdated = "-";
+    [ObservableProperty] private string _mediocreAuthEmail = string.Empty;
+    [ObservableProperty] private string _mediocreAuthPassword = string.Empty;
+    [ObservableProperty] private bool _mediocreRememberCredentials = true;
+    [ObservableProperty] private bool _hasSavedMediocreCredentials;
 
     [ObservableProperty] private bool _isLibraryBusy;
     [ObservableProperty] private int _libraryNewChaptersTotal;
@@ -809,7 +813,9 @@ public partial class MainWindowViewModel : ObservableObject
         DownloadNewItemCommand.NotifyCanExecuteChanged();
         UnfollowLibraryItemCommand.NotifyCanExecuteChanged();
         ConnectMediocreAuthCommand.NotifyCanExecuteChanged();
+        LoginMediocreWithCredentialsCommand.NotifyCanExecuteChanged();
         ClearMediocreAuthCommand.NotifyCanExecuteChanged();
+        ClearMediocreSavedCredentialsCommand.NotifyCanExecuteChanged();
         RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
     }
 
@@ -834,6 +840,47 @@ public partial class MainWindowViewModel : ObservableObject
         catch (Exception ex)
         {
             SetStatus($"Falha no login do MediocreScan: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsMediocreAuthBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
+    private async Task LoginMediocreWithCredentialsAsync()
+    {
+        var provider = GetMediocreCredentialAuthProvider();
+        if (provider is null)
+        {
+            SetStatus("Login por email/senha não está disponível para o MediocreScan.", "warning");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(MediocreAuthEmail) || string.IsNullOrWhiteSpace(MediocreAuthPassword))
+        {
+            SetStatus("Preencha email e senha para conectar no MediocreScan.", "warning");
+            return;
+        }
+
+        IsMediocreAuthBusy = true;
+        try
+        {
+            SetStatus("Realizando login do MediocreScan com email/senha...", "info");
+            await provider.LoginWithCredentialsAsync(
+                MediocreAuthEmail.Trim(),
+                MediocreAuthPassword,
+                MediocreRememberCredentials);
+
+            if (MediocreRememberCredentials)
+                MediocreAuthPassword = string.Empty;
+
+            await RefreshMediocreAuthStateAsync();
+            SetStatus("Login por credenciais concluído.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha no login por credenciais: {ex.Message}", "error");
         }
         finally
         {
@@ -869,14 +916,45 @@ public partial class MainWindowViewModel : ObservableObject
     }
 
     [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
+    private async Task ClearMediocreSavedCredentialsAsync()
+    {
+        var provider = GetMediocreCredentialAuthProvider();
+        if (provider is null)
+        {
+            SetStatus("Credenciais salvas não são suportadas para o MediocreScan.", "warning");
+            return;
+        }
+
+        IsMediocreAuthBusy = true;
+        try
+        {
+            await provider.ClearSavedCredentialsAsync();
+            HasSavedMediocreCredentials = false;
+            MediocreAuthPassword = string.Empty;
+            MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+            SetStatus("Credenciais salvas do MediocreScan removidas.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao limpar credenciais salvas: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsMediocreAuthBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]
     private async Task RefreshMediocreAuthStateAsync()
     {
         var provider = GetMediocreAuthProvider();
+        var credentialProvider = GetMediocreCredentialAuthProvider();
         if (provider is null)
         {
             MediocreAuthStatus = "Indisponível";
             MediocreAuthUser = string.Empty;
             MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+            HasSavedMediocreCredentials = false;
             return;
         }
 
@@ -892,6 +970,9 @@ public partial class MainWindowViewModel : ObservableObject
                 ? state.UserDisplayName!
                 : !string.IsNullOrWhiteSpace(state.UserEmail) ? state.UserEmail! : string.Empty;
 
+            HasSavedMediocreCredentials = credentialProvider is not null &&
+                                          await credentialProvider.HasSavedCredentialsAsync();
+
             MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
         }
         catch (Exception ex)
@@ -899,6 +980,7 @@ public partial class MainWindowViewModel : ObservableObject
             MediocreAuthStatus = "Erro";
             MediocreAuthUser = ex.Message;
             MediocreAuthLastUpdated = DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss");
+            HasSavedMediocreCredentials = false;
         }
         finally
         {
@@ -909,14 +991,23 @@ public partial class MainWindowViewModel : ObservableObject
     partial void OnIsMediocreAuthBusyChanged(bool value)
     {
         ConnectMediocreAuthCommand.NotifyCanExecuteChanged();
+        LoginMediocreWithCredentialsCommand.NotifyCanExecuteChanged();
         ClearMediocreAuthCommand.NotifyCanExecuteChanged();
+        ClearMediocreSavedCredentialsCommand.NotifyCanExecuteChanged();
         RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
     }
 
     private IInteractiveAuthProvider? GetMediocreAuthProvider()
     {
         return _scraperManager.Scrapers
-            .FirstOrDefault(s => s.Name.Equals("MediocreScan", StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault(s => s.Name.Contains("Mediocre", StringComparison.OrdinalIgnoreCase))
             as IInteractiveAuthProvider;
+    }
+
+    private ICredentialAuthProvider? GetMediocreCredentialAuthProvider()
+    {
+        return _scraperManager.Scrapers
+            .FirstOrDefault(s => s.Name.Contains("Mediocre", StringComparison.OrdinalIgnoreCase))
+            as ICredentialAuthProvider;
     }
 }
