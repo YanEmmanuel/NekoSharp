@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using NekoSharp.Core.Helpers;
 using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Models;
 using NekoSharp.Core.Services;
@@ -16,6 +17,7 @@ public partial class MainWindowViewModel : ObservableObject
 {
     private readonly ScraperManager _scraperManager;
     private readonly IDownloadService _downloadService;
+    private readonly IMangaLibraryService _mangaLibraryService;
     private readonly LogService _logService;
     private readonly ISettingsStore _settingsStore;
     private CancellationTokenSource? _cts;
@@ -67,6 +69,11 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private string _mediocreAuthUser = string.Empty;
     [ObservableProperty] private string _mediocreAuthLastUpdated = "-";
 
+    [ObservableProperty] private bool _isLibraryBusy;
+    [ObservableProperty] private int _libraryNewChaptersTotal;
+    [ObservableProperty] private bool _isCurrentMangaFollowed;
+    [ObservableProperty] private long? _currentLibraryMangaId;
+
      
     [ObservableProperty] private bool _isLogPanelOpen;
     [ObservableProperty] private int _logCount;
@@ -76,15 +83,22 @@ public partial class MainWindowViewModel : ObservableObject
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "DownloadsMangas");
 
     public ObservableCollection<ChapterViewModel> Chapters { get; } = [];
+    public ObservableCollection<LibraryMangaEntry> LibraryItems { get; } = [];
     public ObservableCollection<LogEntryViewModel> LogEntries { get; } = [];
 
     public string SupportedSites => string.Join(", ", _scraperManager.Scrapers.Select(s => s.Name));
     public IReadOnlyList<string> ProviderNames => _scraperManager.Scrapers.Select(s => s.Name).ToList();
 
-    public MainWindowViewModel(ScraperManager scraperManager, IDownloadService downloadService, LogService logService, ISettingsStore settingsStore)
+    public MainWindowViewModel(
+        ScraperManager scraperManager,
+        IDownloadService downloadService,
+        IMangaLibraryService mangaLibraryService,
+        LogService logService,
+        ISettingsStore settingsStore)
     {
         _scraperManager = scraperManager;
         _downloadService = downloadService;
+        _mangaLibraryService = mangaLibraryService;
         _logService = logService;
         _settingsStore = settingsStore;
 
@@ -104,6 +118,8 @@ public partial class MainWindowViewModel : ObservableObject
                 return false;  
             });
         };
+
+        _ = RefreshLibraryAsync();
     }
 
     private void LoadSettings()
@@ -194,6 +210,7 @@ public partial class MainWindowViewModel : ObservableObject
 
             TotalChapters = Chapters.Count;
             IsMangaLoaded = true;
+            await SyncCurrentMangaFollowStateAsync();
             SetStatus($"Encontrado: {manga.Name} — {Chapters.Count} capítulos.", "success");
         }
         catch (Exception ex)
@@ -206,9 +223,15 @@ public partial class MainWindowViewModel : ObservableObject
         }
     }
 
-    private bool CanFetch() => !IsFetching && !IsDownloading;
+    private bool CanFetch() => !IsFetching && !IsDownloading && !IsLibraryBusy;
 
-    private bool CanRunMediocreAuthAction() => !IsMediocreAuthBusy && !IsFetching && !IsDownloading;
+    private bool CanRunMediocreAuthAction() => !IsMediocreAuthBusy && !IsFetching && !IsDownloading && !IsLibraryBusy;
+
+    private bool CanRunLibraryAction() => !IsLibraryBusy && !IsFetching && !IsDownloading;
+
+    private bool CanFollowCurrentManga() => IsMangaLoaded && Manga is not null && !IsCurrentMangaFollowed && CanRunLibraryAction();
+
+    private bool CanUnfollowCurrentManga() => CurrentLibraryMangaId.HasValue && IsCurrentMangaFollowed && CanRunLibraryAction();
 
     [RelayCommand(CanExecute = nameof(CanDownload))]
     private async Task DownloadSelectedAsync()
@@ -228,7 +251,7 @@ public partial class MainWindowViewModel : ObservableObject
         await DownloadChaptersAsync(Chapters.ToList());
     }
 
-    private bool CanDownload() => IsMangaLoaded && !IsDownloading && !IsFetching;
+    private bool CanDownload() => IsMangaLoaded && !IsDownloading && !IsFetching && !IsLibraryBusy;
 
     private async Task DownloadChaptersAsync(List<ChapterViewModel> chaptersToDownload)
     {
@@ -333,6 +356,216 @@ public partial class MainWindowViewModel : ObservableObject
         }
     }
 
+    [RelayCommand(CanExecute = nameof(CanFollowCurrentManga))]
+    private async Task FollowCurrentMangaAsync()
+    {
+        if (Manga is null)
+        {
+            SetStatus("Carregue um mangá antes de seguir.", "warning");
+            return;
+        }
+
+        IsLibraryBusy = true;
+        try
+        {
+            var result = await _mangaLibraryService.FollowMangaAsync(
+                mangaUrl: Manga.Url,
+                localPath: OutputDirectory,
+                snapshotExisting: true);
+
+            IsCurrentMangaFollowed = true;
+            CurrentLibraryMangaId = result.Entry.Id;
+
+            await RefreshLibrarySnapshotAsync();
+
+            var action = result.IsNewlyFollowed ? "adicionado" : "atualizado";
+            SetStatus($"Mangá {action} na biblioteca: {result.Entry.Title}", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao seguir mangá: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanUnfollowCurrentManga))]
+    private async Task UnfollowCurrentMangaAsync()
+    {
+        if (!CurrentLibraryMangaId.HasValue)
+            return;
+
+        IsLibraryBusy = true;
+        try
+        {
+            await _mangaLibraryService.UnfollowMangaAsync(CurrentLibraryMangaId.Value);
+            IsCurrentMangaFollowed = false;
+            CurrentLibraryMangaId = null;
+            await RefreshLibrarySnapshotAsync();
+            SetStatus("Mangá removido dos seguidos.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao deixar de seguir: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task RefreshLibraryAsync()
+    {
+        IsLibraryBusy = true;
+        try
+        {
+            await RefreshLibrarySnapshotAsync();
+            SetStatus($"Biblioteca atualizada: {LibraryItems.Count} mangá(s) seguido(s).", "info");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao carregar biblioteca: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task CheckUpdatesAllAsync()
+    {
+        IsLibraryBusy = true;
+        try
+        {
+            var summary = await _mangaLibraryService.CheckUpdatesAsync();
+            await RefreshLibrarySnapshotAsync();
+            SetStatus(
+                $"Verificação concluída: {summary.TotalNewChapters} capítulo(s) novo(s) em {summary.TotalMangaChecked} mangá(s).",
+                "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao verificar atualizações: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task CheckUpdatesItemAsync(long libraryMangaId)
+    {
+        if (libraryMangaId <= 0)
+            return;
+
+        IsLibraryBusy = true;
+        try
+        {
+            var summary = await _mangaLibraryService.CheckUpdatesAsync(libraryMangaId);
+            await RefreshLibrarySnapshotAsync();
+
+            var newCount = summary.MangaResults.FirstOrDefault()?.NewChaptersCount ?? 0;
+            SetStatus($"Verificação concluída: {newCount} capítulo(s) novo(s).", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao verificar mangá da biblioteca: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task DownloadNewAllAsync()
+    {
+        IsLibraryBusy = true;
+        try
+        {
+            var summary = await _mangaLibraryService.DownloadNewChaptersAsync(
+                format: DownloadFormat);
+            await RefreshLibrarySnapshotAsync();
+
+            var type = summary.TotalFailed > 0 ? "warning" : "success";
+            SetStatus(
+                $"Download de novos: {summary.TotalDownloaded}/{summary.TotalAttempted} concluído(s), {summary.TotalFailed} falha(s).",
+                type);
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao baixar capítulos novos: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task DownloadNewItemAsync(long libraryMangaId)
+    {
+        if (libraryMangaId <= 0)
+            return;
+
+        IsLibraryBusy = true;
+        try
+        {
+            var summary = await _mangaLibraryService.DownloadNewChaptersAsync(
+                libraryMangaId: libraryMangaId,
+                format: DownloadFormat);
+            await RefreshLibrarySnapshotAsync();
+
+            var type = summary.TotalFailed > 0 ? "warning" : "success";
+            SetStatus(
+                $"Download concluído: {summary.TotalDownloaded}/{summary.TotalAttempted} capítulo(s), {summary.TotalFailed} falha(s).",
+                type);
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao baixar capítulos novos do mangá: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
+    [RelayCommand(CanExecute = nameof(CanRunLibraryAction))]
+    private async Task UnfollowLibraryItemAsync(long libraryMangaId)
+    {
+        if (libraryMangaId <= 0)
+            return;
+
+        IsLibraryBusy = true;
+        try
+        {
+            await _mangaLibraryService.UnfollowMangaAsync(libraryMangaId);
+
+            if (CurrentLibraryMangaId == libraryMangaId)
+            {
+                CurrentLibraryMangaId = null;
+                IsCurrentMangaFollowed = false;
+            }
+
+            await RefreshLibrarySnapshotAsync();
+            SetStatus("Mangá removido dos seguidos.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Falha ao deixar de seguir mangá: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsLibraryBusy = false;
+        }
+    }
+
     [RelayCommand]
     private void CancelDownload() => _cts?.Cancel();
 
@@ -383,11 +616,69 @@ public partial class MainWindowViewModel : ObservableObject
         MangaDescription = string.Empty;
         MangaCoverUrl = string.Empty;
         MangaSite = string.Empty;
+        IsCurrentMangaFollowed = false;
+        CurrentLibraryMangaId = null;
         Chapters.Clear();
         IsMangaLoaded = false;
         IsFetching = false;
         IsDownloading = false;
         SetStatus("Cole a URL de um mangá e clique em Buscar para começar.", "info");
+    }
+
+    private async Task RefreshLibrarySnapshotAsync(CancellationToken ct = default)
+    {
+        var followed = await _mangaLibraryService.GetLibraryAsync(onlyFollowing: true, ct);
+
+        LibraryItems.Clear();
+        foreach (var entry in followed)
+            LibraryItems.Add(entry);
+
+        LibraryNewChaptersTotal = followed.Sum(x => x.NewChaptersCount);
+        await SyncCurrentMangaFollowStateAsync(ct);
+    }
+
+    private async Task SyncCurrentMangaFollowStateAsync(CancellationToken ct = default)
+    {
+        if (Manga is null || string.IsNullOrWhiteSpace(Manga.Url))
+        {
+            IsCurrentMangaFollowed = false;
+            CurrentLibraryMangaId = null;
+            return;
+        }
+
+        if (LibraryItems.Count == 0)
+        {
+            var followed = await _mangaLibraryService.GetLibraryAsync(onlyFollowing: true, ct);
+            LibraryItems.Clear();
+            foreach (var entry in followed)
+                LibraryItems.Add(entry);
+            LibraryNewChaptersTotal = followed.Sum(x => x.NewChaptersCount);
+        }
+
+        var providerKey = _scraperManager.GetScraperForUrl(Manga.Url)?.Name
+                          ?? Manga.SiteName;
+
+        if (string.IsNullOrWhiteSpace(providerKey))
+        {
+            IsCurrentMangaFollowed = false;
+            CurrentLibraryMangaId = null;
+            return;
+        }
+
+        var identityCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ChapterKeyHelper.BuildMangaIdentityKey(providerKey, Manga.Url)
+        };
+
+        if (!string.IsNullOrWhiteSpace(MangaUrl))
+            identityCandidates.Add(ChapterKeyHelper.BuildMangaIdentityKey(providerKey, MangaUrl));
+
+        var match = LibraryItems.FirstOrDefault(x =>
+            x.ProviderKey.Equals(providerKey, StringComparison.OrdinalIgnoreCase) &&
+            identityCandidates.Contains(x.MangaIdOrUrl));
+
+        IsCurrentMangaFollowed = match is not null;
+        CurrentLibraryMangaId = match?.Id;
     }
 
     private void SetStatus(string message, string type)
@@ -484,6 +775,42 @@ public partial class MainWindowViewModel : ObservableObject
         var v = Math.Clamp(value, 1, 10);
         if (v != value) { MaxConcurrentChapters = v; return; }
         _settingsStore.SetIntAsync("Download.MaxConcurrentChapters", v);
+    }
+
+    partial void OnIsFetchingChanged(bool value) => NotifyCanExecuteStateChanged();
+
+    partial void OnIsDownloadingChanged(bool value) => NotifyCanExecuteStateChanged();
+
+    partial void OnIsLibraryBusyChanged(bool value) => NotifyCanExecuteStateChanged();
+
+    partial void OnIsCurrentMangaFollowedChanged(bool value)
+    {
+        FollowCurrentMangaCommand.NotifyCanExecuteChanged();
+        UnfollowCurrentMangaCommand.NotifyCanExecuteChanged();
+    }
+
+    partial void OnCurrentLibraryMangaIdChanged(long? value)
+    {
+        FollowCurrentMangaCommand.NotifyCanExecuteChanged();
+        UnfollowCurrentMangaCommand.NotifyCanExecuteChanged();
+    }
+
+    private void NotifyCanExecuteStateChanged()
+    {
+        FetchMangaCommand.NotifyCanExecuteChanged();
+        DownloadSelectedCommand.NotifyCanExecuteChanged();
+        DownloadAllCommand.NotifyCanExecuteChanged();
+        FollowCurrentMangaCommand.NotifyCanExecuteChanged();
+        UnfollowCurrentMangaCommand.NotifyCanExecuteChanged();
+        RefreshLibraryCommand.NotifyCanExecuteChanged();
+        CheckUpdatesAllCommand.NotifyCanExecuteChanged();
+        CheckUpdatesItemCommand.NotifyCanExecuteChanged();
+        DownloadNewAllCommand.NotifyCanExecuteChanged();
+        DownloadNewItemCommand.NotifyCanExecuteChanged();
+        UnfollowLibraryItemCommand.NotifyCanExecuteChanged();
+        ConnectMediocreAuthCommand.NotifyCanExecuteChanged();
+        ClearMediocreAuthCommand.NotifyCanExecuteChanged();
+        RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
     }
 
     [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]

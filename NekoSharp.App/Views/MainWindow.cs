@@ -14,8 +14,15 @@ public class MainWindow
     private Gtk.SearchEntry _urlEntry = null!;
     private Gtk.Button _fetchButton = null!;
     private Gtk.Button _pasteButton = null!;
+    private Gtk.Button _followBtn = null!;
     private Gtk.MenuButton _providersButton = null!;
     private Gtk.Popover _providersPopover = null!;
+    private Gtk.Label _librarySummaryLabel = null!;
+    private Gtk.Button _refreshLibraryBtn = null!;
+    private Gtk.Button _checkUpdatesAllBtn = null!;
+    private Gtk.Button _downloadNewAllBtn = null!;
+    private Gtk.Box _libraryListBox = null!;
+    private Gtk.Label _libraryEmptyLabel = null!;
 
     private Gtk.Stack _contentStack = null!;
     private Adw.ViewStack _viewStack = null!;
@@ -58,6 +65,7 @@ public class MainWindow
     private readonly HttpClient _httpClient;
 
     private readonly Dictionary<ChapterViewModel, ChapterRowWidgets> _chapterRows = new();
+    private readonly Dictionary<long, Gtk.Widget> _libraryRows = new();
 
     public MainWindow(MainWindowViewModel viewModel, Adw.Application app, LogService? logService = null)
     {
@@ -100,8 +108,12 @@ public class MainWindow
         _viewStack = Adw.ViewStack.New();
         
         var libraryPage = _viewStack.AddNamed(BuildLibraryView(), "library");
-        libraryPage.SetTitle("Biblioteca");
-        libraryPage.SetIconName("library-symbolic");
+        libraryPage.SetTitle("Buscar");
+        libraryPage.SetIconName("system-search-symbolic");
+
+        var followingPage = _viewStack.AddNamed(BuildFollowingView(), "following");
+        followingPage.SetTitle("Seguindo");
+        followingPage.SetIconName("library-symbolic");
 
         var settingsPage = _viewStack.AddNamed(BuildSettingsView(), "settings");
         settingsPage.SetTitle("Configurações");
@@ -181,6 +193,93 @@ public class MainWindow
         libraryBox.Append(BuildContentArea());
 
         return libraryBox;
+    }
+
+    private Gtk.Widget BuildFollowingView()
+    {
+        var container = Gtk.Box.New(Gtk.Orientation.Vertical, 0);
+
+        var scroll = Gtk.ScrolledWindow.New();
+        scroll.SetPolicy(Gtk.PolicyType.Never, Gtk.PolicyType.Automatic);
+        scroll.SetVexpand(true);
+        scroll.SetHexpand(true);
+
+        var clamp = Adw.Clamp.New();
+        clamp.SetMaximumSize(980);
+        clamp.SetTighteningThreshold(680);
+
+        var content = Gtk.Box.New(Gtk.Orientation.Vertical, 8);
+        content.SetMarginTop(16);
+        content.SetMarginBottom(16);
+        content.SetMarginStart(16);
+        content.SetMarginEnd(16);
+        content.Append(BuildFollowedSection());
+
+        clamp.SetChild(content);
+        scroll.SetChild(clamp);
+        container.Append(scroll);
+
+        return container;
+    }
+
+    private Gtk.Widget BuildFollowedSection()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("Mangás Seguidos");
+        group.SetDescription("Gerencie updates e baixe apenas os capítulos novos.");
+
+        var container = Gtk.Box.New(Gtk.Orientation.Vertical, 8);
+
+        var actions = Gtk.Box.New(Gtk.Orientation.Horizontal, 8);
+        actions.SetHexpand(true);
+
+        _librarySummaryLabel = Gtk.Label.New("0 mangás seguidos • 0 novos capítulos");
+        _librarySummaryLabel.SetHalign(Gtk.Align.Start);
+        _librarySummaryLabel.SetHexpand(true);
+        _librarySummaryLabel.AddCssClass("dim-label");
+        actions.Append(_librarySummaryLabel);
+
+        _refreshLibraryBtn = Gtk.Button.NewWithLabel("Atualizar lista");
+        _refreshLibraryBtn.AddCssClass("flat");
+        _refreshLibraryBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.RefreshLibraryCommand.CanExecute(null))
+                _vm.RefreshLibraryCommand.Execute(null);
+        };
+        actions.Append(_refreshLibraryBtn);
+
+        _checkUpdatesAllBtn = Gtk.Button.NewWithLabel("Verificar atualizações");
+        _checkUpdatesAllBtn.AddCssClass("flatpak-button");
+        _checkUpdatesAllBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.CheckUpdatesAllCommand.CanExecute(null))
+                _vm.CheckUpdatesAllCommand.Execute(null);
+        };
+        actions.Append(_checkUpdatesAllBtn);
+
+        _downloadNewAllBtn = Gtk.Button.NewWithLabel("Baixar novos");
+        _downloadNewAllBtn.AddCssClass("flatpak-button");
+        _downloadNewAllBtn.AddCssClass("flatpak-primary");
+        _downloadNewAllBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.DownloadNewAllCommand.CanExecute(null))
+                _vm.DownloadNewAllCommand.Execute(null);
+        };
+        actions.Append(_downloadNewAllBtn);
+
+        container.Append(actions);
+
+        _libraryListBox = Gtk.Box.New(Gtk.Orientation.Vertical, 6);
+        _libraryListBox.AddCssClass("boxed-list");
+        container.Append(_libraryListBox);
+
+        _libraryEmptyLabel = Gtk.Label.New("Nenhum mangá seguido ainda.");
+        _libraryEmptyLabel.SetHalign(Gtk.Align.Start);
+        _libraryEmptyLabel.AddCssClass("dim-label");
+        _libraryListBox.Append(_libraryEmptyLabel);
+
+        group.Add(container);
+        return group;
     }
 
     private Gtk.Widget BuildSearchBar()
@@ -807,6 +906,23 @@ public class MainWindow
         var actionsBox = Gtk.Box.New(Gtk.Orientation.Horizontal, 12);
         actionsBox.SetMarginBottom(24);
 
+        _followBtn = Gtk.Button.NewWithLabel("Seguir");
+        _followBtn.AddCssClass("pill");
+        _followBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.IsCurrentMangaFollowed)
+            {
+                if (_vm.UnfollowCurrentMangaCommand.CanExecute(null))
+                    _vm.UnfollowCurrentMangaCommand.Execute(null);
+            }
+            else
+            {
+                if (_vm.FollowCurrentMangaCommand.CanExecute(null))
+                    _vm.FollowCurrentMangaCommand.Execute(null);
+            }
+        };
+        actionsBox.Append(_followBtn);
+
         _downloadSelectedBtn = Gtk.Button.NewWithLabel("Baixar selecionados");
         _downloadSelectedBtn.AddCssClass("suggested-action");
         _downloadSelectedBtn.AddCssClass("pill");
@@ -936,7 +1052,11 @@ public class MainWindow
     {
         _vm.PropertyChanged += OnViewModelPropertyChanged;
         _vm.Chapters.CollectionChanged += OnChaptersCollectionChanged;
+        _vm.LibraryItems.CollectionChanged += OnLibraryItemsCollectionChanged;
          
+        RebuildLibraryRows();
+        UpdateLibrarySectionState();
+        UpdateFollowButtonState();
     }
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -949,10 +1069,13 @@ public class MainWindow
                 _urlEntry.SetSensitive(!_vm.IsFetching);
                 if (_vm.IsFetching) _fetchingSpinner.Start();
                 else _fetchingSpinner.Stop();
+                UpdateLibrarySectionState();
+                UpdateFollowButtonState();
                 break;
 
             case nameof(MainWindowViewModel.IsMangaLoaded):
                 UpdateContentStack();
+                UpdateFollowButtonState();
                 break;
 
             case nameof(MainWindowViewModel.IsErrorState):
@@ -984,6 +1107,19 @@ public class MainWindow
                 _cancelBtn.SetVisible(_vm.IsDownloading);
                 _downloadSelectedBtn.SetSensitive(!_vm.IsDownloading);
                 _downloadAllBtn.SetSensitive(!_vm.IsDownloading);
+                UpdateLibrarySectionState();
+                UpdateFollowButtonState();
+                break;
+
+            case nameof(MainWindowViewModel.IsLibraryBusy):
+            case nameof(MainWindowViewModel.LibraryNewChaptersTotal):
+                UpdateLibrarySectionState();
+                UpdateFollowButtonState();
+                break;
+
+            case nameof(MainWindowViewModel.IsCurrentMangaFollowed):
+            case nameof(MainWindowViewModel.CurrentLibraryMangaId):
+                UpdateFollowButtonState();
                 break;
 
             case nameof(MainWindowViewModel.OverallProgress):
@@ -1062,6 +1198,124 @@ public class MainWindow
             "warning" => "⚠",
             _ => "ℹ"
         });
+    }
+
+    private void OnLibraryItemsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        RebuildLibraryRows();
+        UpdateLibrarySectionState();
+    }
+
+    private void RebuildLibraryRows()
+    {
+        if (_libraryListBox == null)
+            return;
+
+        foreach (var row in _libraryRows.Values)
+            _libraryListBox.Remove(row);
+        _libraryRows.Clear();
+
+        if (_vm.LibraryItems.Count == 0)
+        {
+            _libraryEmptyLabel.SetVisible(true);
+            return;
+        }
+
+        _libraryEmptyLabel.SetVisible(false);
+        foreach (var item in _vm.LibraryItems)
+        {
+            var row = BuildLibraryRow(item);
+            _libraryRows[item.Id] = row;
+            _libraryListBox.Append(row);
+        }
+    }
+
+    private Gtk.Widget BuildLibraryRow(LibraryMangaEntry entry)
+    {
+        var row = Adw.ActionRow.New();
+        row.SetTitle(entry.Title);
+
+        var lastChecked = entry.LastCheckedAtUtc.HasValue
+            ? entry.LastCheckedAtUtc.Value.ToLocalTime().ToString("dd/MM HH:mm")
+            : "nunca";
+        row.SetSubtitle($"{entry.ProviderKey} • últimos check: {lastChecked}");
+
+        var badge = Gtk.Label.New($"+{entry.NewChaptersCount}");
+        badge.AddCssClass("pill");
+        badge.SetVisible(entry.NewChaptersCount > 0);
+        row.AddSuffix(badge);
+
+        var actions = Gtk.Box.New(Gtk.Orientation.Horizontal, 6);
+        actions.SetValign(Gtk.Align.Center);
+
+        var checkBtn = Gtk.Button.NewWithLabel("Verificar");
+        checkBtn.AddCssClass("flat");
+        checkBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.CheckUpdatesItemCommand.CanExecute(entry.Id))
+                _vm.CheckUpdatesItemCommand.Execute(entry.Id);
+        };
+        actions.Append(checkBtn);
+
+        var downloadBtn = Gtk.Button.NewWithLabel("Baixar novos");
+        downloadBtn.AddCssClass("flat");
+        downloadBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.DownloadNewItemCommand.CanExecute(entry.Id))
+                _vm.DownloadNewItemCommand.Execute(entry.Id);
+        };
+        actions.Append(downloadBtn);
+
+        var unfollowBtn = Gtk.Button.NewWithLabel("Deixar de seguir");
+        unfollowBtn.AddCssClass("flat");
+        unfollowBtn.OnClicked += (_, _) =>
+        {
+            if (_vm.UnfollowLibraryItemCommand.CanExecute(entry.Id))
+                _vm.UnfollowLibraryItemCommand.Execute(entry.Id);
+        };
+        actions.Append(unfollowBtn);
+
+        row.AddSuffix(actions);
+        row.SetActivatable(false);
+        return row;
+    }
+
+    private void UpdateLibrarySectionState()
+    {
+        if (_librarySummaryLabel == null)
+            return;
+
+        _librarySummaryLabel.SetText(
+            $"{_vm.LibraryItems.Count} mangá(s) seguido(s) • {_vm.LibraryNewChaptersTotal} capítulo(s) novo(s)");
+
+        var enabled = !_vm.IsLibraryBusy && !_vm.IsDownloading && !_vm.IsFetching;
+        _refreshLibraryBtn.SetSensitive(enabled);
+        _checkUpdatesAllBtn.SetSensitive(enabled && _vm.LibraryItems.Count > 0);
+        _downloadNewAllBtn.SetSensitive(enabled && _vm.LibraryItems.Count > 0);
+    }
+
+    private void UpdateFollowButtonState()
+    {
+        if (_followBtn == null)
+            return;
+
+        _followBtn.SetVisible(_vm.IsMangaLoaded);
+        if (!_vm.IsMangaLoaded)
+            return;
+
+        if (_vm.IsCurrentMangaFollowed)
+        {
+            _followBtn.SetLabel("Seguindo");
+            _followBtn.SetTooltipText("Clique para deixar de seguir");
+        }
+        else
+        {
+            _followBtn.SetLabel("Seguir");
+            _followBtn.SetTooltipText("Adicionar mangá à biblioteca");
+        }
+
+        var enabled = !_vm.IsLibraryBusy && !_vm.IsDownloading && !_vm.IsFetching;
+        _followBtn.SetSensitive(enabled);
     }
 
      

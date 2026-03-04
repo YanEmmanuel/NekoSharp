@@ -40,9 +40,11 @@ class Program
             var logService = new LogService();
             var settingsStore = new SettingsStore(logService: logService);
             var cfStore = new CloudflareCredentialStore(logService: logService);
+            var libraryStore = new LibraryStore(logService: logService);
             var scraperManager = new ScraperManager();
             var downloadService = new DownloadService(scraperManager, logService: logService, cfStore: cfStore, settingsStore: settingsStore);
-            var viewModel = new MainWindowViewModel(scraperManager, downloadService, logService, settingsStore);
+            var libraryService = new MangaLibraryService(scraperManager, downloadService, libraryStore, logService);
+            var viewModel = new MainWindowViewModel(scraperManager, downloadService, libraryService, logService, settingsStore);
             var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
 
             scraperManager.DiscoverAndRegisterAll(logService, cfStore, providerUpdateService.GetInstalledProviderAssemblies());

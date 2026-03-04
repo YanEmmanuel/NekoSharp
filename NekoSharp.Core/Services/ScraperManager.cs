@@ -170,6 +170,15 @@ public class ScraperManager
         return _scrapers.FirstOrDefault(s => s.CanHandle(url));
     }
 
+    public IScraper? GetScraperByName(string providerKey)
+    {
+        if (string.IsNullOrWhiteSpace(providerKey))
+            return null;
+
+        return _scrapers.FirstOrDefault(s =>
+            s.Name.Equals(providerKey, StringComparison.OrdinalIgnoreCase));
+    }
+
     public bool CanHandle(string url)
     {
         return _scrapers.Any(s => s.CanHandle(url));
