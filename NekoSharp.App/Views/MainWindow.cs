@@ -18,6 +18,8 @@ public class MainWindow
     private Gtk.Button _followBtn = null!;
     private Gtk.MenuButton _providersButton = null!;
     private Gtk.Popover _providersPopover = null!;
+    private Gtk.Label _providersCountLabel = null!;
+    private Gtk.Box _providersListBox = null!;
     private Gtk.Label _librarySummaryLabel = null!;
     private Gtk.Button _refreshLibraryBtn = null!;
     private Gtk.Button _checkUpdatesAllBtn = null!;
@@ -187,11 +189,12 @@ public class MainWindow
         providersRow.SetHalign(Gtk.Align.End);
 
         _providersButton = Gtk.MenuButton.New();
-        _providersButton.SetLabel("Provedores");
+        _providersButton.SetLabel(_vm.ProvidersButtonLabel);
         _providersButton.SetTooltipText("Sites suportados");
         _providersButton.AddCssClass("flatpak-button");
         _providersPopover = BuildProvidersPopover();
         _providersButton.SetPopover(_providersPopover);
+        RefreshProvidersUi();
         providersRow.Append(_providersButton);
 
         topArea.Append(providersRow);
@@ -359,14 +362,18 @@ public class MainWindow
         title.AddCssClass("heading");
         box.Append(title);
 
-        var listBox = Gtk.Box.New(Gtk.Orientation.Vertical, 4);
-        foreach (var name in _vm.ProviderNames)
-        {
-            var label = Gtk.Label.New(name);
-            label.SetHalign(Gtk.Align.Start);
-            listBox.Append(label);
-        }
-        box.Append(listBox);
+        _providersCountLabel = Gtk.Label.New(string.Empty);
+        _providersCountLabel.SetHalign(Gtk.Align.Start);
+        _providersCountLabel.AddCssClass("dim-label");
+        box.Append(_providersCountLabel);
+
+        _providersListBox = Gtk.Box.New(Gtk.Orientation.Vertical, 4);
+
+        var scroll = Gtk.ScrolledWindow.New();
+        scroll.SetPolicy(Gtk.PolicyType.Never, Gtk.PolicyType.Automatic);
+        scroll.SetSizeRequest(300, 360);
+        scroll.SetChild(_providersListBox);
+        box.Append(scroll);
 
         popover.SetChild(box);
         return popover;
@@ -1340,6 +1347,7 @@ public class MainWindow
         _vm.Chapters.CollectionChanged += OnChaptersCollectionChanged;
         _vm.LibraryItems.CollectionChanged += OnLibraryItemsCollectionChanged;
          
+        RefreshProvidersUi();
         RebuildLibraryRows();
         UpdateLibrarySectionState();
         UpdateFollowButtonState();
@@ -1451,6 +1459,41 @@ public class MainWindow
         else
         {
             _contentStack.SetVisibleChildName("empty");
+        }
+    }
+
+    private void RefreshProvidersUi()
+    {
+        if (_providersButton == null || _providersPopover == null || _providersCountLabel == null || _providersListBox == null)
+            return;
+
+        _providersButton.SetLabel(_vm.ProvidersButtonLabel);
+        _providersButton.SetTooltipText($"{_vm.ProviderCount} sites suportados");
+        _providersCountLabel.SetText($"{_vm.ProviderCount} total");
+
+        for (var child = _providersListBox.GetFirstChild(); child is not null;)
+        {
+            var next = child.GetNextSibling();
+            _providersListBox.Remove(child);
+            child = next;
+        }
+
+        if (_vm.ProviderCount == 0)
+        {
+            var emptyLabel = Gtk.Label.New("Nenhum provider carregado.");
+            emptyLabel.SetHalign(Gtk.Align.Start);
+            emptyLabel.AddCssClass("dim-label");
+            _providersListBox.Append(emptyLabel);
+            return;
+        }
+
+        foreach (var name in _vm.ProviderNames)
+        {
+            var label = Gtk.Label.New(name);
+            label.SetHalign(Gtk.Align.Start);
+            label.SetWrap(true);
+            label.SetXalign(0);
+            _providersListBox.Append(label);
         }
     }
 

@@ -94,8 +94,16 @@ public partial class MainWindowViewModel : ObservableObject
     public ObservableCollection<LibraryMangaEntry> LibraryItems { get; } = [];
     public ObservableCollection<LogEntryViewModel> LogEntries { get; } = [];
 
-    public string SupportedSites => string.Join(", ", _scraperManager.Scrapers.Select(s => s.Name));
-    public IReadOnlyList<string> ProviderNames => _scraperManager.Scrapers.Select(s => s.Name).ToList();
+    public IReadOnlyList<string> ProviderNames => _scraperManager.Scrapers
+        .Select(s => s.Name)
+        .OrderBy(static name => name, StringComparer.CurrentCultureIgnoreCase)
+        .ToList();
+
+    public int ProviderCount => _scraperManager.Scrapers.Count;
+
+    public string ProvidersButtonLabel => $"Provedores ({ProviderCount})";
+
+    public string SupportedSites => string.Join(", ", ProviderNames);
 
     public MainWindowViewModel(
         ScraperManager scraperManager,

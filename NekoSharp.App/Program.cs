@@ -42,12 +42,13 @@ class Program
             var cfStore = new CloudflareCredentialStore(logService: logService);
             var libraryStore = new LibraryStore(logService: logService);
             var scraperManager = new ScraperManager();
-            var downloadService = new DownloadService(scraperManager, logService: logService, cfStore: cfStore, settingsStore: settingsStore);
-            var libraryService = new MangaLibraryService(scraperManager, downloadService, libraryStore, logService);
-            var viewModel = new MainWindowViewModel(scraperManager, downloadService, libraryService, logService, settingsStore, cfStore);
             var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
 
             scraperManager.DiscoverAndRegisterAll(logService, cfStore, providerUpdateService.GetInstalledProviderAssemblies());
+
+            var downloadService = new DownloadService(scraperManager, logService: logService, cfStore: cfStore, settingsStore: settingsStore);
+            var libraryService = new MangaLibraryService(scraperManager, downloadService, libraryStore, logService);
+            var viewModel = new MainWindowViewModel(scraperManager, downloadService, libraryService, logService, settingsStore, cfStore);
             if (viewModel.RefreshMediocreAuthStateCommand.CanExecute(null))
                 viewModel.RefreshMediocreAuthStateCommand.Execute(null);
 

@@ -24,11 +24,13 @@ public abstract class WordPressMadaraScraper : IScraper
     protected virtual string ChaptersPlaceholderSelector => "[id^=\"manga-chapters-holder\"][data-id]";
     protected virtual bool EnableChapterAjax => true;
     protected virtual bool ReverseChapterOrder => false;
+    protected virtual string? ChapterLinkSelector => null;
+    protected virtual string? ChapterTitleSelector => null;
 
     protected virtual bool UseStyleListQuery => true;
-    protected virtual string PagesSelector => "div.page-break.no-gaps, div.page-break";
+    protected virtual string PagesSelector => "div.page-break.no-gaps, div.page-break, li.blocks-gallery-item, .reading-content .text-left:not(:has(.blocks-gallery-item)) img";
     protected virtual string PageImageSelector => "img, image";
-    protected virtual string FallbackPageImageSelector => "img.wp-manga-chapter-img";
+    protected virtual string FallbackPageImageSelector => "img.wp-manga-chapter-img, .reading-content img";
 
     protected readonly HttpClient Http;
     protected readonly IBrowsingContext Browser;
@@ -183,6 +185,21 @@ public abstract class WordPressMadaraScraper : IScraper
             : rawTitle;
     }
 
+    protected virtual string? ExtractChapterUrl(IElement chapterElement, string refererUrl)
+    {
+        var linkElement = ResolveChapterLinkElement(chapterElement);
+        return ToAbsoluteUrl(refererUrl, linkElement?.GetAttribute("href"));
+    }
+
+    protected virtual string ExtractChapterRawTitle(IElement chapterElement)
+    {
+        var titleElement = !string.IsNullOrWhiteSpace(ChapterTitleSelector)
+            ? chapterElement.QuerySelector(ChapterTitleSelector!)
+            : ResolveChapterLinkElement(chapterElement);
+
+        return titleElement?.TextContent?.Trim() ?? string.Empty;
+    }
+
     protected virtual string? ExtractPageImageUrl(IElement pageElement, string refererUrl)
     {
         var imageNode = pageElement.Matches(PageImageSelector)
@@ -220,8 +237,8 @@ public abstract class WordPressMadaraScraper : IScraper
 
         foreach (var link in chapterLinks)
         {
-            var chapterUrl = ToAbsoluteUrl(refererUrl, link.GetAttribute("href"));
-            var rawTitle = (link.TextContent ?? string.Empty).Trim();
+            var chapterUrl = ExtractChapterUrl(link, refererUrl);
+            var rawTitle = ExtractChapterRawTitle(link);
 
             if (string.IsNullOrWhiteSpace(chapterUrl) || string.IsNullOrWhiteSpace(rawTitle))
                 continue;
@@ -235,6 +252,16 @@ public abstract class WordPressMadaraScraper : IScraper
         }
 
         return chapters;
+    }
+
+    private IElement? ResolveChapterLinkElement(IElement chapterElement)
+    {
+        if (chapterElement.TagName.Equals("A", StringComparison.OrdinalIgnoreCase))
+            return chapterElement;
+
+        return !string.IsNullOrWhiteSpace(ChapterLinkSelector)
+            ? chapterElement.QuerySelector(ChapterLinkSelector!)
+            : chapterElement.QuerySelector("a");
     }
 
     private async Task<List<IElement>> TryLoadChaptersFromAjaxAsync(string mangaUrl, IElement placeholder, CancellationToken ct)
