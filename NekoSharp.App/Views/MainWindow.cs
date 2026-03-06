@@ -1,5 +1,6 @@
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Net;
 using NekoSharp.App.ViewModels;
 using NekoSharp.Core.Models;
 using NekoSharp.Core.Services;
@@ -63,6 +64,15 @@ public class MainWindow
     private Gtk.Label _outputDirLabel = null!;
 
     private readonly HttpClient _httpClient;
+    private static readonly TimeSpan[] CoverAttemptTimeouts = [
+        TimeSpan.FromSeconds(8),
+        TimeSpan.FromSeconds(15),
+        TimeSpan.FromSeconds(25)
+    ];
+    private static readonly TimeSpan[] CoverRetryDelays = [
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(1500)
+    ];
 
     private readonly Dictionary<ChapterViewModel, ChapterRowWidgets> _chapterRows = new();
     private readonly Dictionary<long, Gtk.Widget> _libraryRows = new();
@@ -77,6 +87,7 @@ public class MainWindow
             ? new LoggingHttpHandler(logService, new HttpClientHandler())
             : new HttpClientHandler();
         _httpClient = new HttpClient(handler);
+        _httpClient.Timeout = Timeout.InfiniteTimeSpan;
         _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgentProvider.Default);
 
         _window = Adw.ApplicationWindow.New(app);
@@ -461,9 +472,33 @@ public class MainWindow
             }
         };
 
+        var pageConcurrentRow = Adw.ActionRow.New();
+        pageConcurrentRow.SetTitle("Downloads Simultâneos de Páginas");
+        pageConcurrentRow.SetSubtitle("Limite global de imagens baixadas ao mesmo tempo (1-12). Reduza se o site começar a falhar.");
+        var pageConcurrentSpin = Gtk.SpinButton.NewWithRange(1, 12, 1);
+        pageConcurrentSpin.SetNumeric(true);
+        pageConcurrentSpin.SetValue(_vm.MaxConcurrentPageDownloads);
+        pageConcurrentSpin.OnValueChanged += (_, _) =>
+        {
+            _vm.MaxConcurrentPageDownloads = pageConcurrentSpin.GetValueAsInt();
+        };
+        pageConcurrentRow.AddSuffix(pageConcurrentSpin);
+        pageConcurrentRow.SetActivatable(false);
+        group.Add(pageConcurrentRow);
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(_vm.MaxConcurrentPageDownloads))
+            {
+                var val = _vm.MaxConcurrentPageDownloads;
+                if (pageConcurrentSpin.GetValueAsInt() != val)
+                    pageConcurrentSpin.SetValue(val);
+            }
+        };
+
         var concurrentRow = Adw.ActionRow.New();
-        concurrentRow.SetTitle("Downloads Simultâneos");
-        concurrentRow.SetSubtitle("Quantidade de capítulos baixados ao mesmo tempo (1-10). Padrão: 3");
+        concurrentRow.SetTitle("Downloads Simultâneos de Capítulos");
+        concurrentRow.SetSubtitle("Quantidade de capítulos processados ao mesmo tempo (1-10). Padrão: 3");
         var concurrentSpin = Gtk.SpinButton.NewWithRange(1, 10, 1);
         concurrentSpin.SetNumeric(true);
         concurrentSpin.SetValue(_vm.MaxConcurrentChapters);
@@ -1760,17 +1795,7 @@ public class MainWindow
             {
                 var imageUri = new Uri(url);
                 var referer = $"{imageUri.Scheme}://{imageUri.Host}/";
-
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Add("Referer", referer);
-                request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
-
-                using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-                response.EnsureSuccessStatusCode();
-
-                await using var contentStream = await response.Content.ReadAsStreamAsync();
-                await using var fileStream = new FileStream(cachePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true);
-                await contentStream.CopyToAsync(fileStream);
+                await DownloadCoverToCacheAsync(url, cachePath, referer);
             }
 
              
@@ -1787,6 +1812,72 @@ public class MainWindow
         {
             Console.Error.WriteLine($"[Cover] Falha ao carregar capa: {ex.Message}");
         }
+    }
+
+    private async Task DownloadCoverToCacheAsync(string url, string cachePath, string referer)
+    {
+        Exception? lastException = null;
+
+        for (var attempt = 0; attempt < CoverAttemptTimeouts.Length; attempt++)
+        {
+            var isLastAttempt = attempt == CoverAttemptTimeouts.Length - 1;
+            var timeout = CoverAttemptTimeouts[attempt];
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                request.Headers.Add("Referer", referer);
+                request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
+
+                using var timeoutCts = new CancellationTokenSource(timeout);
+                using var response = await _httpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    timeoutCts.Token);
+
+                if (!response.IsSuccessStatusCode && IsTransientCoverStatus(response.StatusCode) && !isLastAttempt)
+                {
+                    throw new HttpRequestException(
+                        $"Servidor retornou {(int)response.StatusCode} ({response.StatusCode}) ao carregar a capa.",
+                        inner: null,
+                        response.StatusCode);
+                }
+
+                response.EnsureSuccessStatusCode();
+
+                await using var contentStream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
+                await using var fileStream = new FileStream(cachePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true);
+                await contentStream.CopyToAsync(fileStream, timeoutCts.Token);
+                return;
+            }
+            catch (OperationCanceledException ex)
+            {
+                lastException = new TimeoutException($"Tempo esgotado ao carregar a capa {url}.", ex);
+            }
+            catch (HttpRequestException ex) when (!isLastAttempt && IsTransientCoverStatus(ex.StatusCode))
+            {
+                lastException = ex;
+            }
+
+            if (isLastAttempt)
+                break;
+
+            var delay = CoverRetryDelays[Math.Min(attempt, CoverRetryDelays.Length - 1)]
+                        + TimeSpan.FromMilliseconds(Random.Shared.Next(100, 250));
+            await Task.Delay(delay);
+        }
+
+        throw lastException ?? new HttpRequestException($"Falha ao carregar a capa {url}.");
+    }
+
+    private static bool IsTransientCoverStatus(HttpStatusCode? statusCode)
+    {
+        return statusCode is HttpStatusCode.RequestTimeout
+            or HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout
+            or HttpStatusCode.InternalServerError
+            or (HttpStatusCode)429;
     }
 
     private async void PasteFromClipboardAsync()

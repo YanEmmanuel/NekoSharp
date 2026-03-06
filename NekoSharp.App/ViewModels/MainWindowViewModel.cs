@@ -64,6 +64,7 @@ public partial class MainWindowViewModel : ObservableObject
     [ObservableProperty] private int _smartStitchLossyQuality = 100;
 
     [ObservableProperty] private int _maxConcurrentChapters = 3;
+    [ObservableProperty] private int _maxConcurrentPageDownloads = 4;
 
     [ObservableProperty] private bool _isMediocreAuthBusy;
     [ObservableProperty] private string _mediocreAuthStatus = "Desconectado";
@@ -110,6 +111,7 @@ public partial class MainWindowViewModel : ObservableObject
         _logService = logService;
         _settingsStore = settingsStore;
         _cloudflareStore = cloudflareStore;
+        _downloadService.MaxConcurrentDownloads = MaxConcurrentPageDownloads;
 
         LoadSettings();
 
@@ -152,6 +154,7 @@ public partial class MainWindowViewModel : ObservableObject
             var ssOutFmt = await _settingsStore.GetEnumAsync(SmartStitchSettings.KeyOutputFormat, ImageFormat.Png);
             var ssLossyQ = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyLossyQuality, 100);
             var concChapters = await _settingsStore.GetIntAsync("Download.MaxConcurrentChapters", 3);
+            var concPages = await _settingsStore.GetIntAsync("Download.MaxConcurrentPages", 4);
 
             GLib.Functions.IdleAdd(0, () =>
             {
@@ -175,6 +178,7 @@ public partial class MainWindowViewModel : ObservableObject
                 SmartStitchLossyQuality = Math.Clamp(ssLossyQ, 1, 100);
 
                 MaxConcurrentChapters = Math.Clamp(concChapters, 1, 10);
+                MaxConcurrentPageDownloads = Math.Clamp(concPages, 1, 12);
 
                 return false;
             });
@@ -787,6 +791,15 @@ public partial class MainWindowViewModel : ObservableObject
         var v = Math.Clamp(value, 1, 10);
         if (v != value) { MaxConcurrentChapters = v; return; }
         _settingsStore.SetIntAsync("Download.MaxConcurrentChapters", v);
+    }
+
+    partial void OnMaxConcurrentPageDownloadsChanged(int value)
+    {
+        var v = Math.Clamp(value, 1, 12);
+        if (v != value) { MaxConcurrentPageDownloads = v; return; }
+
+        _downloadService.MaxConcurrentDownloads = v;
+        _settingsStore.SetIntAsync("Download.MaxConcurrentPages", v);
     }
 
     partial void OnIsFetchingChanged(bool value) => NotifyCanExecuteStateChanged();
