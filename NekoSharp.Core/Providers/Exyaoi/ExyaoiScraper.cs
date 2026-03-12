@@ -6,6 +6,8 @@ namespace NekoSharp.Core.Providers.Exyaoi;
 public sealed class ExyaoiScraper : WordPressMadaraScraper
 {
     public override string Name => "Exyaoi";
+    protected override bool EnableChapterAjax => false;
+    protected override string ChaptersSelector => ".page-content-listing.single-page li.wp-manga-chapter > a";
 
     public ExyaoiScraper() : this(null, null) { }
 

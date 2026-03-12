@@ -389,8 +389,15 @@ public class CloudflareHandler : DelegatingHandler
                     if (!IsChallengeHtml(content))
                     {
                         _log?.Info("[Cloudflare] Challenge page cleared! Waiting 3s for cookies to settle…");
-                        solvedHtmlContent = content;
                         await Task.Delay(3_000, ct);
+                        try
+                        {
+                            solvedHtmlContent = await page.GetContentAsync();
+                        }
+                        catch
+                        {
+                            solvedHtmlContent = content;
+                        }
                         solved = true;
                         break;
                     }

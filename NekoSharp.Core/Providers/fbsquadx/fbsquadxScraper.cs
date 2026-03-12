@@ -15,6 +15,7 @@ public sealed class fbsquadxScraper : IScraper
 
     private readonly HttpClient _http;
     private readonly IBrowsingContext _browser;
+    private readonly LogService? _log;
 
     public fbsquadxScraper() : this(null, null, null) { }
     public fbsquadxScraper(LogService? logService) : this(logService, null, null) { }
@@ -25,6 +26,7 @@ public sealed class fbsquadxScraper : IScraper
 
     private fbsquadxScraper(LogService? logService, CloudflareCredentialStore? cfStore, IBrowsingContext? browser)
     {
+        _log = logService;
         _browser = browser ?? BrowsingContext.New(Configuration.Default);
 
         HttpMessageHandler inner = new CloudflareHandler(
@@ -55,7 +57,7 @@ public sealed class fbsquadxScraper : IScraper
             throw new ArgumentException("URL invalida do fbsquadx.", nameof(url));
 
         var html = await _http.GetStringAsync(url, ct);
-        var doc = await _browser.OpenAsync(req => req.Content(html), ct);
+        var doc = await _browser.OpenAsync(req => req.Content(html).Address(url), ct);
 
         var coverImg = doc.QuerySelector<IHtmlImageElement>("div.summary_image img");
         var coverUrl = coverImg?.Source ?? string.Empty;
@@ -67,8 +69,11 @@ public sealed class fbsquadxScraper : IScraper
             ? titleNode.TextContent.Trim()
             : titleFromAlt.Trim();
 
-        var descriptionNode = doc.QuerySelector("div.manga-about.manga-info p");
-        var descriptionText = descriptionNode?.TextContent.Trim() ?? string.Empty;
+        var descriptionText =
+            doc.QuerySelector("div.manga-about.manga-info p")?.TextContent.Trim() ??
+            doc.QuerySelector("div.manga-summary p")?.TextContent.Trim() ??
+            doc.QuerySelector("div.summary__content p")?.TextContent.Trim() ??
+            string.Empty;
 
         return new Manga
         {
@@ -83,11 +88,16 @@ public sealed class fbsquadxScraper : IScraper
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
     {
         var response = await _http.GetStringAsync(url, ct);
-        var doc = await _browser.OpenAsync(req => req.Content(response), ct);
+        var doc = await _browser.OpenAsync(req => req.Content(response).Address(url), ct);
 
         var chapters = new List<Chapter>();
 
-        var chapterLinks = doc.QuerySelectorAll("ul.sub-chap-list li.wp-manga-chapter > a");
+        var chapterLinks = doc.QuerySelectorAll("li.wp-manga-chapter > a, li.wp-manga-chapter a")
+            .OfType<IElement>()
+            .DistinctBy(link => link.GetAttribute("href") ?? string.Empty)
+            .ToList();
+
+        _log?.Debug($"[{Name}] Chapter selector matched {chapterLinks.Count} nodes for {url}");
 
         foreach (var link in chapterLinks)
         {
@@ -99,6 +109,9 @@ public sealed class fbsquadxScraper : IScraper
 
             if (string.IsNullOrWhiteSpace(rawTitle))
                 continue;
+
+            if (Uri.TryCreate(urlChapter, UriKind.Relative, out var relative))
+                urlChapter = new Uri(_http.BaseAddress!, relative).ToString();
 
              
             var title = rawTitle.Contains(" - ")
@@ -112,6 +125,8 @@ public sealed class fbsquadxScraper : IScraper
                 Url = urlChapter
             });
         }
+
+        _log?.Debug($"[{Name}] Parsed {chapters.Count} chapters for {url}");
 
         return chapters;
     }

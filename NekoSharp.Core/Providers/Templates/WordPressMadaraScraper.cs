@@ -12,6 +12,7 @@ public abstract class WordPressMadaraScraper : IScraper
 {
     public abstract string Name { get; }
     public string BaseUrl { get; }
+    protected readonly LogService? Log;
 
     protected virtual string PathPrefix => string.Empty;
 
@@ -19,6 +20,7 @@ public abstract class WordPressMadaraScraper : IScraper
     protected virtual string MangaTitleSelector => "h1";
     protected virtual string MangaOgTitleSelector => "head meta[property=\"og:title\"]";
     protected virtual string MangaDescriptionSelector => "div.summary__content p";
+    protected virtual IReadOnlyList<string> MangaDescriptionFallbackSelectors => ["div.manga-summary p", "div.description-summary p"];
 
     protected virtual string ChaptersSelector => "li.wp-manga-chapter > a";
     protected virtual string ChaptersPlaceholderSelector => "[id^=\"manga-chapters-holder\"][data-id]";
@@ -41,6 +43,7 @@ public abstract class WordPressMadaraScraper : IScraper
             throw new ArgumentException("BaseUrl invalida.", nameof(baseUrl));
 
         BaseUrl = baseUrl.TrimEnd('/');
+        Log = logService;
         Browser = BrowsingContext.New(Configuration.Default);
 
         HttpMessageHandler inner = new CloudflareHandler(
@@ -85,6 +88,16 @@ public abstract class WordPressMadaraScraper : IScraper
         var descriptionNode = doc.QuerySelector(MangaDescriptionSelector);
         var descriptionText = descriptionNode?.TextContent?.Trim() ?? string.Empty;
 
+        if (string.IsNullOrWhiteSpace(descriptionText))
+        {
+            foreach (var selector in MangaDescriptionFallbackSelectors)
+            {
+                descriptionText = doc.QuerySelector(selector)?.TextContent?.Trim() ?? string.Empty;
+                if (!string.IsNullOrWhiteSpace(descriptionText))
+                    break;
+            }
+        }
+
         return new Manga
         {
             Name = title,
@@ -101,17 +114,23 @@ public abstract class WordPressMadaraScraper : IScraper
             throw new ArgumentException($"URL invalida do {Name}.", nameof(url));
 
         var doc = await LoadDocumentAsync(url, ct);
+        var placeholder = doc.QuerySelector(ChaptersPlaceholderSelector);
 
-        IEnumerable<IElement> chapterLinks = doc.QuerySelectorAll(ChaptersSelector);
+        var chapterLinks = doc.QuerySelectorAll(ChaptersSelector).ToList();
+        Log?.Debug($"[{Name}] Chapter selector '{ChaptersSelector}' matched {chapterLinks.Count} nodes for {url}");
 
-        if (EnableChapterAjax && doc.QuerySelector(ChaptersPlaceholderSelector) is { } placeholder)
+        if (EnableChapterAjax && (placeholder is not null || !chapterLinks.Any()))
         {
             var ajaxLinks = await TryLoadChaptersFromAjaxAsync(url, placeholder, ct);
             if (ajaxLinks.Count > 0)
+            {
                 chapterLinks = ajaxLinks;
+                Log?.Debug($"[{Name}] AJAX chapter fallback returned {chapterLinks.Count} nodes for {url}");
+            }
         }
 
         var chapters = ParseChapters(chapterLinks, url);
+        Log?.Debug($"[{Name}] Parsed {chapters.Count} chapters for {url}");
 
         if (ReverseChapterOrder)
             chapters.Reverse();
@@ -264,7 +283,7 @@ public abstract class WordPressMadaraScraper : IScraper
             : chapterElement.QuerySelector("a");
     }
 
-    private async Task<List<IElement>> TryLoadChaptersFromAjaxAsync(string mangaUrl, IElement placeholder, CancellationToken ct)
+    private async Task<List<IElement>> TryLoadChaptersFromAjaxAsync(string mangaUrl, IElement? placeholder, CancellationToken ct)
     {
         try
         {
@@ -276,7 +295,7 @@ public abstract class WordPressMadaraScraper : IScraper
         {
         }
 
-        var dataId = placeholder.GetAttribute("data-id");
+        var dataId = placeholder?.GetAttribute("data-id");
         if (string.IsNullOrWhiteSpace(dataId))
             return [];
 
