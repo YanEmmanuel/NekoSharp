@@ -79,7 +79,7 @@ public class CloudflareHandler : DelegatingHandler
             storedCreds = await _store.TryGetAsync(host);
             if (storedCreds is not null)
             {
-                if (BrowserTransportPreferredHosts.ContainsKey(host) && IsBrowserTransportCandidate(request))
+                if (BrowserTransportPreferredHosts.ContainsKey(host) && request.Method == HttpMethod.Get)
                 {
                     var browserFirst = await TrySendWithBrowserTransportAsync(request, host, storedCreds, ct);
                     if (browserFirst is { IsSuccessStatusCode: true })
@@ -208,7 +208,9 @@ public class CloudflareHandler : DelegatingHandler
                         return response;
                     }
 
-                    await _store.SaveAsync(solveResult.Credentials);
+                    var mergedCreds = MergeCredentials(fresh ?? storedCreds, solveResult.Credentials);
+                    await _store.SaveAsync(mergedCreds);
+                    BrowserTransportPreferredHosts[host] = 0;
                     if (host is not null)
                         FailedChallengeCooldownUntilUtc.TryRemove(host, out _);
 
@@ -235,6 +237,18 @@ public class CloudflareHandler : DelegatingHandler
         {
             _log?.Debug($"[Cloudflare] Retrying {uri} with saved credentials.");
             InjectCredentials(retry, savedCreds);
+
+            if (BrowserTransportPreferredHosts.ContainsKey(uri.Host) && retry.Method == HttpMethod.Get)
+            {
+                var browserFirst = await TrySendWithBrowserTransportAsync(retry, uri.Host, savedCreds, ct);
+                if (browserFirst is { IsSuccessStatusCode: true })
+                {
+                    _log?.Info($"[Cloudflare] Browser-backed retry succeeded for {uri}");
+                    return browserFirst;
+                }
+
+                browserFirst?.Dispose();
+            }
         }
         else
         {
@@ -518,7 +532,7 @@ public class CloudflareHandler : DelegatingHandler
         CloudflareCredentials creds,
         CancellationToken ct)
     {
-        if (!IsBrowserTransportCandidate(request) || request.RequestUri is null)
+        if (request.Method != HttpMethod.Get || request.RequestUri is null)
             return null;
 
         await BrowserLock.WaitAsync(ct);
@@ -578,7 +592,7 @@ public class CloudflareHandler : DelegatingHandler
 
             browser = await Puppeteer.LaunchAsync(new LaunchOptions
             {
-                Headless = false,
+                Headless = true,
                 ExecutablePath = chromePath,
                 UserDataDir = tempProfile,
                 Args =
@@ -605,32 +619,42 @@ public class CloudflareHandler : DelegatingHandler
             else
                 await page.SetUserAgentAsync(creds.UserAgent, metadata);
 
-            if (deleteTempProfile)
-            {
-                var cookieOrigin = requestUri.GetLeftPart(UriPartial.Authority);
-                var cookies = creds.AllCookies
-                    .Where(static kv => !string.IsNullOrWhiteSpace(kv.Key))
-                    .Select(kv => new CookieParam
-                    {
-                        Name = kv.Key,
-                        Value = kv.Value,
-                        Url = cookieOrigin,
-                        Path = "/",
-                        Secure = requestUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase),
-                    })
-                    .ToArray();
+            var extraHeaders = BuildBrowserExtraHeaders(request);
+            if (extraHeaders.Count > 0)
+                await page.SetExtraHttpHeadersAsync(extraHeaders);
 
-                if (cookies.Length > 0)
-                    await page.SetCookieAsync(cookies);
+            var cookieOrigin = requestUri.GetLeftPart(UriPartial.Authority);
+            var cookies = creds.AllCookies
+                .Where(static kv => !string.IsNullOrWhiteSpace(kv.Key))
+                .Select(kv => new CookieParam
+                {
+                    Name = kv.Key,
+                    Value = kv.Value,
+                    Url = cookieOrigin,
+                    Path = "/",
+                    Secure = requestUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase),
+                })
+                .ToArray();
+
+            if (cookies.Length > 0)
+            {
+                await page.SetCookieAsync(cookies);
             }
 
             _log?.Info($"[Cloudflare] Browser-backed request for {requestUri}");
+
+            var referer = request.Headers.Referrer?.ToString();
+            if (string.IsNullOrWhiteSpace(referer) &&
+                request.Headers.TryGetValues("Referer", out var refererValues))
+            {
+                referer = refererValues.FirstOrDefault();
+            }
 
             var browserResponse = await page.GoToAsync(requestUri.ToString(), new NavigationOptions
             {
                 Timeout = 30_000,
                 WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
-                Referer = request.Headers.Referrer?.ToString(),
+                Referer = referer,
                 CancellationToken = ct,
             });
 
@@ -668,17 +692,15 @@ public class CloudflareHandler : DelegatingHandler
             var refreshedCookies = await CollectCookiesAsync(page, browser, requestUri);
             if (refreshedCookies.Count > 0)
             {
-                var mergedCookies = new Dictionary<string, string>(creds.AllCookies, StringComparer.Ordinal);
-                foreach (var cookie in refreshedCookies)
-                    mergedCookies[cookie.Key] = cookie.Value;
-
-                await _store.SaveAsync(new CloudflareCredentials
-                {
-                    Domain = creds.Domain,
-                    UserAgent = creds.UserAgent,
-                    AllCookies = mergedCookies,
-                    ObtainedAtUtc = DateTime.UtcNow,
-                });
+                await _store.SaveAsync(MergeCredentials(
+                    creds,
+                    new CloudflareCredentials
+                    {
+                        Domain = creds.Domain,
+                        UserAgent = creds.UserAgent,
+                        AllCookies = refreshedCookies,
+                        ObtainedAtUtc = DateTime.UtcNow,
+                    }));
             }
 
             return response;
@@ -863,6 +885,30 @@ public class CloudflareHandler : DelegatingHandler
         return candidate.ObtainedAtUtc > current.ObtainedAtUtc;
     }
 
+    private static CloudflareCredentials MergeCredentials(
+        CloudflareCredentials? baseline,
+        CloudflareCredentials incoming)
+    {
+        var mergedCookies = baseline is null
+            ? new Dictionary<string, string>(StringComparer.Ordinal)
+            : new Dictionary<string, string>(baseline.AllCookies, StringComparer.Ordinal);
+
+        foreach (var cookie in incoming.AllCookies)
+            mergedCookies[cookie.Key] = cookie.Value;
+
+        return new CloudflareCredentials
+        {
+            Domain = !string.IsNullOrWhiteSpace(incoming.Domain)
+                ? incoming.Domain
+                : baseline?.Domain ?? string.Empty,
+            UserAgent = !string.IsNullOrWhiteSpace(incoming.UserAgent)
+                ? incoming.UserAgent
+                : baseline?.UserAgent ?? string.Empty,
+            AllCookies = mergedCookies,
+            ObtainedAtUtc = DateTime.UtcNow,
+        };
+    }
+
     private static void DisposeBrowserTransportSession(string host)
     {
         if (!BrowserTransportSessions.TryRemove(host, out var session))
@@ -894,6 +940,22 @@ public class CloudflareHandler : DelegatingHandler
 
             target[name] = value;
         }
+    }
+
+    private static Dictionary<string, string> BuildBrowserExtraHeaders(HttpRequestMessage request)
+    {
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        if (request.Headers.TryGetValues("Accept", out var acceptValues))
+            headers["Accept"] = string.Join(", ", acceptValues);
+
+        if (request.Headers.TryGetValues("Accept-Language", out var languageValues))
+            headers["Accept-Language"] = string.Join(", ", languageValues);
+
+        if (request.Headers.TryGetValues("Sec-GPC", out var secGpcValues))
+            headers["Sec-GPC"] = string.Join(", ", secGpcValues);
+
+        return headers;
     }
 
     private static bool IsCookieForHost(string? cookieDomain, string host)

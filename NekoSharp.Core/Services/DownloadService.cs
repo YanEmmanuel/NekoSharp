@@ -89,7 +89,7 @@ public class DownloadService : IDownloadService
         };
 
         client.DefaultRequestHeaders.Add("User-Agent", UserAgentProvider.Default);
-        client.DefaultRequestHeaders.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
+        client.DefaultRequestHeaders.Add("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5");
         client.DefaultRequestHeaders.Add("Accept-Language", "en-US,en;q=0.9");
 
         return client;
@@ -177,14 +177,14 @@ public class DownloadService : IDownloadService
 
             if (!needsConversion)
             {
-                await DownloadFileWithRetryAsync(page.ImageUrl, filePath, chapter.Url, ct);
+                await DownloadFileWithRetryAsync(page.ImageUrl, filePath, page.RefererUrl ?? chapter.Url, ct);
             }
             else
             {
                 var tempFile = Path.Combine(tempDir, $"{page.Number:D3}_tmp{originalExtension}");
                 try
                 {
-                    await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, chapter.Url, ct);
+                    await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, page.RefererUrl ?? chapter.Url, ct);
                     await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
                 }
                 finally
@@ -354,8 +354,12 @@ public class DownloadService : IDownloadService
                 await using var _ = await AcquireDownloadSlotAsync(ct);
 
                 using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Add("Referer", referer);
-                request.Headers.Add("Accept", "image/avif,image/webp,image/apng,image/*;q=0.8");
+                if (Uri.TryCreate(referer, UriKind.Absolute, out var refererUri))
+                    request.Headers.Referrer = refererUri;
+                else
+                    request.Headers.TryAddWithoutValidation("Referer", referer);
+
+                request.Headers.Add("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5");
 
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(timeout);

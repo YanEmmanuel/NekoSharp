@@ -173,7 +173,8 @@ public abstract class WordPressMadaraScraper : IScraper
                 pages.Add(new Page
                 {
                     Number = index++,
-                    ImageUrl = src
+                    ImageUrl = src,
+                    RefererUrl = requestUrl
                 });
             }
 
@@ -190,7 +191,8 @@ public abstract class WordPressMadaraScraper : IScraper
             pages.Add(new Page
             {
                 Number = index++,
-                ImageUrl = src
+                ImageUrl = src,
+                RefererUrl = requestUrl
             });
         }
 
