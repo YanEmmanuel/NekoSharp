@@ -177,14 +177,14 @@ public class DownloadService : IDownloadService
 
             if (!needsConversion)
             {
-                await DownloadFileWithRetryAsync(page.ImageUrl, filePath, manga.Url, ct);
+                await DownloadFileWithRetryAsync(page.ImageUrl, filePath, chapter.Url, ct);
             }
             else
             {
                 var tempFile = Path.Combine(tempDir, $"{page.Number:D3}_tmp{originalExtension}");
                 try
                 {
-                    await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, manga.Url, ct);
+                    await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, chapter.Url, ct);
                     await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
                 }
                 finally
