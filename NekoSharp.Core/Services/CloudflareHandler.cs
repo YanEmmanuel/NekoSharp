@@ -50,7 +50,10 @@ public class CloudflareHandler : DelegatingHandler
         new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, BrowserTransportSession> BrowserTransportSessions =
         new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, ResolvedChallengeUrl> ResolvedChallengeUrls =
+        new(StringComparer.Ordinal);
     private static readonly TimeSpan FailedChallengeCooldown = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan ResolvedChallengeUrlLifetime = TimeSpan.FromMinutes(10);
 
     public CloudflareHandler(
         HttpMessageHandler? inner = null,
@@ -70,6 +73,16 @@ public class CloudflareHandler : DelegatingHandler
         HttpRequestMessage request, CancellationToken ct)
     {
         var originalUri = request.RequestUri;
+        if (originalUri is not null && request.Method == HttpMethod.Get)
+        {
+            var resolvedChallengeUri = TryGetResolvedChallengeUri(originalUri);
+            if (resolvedChallengeUri is not null && !UrisMatch(originalUri, resolvedChallengeUri))
+            {
+                _log?.Debug($"[Cloudflare] Reusing resolved challenge URL for {originalUri} -> {resolvedChallengeUri}");
+                request.RequestUri = resolvedChallengeUri;
+            }
+        }
+
         var host = request.RequestUri?.Host;
         CloudflareCredentials? storedCreds = null;
 
@@ -88,6 +101,9 @@ public class CloudflareHandler : DelegatingHandler
                         return browserFirst;
                     }
 
+                    _log?.Warn($"[Cloudflare] Browser-backed transport for {host} failed. Falling back to HTTP transport.");
+                    BrowserTransportPreferredHosts.TryRemove(host, out _);
+                    DisposeBrowserTransportSession(host);
                     browserFirst?.Dispose();
                 }
 
@@ -103,11 +119,14 @@ public class CloudflareHandler : DelegatingHandler
         {
             _log?.Warn($"[Cloudflare] Suspicious redirect/response for {host} with stored credentials. Invalidating and retrying naked.");
             await _store.RemoveAsync(host);
+            ForgetResolvedChallengeUrl(originalUri);
             BrowserTransportPreferredHosts.TryRemove(host, out _);
             DisposeBrowserTransportSession(host);
             response.Dispose();
 
             var retryNaked = await CloneRequestAsync(request);
+            if (originalUri is not null)
+                retryNaked.RequestUri = originalUri;
             retryNaked.Headers.Remove("Cookie");
             retryNaked.Headers.Remove("User-Agent");
 
@@ -145,6 +164,7 @@ public class CloudflareHandler : DelegatingHandler
                         browserFallback?.Dispose();
                         _log?.Warn($"[Cloudflare] Request to {host} failed ({code}) with stored credentials but was NOT a standard challenge. Invalidating credentials.");
                         await _store.RemoveAsync(host);
+                        ForgetResolvedChallengeUrl(originalUri);
                         BrowserTransportPreferredHosts.TryRemove(host, out _);
                         DisposeBrowserTransportSession(host);
                         
@@ -152,6 +172,8 @@ public class CloudflareHandler : DelegatingHandler
                          
                         response.Dispose();
                         var retryNaked = await CloneRequestAsync(request);
+                        if (originalUri is not null)
+                            retryNaked.RequestUri = originalUri;
                          
                         retryNaked.Headers.Remove("Cookie");
                         retryNaked.Headers.Remove("User-Agent");
@@ -166,6 +188,9 @@ public class CloudflareHandler : DelegatingHandler
         if (!await IsCloudflareChallenge(response, ct))
             return response;
 
+        if (originalUri is not null && request.RequestUri is not null && !UrisMatch(originalUri, request.RequestUri))
+            ForgetResolvedChallengeUrl(originalUri);
+
         if (host is not null &&
             FailedChallengeCooldownUntilUtc.TryGetValue(host, out var cooldownUntilUtc) &&
             DateTime.UtcNow < cooldownUntilUtc)
@@ -178,7 +203,7 @@ public class CloudflareHandler : DelegatingHandler
         _log?.Warn($"[Cloudflare] Challenge detected for {request.RequestUri}");
         _log?.Info("[Cloudflare] Opening Chrome via CDP — please solve the CAPTCHA if prompted…");
 
-        var uri = request.RequestUri!;
+        var uri = originalUri ?? request.RequestUri!;
 
          
         await BrowserLock.WaitAsync(ct);
@@ -195,6 +220,7 @@ public class CloudflareHandler : DelegatingHandler
                 else
                 {
                     await _store.RemoveAsync(host);
+                    ForgetResolvedChallengeUrl(originalUri);
                     BrowserTransportPreferredHosts.TryRemove(host, out _);
                     DisposeBrowserTransportSession(host);
 
@@ -210,7 +236,7 @@ public class CloudflareHandler : DelegatingHandler
 
                     var mergedCreds = MergeCredentials(fresh ?? storedCreds, solveResult.Credentials);
                     await _store.SaveAsync(mergedCreds);
-                    BrowserTransportPreferredHosts[host] = 0;
+                    RememberResolvedChallengeUrl(uri, solveResult.FinalUrl);
                     if (host is not null)
                         FailedChallengeCooldownUntilUtc.TryRemove(host, out _);
 
@@ -232,6 +258,8 @@ public class CloudflareHandler : DelegatingHandler
          
         response.Dispose();
         var retry = await CloneRequestAsync(request);
+        if (originalUri is not null)
+            retry.RequestUri = TryGetResolvedChallengeUri(originalUri) ?? originalUri;
         var savedCreds = await _store.TryGetAsync(uri.Host);
         if (savedCreds is not null)
         {
@@ -247,6 +275,9 @@ public class CloudflareHandler : DelegatingHandler
                     return browserFirst;
                 }
 
+                _log?.Warn($"[Cloudflare] Browser-backed retry for {uri.Host} failed. Falling back to HTTP transport.");
+                BrowserTransportPreferredHosts.TryRemove(uri.Host, out _);
+                DisposeBrowserTransportSession(uri.Host);
                 browserFirst?.Dispose();
             }
         }
@@ -480,6 +511,7 @@ public class CloudflareHandler : DelegatingHandler
                 {
                     Credentials = creds,
                     HtmlContent = htmlContent,
+                    FinalUrl = page.Url,
                 };
             }
             finally
@@ -702,6 +734,9 @@ public class CloudflareHandler : DelegatingHandler
                         ObtainedAtUtc = DateTime.UtcNow,
                     }));
             }
+
+            if (response.IsSuccessStatusCode)
+                RememberResolvedChallengeUrl(requestUri, page.Url);
 
             return response;
         }
@@ -1041,6 +1076,7 @@ public class CloudflareHandler : DelegatingHandler
     {
         public required CloudflareCredentials Credentials { get; init; }
         public string? HtmlContent { get; init; }
+        public string? FinalUrl { get; init; }
     }
 
     private sealed class BrowserTransportSession
@@ -1052,9 +1088,68 @@ public class CloudflareHandler : DelegatingHandler
         public bool IsExpired => DateTime.UtcNow - LastUsedUtc > TimeSpan.FromMinutes(25);
     }
 
+    private sealed class ResolvedChallengeUrl
+    {
+        public required string ResolvedUrl { get; init; }
+        public DateTime ObtainedAtUtc { get; init; }
+        public bool IsExpired => DateTime.UtcNow - ObtainedAtUtc > ResolvedChallengeUrlLifetime;
+    }
+
      
      
      
+
+    private void RememberResolvedChallengeUrl(Uri originalUri, string? finalUrl)
+    {
+        if (string.IsNullOrWhiteSpace(finalUrl) || !Uri.TryCreate(finalUrl, UriKind.Absolute, out var resolvedUri))
+            return;
+
+        if (!originalUri.Host.Equals(resolvedUri.Host, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var key = originalUri.AbsoluteUri;
+        if (UrisMatch(originalUri, resolvedUri))
+        {
+            ResolvedChallengeUrls.TryRemove(key, out _);
+            return;
+        }
+
+        ResolvedChallengeUrls[key] = new ResolvedChallengeUrl
+        {
+            ResolvedUrl = resolvedUri.AbsoluteUri,
+            ObtainedAtUtc = DateTime.UtcNow,
+        };
+
+        _log?.Debug($"[Cloudflare] Remembered resolved challenge URL for {originalUri} -> {resolvedUri}");
+    }
+
+    private void ForgetResolvedChallengeUrl(Uri? originalUri)
+    {
+        if (originalUri is null)
+            return;
+
+        if (ResolvedChallengeUrls.TryRemove(originalUri.AbsoluteUri, out _))
+            _log?.Debug($"[Cloudflare] Cleared resolved challenge URL for {originalUri}");
+    }
+
+    private static Uri? TryGetResolvedChallengeUri(Uri originalUri)
+    {
+        if (!ResolvedChallengeUrls.TryGetValue(originalUri.AbsoluteUri, out var resolved))
+            return null;
+
+        if (resolved.IsExpired || !Uri.TryCreate(resolved.ResolvedUrl, UriKind.Absolute, out var resolvedUri))
+        {
+            ResolvedChallengeUrls.TryRemove(originalUri.AbsoluteUri, out _);
+            return null;
+        }
+
+        return resolvedUri;
+    }
+
+    private static bool UrisMatch(Uri left, Uri right)
+    {
+        return string.Equals(left.AbsoluteUri, right.AbsoluteUri, StringComparison.Ordinal);
+    }
 
     private static async Task<HttpRequestMessage> CloneRequestAsync(HttpRequestMessage original)
     {
