@@ -92,7 +92,9 @@ public class CloudflareHandler : DelegatingHandler
             storedCreds = await _store.TryGetAsync(host);
             if (storedCreds is not null)
             {
-                if (BrowserTransportPreferredHosts.ContainsKey(host) && request.Method == HttpMethod.Get)
+                if (BrowserTransportPreferredHosts.ContainsKey(host) &&
+                    request.Method == HttpMethod.Get &&
+                    IsBrowserTransportCandidate(request))
                 {
                     var browserFirst = await TrySendWithBrowserTransportAsync(request, host, storedCreds, ct);
                     if (browserFirst is { IsSuccessStatusCode: true })
@@ -152,7 +154,9 @@ public class CloudflareHandler : DelegatingHandler
                     bool isChallenge = await IsCloudflareChallenge(response, ct);
                     if (!isChallenge)
                     {
-                        var browserFallback = await TrySendWithBrowserTransportAsync(request, host, storedCreds, ct);
+                        HttpResponseMessage? browserFallback = null;
+                        if (IsBrowserTransportCandidate(request))
+                            browserFallback = await TrySendWithBrowserTransportAsync(request, host, storedCreds, ct);
                         if (browserFallback is { IsSuccessStatusCode: true })
                         {
                             _log?.Info($"[Cloudflare] Browser-backed fallback succeeded for {request.RequestUri}");
@@ -266,7 +270,9 @@ public class CloudflareHandler : DelegatingHandler
             _log?.Debug($"[Cloudflare] Retrying {uri} with saved credentials.");
             InjectCredentials(retry, savedCreds);
 
-            if (BrowserTransportPreferredHosts.ContainsKey(uri.Host) && retry.Method == HttpMethod.Get)
+            if (BrowserTransportPreferredHosts.ContainsKey(uri.Host) &&
+                retry.Method == HttpMethod.Get &&
+                IsBrowserTransportCandidate(retry))
             {
                 var browserFirst = await TrySendWithBrowserTransportAsync(retry, uri.Host, savedCreds, ct);
                 if (browserFirst is { IsSuccessStatusCode: true })
@@ -287,7 +293,9 @@ public class CloudflareHandler : DelegatingHandler
         }
         var retryResponse = await base.SendAsync(retry, ct);
 
-        if (savedCreds is not null && !retryResponse.IsSuccessStatusCode)
+        if (savedCreds is not null &&
+            !retryResponse.IsSuccessStatusCode &&
+            IsBrowserTransportCandidate(retry))
         {
             var browserFallback = await TrySendWithBrowserTransportAsync(retry, uri.Host, savedCreds, ct);
             if (browserFallback is { IsSuccessStatusCode: true })
@@ -456,6 +464,30 @@ public class CloudflareHandler : DelegatingHandler
                 {
                     _log?.Error($"[Cloudflare] Timed out after {_challengeTimeout.TotalSeconds}s waiting for challenge.");
                     return null;
+                }
+
+                if (IsLikelyDocumentUrl(targetUrl))
+                {
+                    var confirmedUrl = page.Url;
+                    if (string.IsNullOrWhiteSpace(confirmedUrl))
+                        confirmedUrl = targetUrl;
+
+                    try
+                    {
+                        _log?.Debug($"[Cloudflare] Reloading solved document to capture final HTML: {confirmedUrl}");
+                        await page.GoToAsync(confirmedUrl, new NavigationOptions
+                        {
+                            WaitUntil = [WaitUntilNavigation.DOMContentLoaded, WaitUntilNavigation.Networkidle2],
+                            Timeout = 30_000,
+                        });
+
+                        await Task.Delay(500, ct);
+                        solvedHtmlContent = await page.GetContentAsync();
+                    }
+                    catch (NavigationException)
+                    {
+                        _log?.Warn("[Cloudflare] Follow-up document navigation timed out after challenge. Keeping current page HTML.");
+                    }
                 }
 
                  
@@ -1149,6 +1181,26 @@ public class CloudflareHandler : DelegatingHandler
     private static bool UrisMatch(Uri left, Uri right)
     {
         return string.Equals(left.AbsoluteUri, right.AbsoluteUri, StringComparison.Ordinal);
+    }
+
+    private static bool IsLikelyDocumentUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return false;
+
+        var path = uri.AbsolutePath;
+        if (string.IsNullOrWhiteSpace(path) || path.EndsWith('/'))
+            return true;
+
+        var extension = Path.GetExtension(path);
+        if (string.IsNullOrWhiteSpace(extension))
+            return true;
+
+        return extension.Equals(".html", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".htm", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".php", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".asp", StringComparison.OrdinalIgnoreCase) ||
+               extension.Equals(".aspx", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<HttpRequestMessage> CloneRequestAsync(HttpRequestMessage original)
