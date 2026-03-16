@@ -52,8 +52,11 @@ public class CloudflareHandler : DelegatingHandler
         new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, ResolvedChallengeUrl> ResolvedChallengeUrls =
         new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, CachedDocumentHtml> CachedDocumentHtmlByUrl =
+        new(StringComparer.Ordinal);
     private static readonly TimeSpan FailedChallengeCooldown = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan ResolvedChallengeUrlLifetime = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan CachedDocumentHtmlLifetime = TimeSpan.FromMinutes(3);
 
     public CloudflareHandler(
         HttpMessageHandler? inner = null,
@@ -73,6 +76,15 @@ public class CloudflareHandler : DelegatingHandler
         HttpRequestMessage request, CancellationToken ct)
     {
         var originalUri = request.RequestUri;
+        if (originalUri is not null &&
+            request.Method == HttpMethod.Get &&
+            IsBrowserTransportCandidate(request) &&
+            TryGetCachedDocumentHtml(originalUri, out var cachedHtml))
+        {
+            _log?.Debug($"[Cloudflare] Serving cached document HTML for {originalUri}");
+            return CreateDocumentResponse(request, cachedHtml);
+        }
+
         if (originalUri is not null && request.Method == HttpMethod.Get)
         {
             var resolvedChallengeUri = TryGetResolvedChallengeUri(originalUri);
@@ -83,8 +95,12 @@ public class CloudflareHandler : DelegatingHandler
             }
         }
 
+        if (IsBrowserTransportCandidate(request))
+            ApplyDocumentNavigationHeaders(request);
+
         var host = request.RequestUri?.Host;
         CloudflareCredentials? storedCreds = null;
+        string? solveHtmlContent = null;
 
          
         if (host is not null)
@@ -241,16 +257,11 @@ public class CloudflareHandler : DelegatingHandler
                     var mergedCreds = MergeCredentials(fresh ?? storedCreds, solveResult.Credentials);
                     await _store.SaveAsync(mergedCreds);
                     RememberResolvedChallengeUrl(uri, solveResult.FinalUrl);
+                    solveHtmlContent = solveResult.HtmlContent;
                     if (host is not null)
                         FailedChallengeCooldownUntilUtc.TryRemove(host, out _);
 
                     _log?.Info($"[Cloudflare] Bypass succeeded for {uri.Host}. Credentials saved to DB.");
-
-                    if (IsBrowserTransportCandidate(request) && !string.IsNullOrWhiteSpace(solveResult.HtmlContent))
-                    {
-                        response.Dispose();
-                        return CreateDocumentResponse(request, solveResult.HtmlContent);
-                    }
                 }
             }
         }
@@ -264,6 +275,8 @@ public class CloudflareHandler : DelegatingHandler
         var retry = await CloneRequestAsync(request);
         if (originalUri is not null)
             retry.RequestUri = TryGetResolvedChallengeUri(originalUri) ?? originalUri;
+        if (IsBrowserTransportCandidate(retry))
+            ApplyDocumentNavigationHeaders(retry);
         var savedCreds = await _store.TryGetAsync(uri.Host);
         if (savedCreds is not null)
         {
@@ -292,6 +305,16 @@ public class CloudflareHandler : DelegatingHandler
             _log?.Warn("[Cloudflare] No saved credentials found for retry — request might fail.");
         }
         var retryResponse = await base.SendAsync(retry, ct);
+
+        if (!retryResponse.IsSuccessStatusCode &&
+            !string.IsNullOrWhiteSpace(solveHtmlContent) &&
+            IsBrowserTransportCandidate(retry))
+        {
+            _log?.Warn($"[Cloudflare] HTTP retry after bypass failed for {uri}. Using browser-captured HTML instead.");
+            RememberDocumentHtml(originalUri ?? retry.RequestUri, solveHtmlContent);
+            retryResponse.Dispose();
+            return CreateDocumentResponse(retry, solveHtmlContent);
+        }
 
         if (savedCreds is not null &&
             !retryResponse.IsSuccessStatusCode &&
@@ -445,6 +468,20 @@ public class CloudflareHandler : DelegatingHandler
                         await Task.Delay(3_000, ct);
                         try
                         {
+                            await page.WaitForNetworkIdleAsync(new WaitForNetworkIdleOptions
+                            {
+                                IdleTime = 1_200,
+                                Concurrency = 2,
+                                Timeout = 10_000,
+                            });
+                        }
+                        catch (Exception ex) when (ex is WaitTaskTimeoutException or TimeoutException)
+                        {
+                            _log?.Debug("[Cloudflare] Network idle wait timed out after challenge. Capturing current page state.");
+                        }
+
+                        try
+                        {
                             solvedHtmlContent = await page.GetContentAsync();
                         }
                         catch
@@ -464,30 +501,6 @@ public class CloudflareHandler : DelegatingHandler
                 {
                     _log?.Error($"[Cloudflare] Timed out after {_challengeTimeout.TotalSeconds}s waiting for challenge.");
                     return null;
-                }
-
-                if (IsLikelyDocumentUrl(targetUrl))
-                {
-                    var confirmedUrl = page.Url;
-                    if (string.IsNullOrWhiteSpace(confirmedUrl))
-                        confirmedUrl = targetUrl;
-
-                    try
-                    {
-                        _log?.Debug($"[Cloudflare] Reloading solved document to capture final HTML: {confirmedUrl}");
-                        await page.GoToAsync(confirmedUrl, new NavigationOptions
-                        {
-                            WaitUntil = [WaitUntilNavigation.DOMContentLoaded, WaitUntilNavigation.Networkidle2],
-                            Timeout = 30_000,
-                        });
-
-                        await Task.Delay(500, ct);
-                        solvedHtmlContent = await page.GetContentAsync();
-                    }
-                    catch (NavigationException)
-                    {
-                        _log?.Warn("[Cloudflare] Follow-up document navigation timed out after challenge. Keeping current page HTML.");
-                    }
                 }
 
                  
@@ -796,15 +809,6 @@ public class CloudflareHandler : DelegatingHandler
         }
     }
 
-    private static HttpResponseMessage CreateDocumentResponse(HttpRequestMessage request, string htmlContent)
-    {
-        return new HttpResponseMessage(HttpStatusCode.OK)
-        {
-            Content = new StringContent(htmlContent, Encoding.UTF8, "text/html"),
-            RequestMessage = request,
-        };
-    }
-
     private async Task<Dictionary<string, string>> CollectCookiesAsync(IPage page, IBrowser browser, Uri uri)
     {
         var cookies = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -865,6 +869,15 @@ public class CloudflareHandler : DelegatingHandler
         }
 
         return cookies;
+    }
+
+    private static HttpResponseMessage CreateDocumentResponse(HttpRequestMessage request, string htmlContent)
+    {
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(htmlContent, Encoding.UTF8, "text/html"),
+            RequestMessage = request,
+        };
     }
 
     private async Task<string> GetBrowserUserAgentAsync(IPage page, IBrowser browser)
@@ -1025,6 +1038,52 @@ public class CloudflareHandler : DelegatingHandler
         return headers;
     }
 
+    private static void ApplyDocumentNavigationHeaders(HttpRequestMessage request)
+    {
+        SetSingleHeader(request, "Upgrade-Insecure-Requests", "1");
+        SetSingleHeader(request, "Sec-Fetch-Dest", "document");
+        SetSingleHeader(request, "Sec-Fetch-Mode", "navigate");
+        SetSingleHeader(request, "Sec-Fetch-Site", DetermineSecFetchSite(request));
+        SetSingleHeader(request, "Sec-Fetch-User", "?1");
+
+        if (!request.Headers.Contains("Sec-GPC"))
+            SetSingleHeader(request, "Sec-GPC", "1");
+
+        SetSingleHeader(request, "Priority", "u=0, i");
+    }
+
+    private static string DetermineSecFetchSite(HttpRequestMessage request)
+    {
+        var requestUri = request.RequestUri;
+        if (requestUri is null)
+            return "none";
+
+        var referer = request.Headers.Referrer;
+        if (referer is null &&
+            request.Headers.TryGetValues("Referer", out var refererValues))
+        {
+            var rawReferer = refererValues.FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(rawReferer) &&
+                Uri.TryCreate(rawReferer, UriKind.Absolute, out var parsedReferer))
+            {
+                referer = parsedReferer;
+            }
+        }
+
+        if (referer is null)
+            return "none";
+
+        return referer.Host.Equals(requestUri.Host, StringComparison.OrdinalIgnoreCase)
+            ? "same-origin"
+            : "cross-site";
+    }
+
+    private static void SetSingleHeader(HttpRequestMessage request, string name, string value)
+    {
+        request.Headers.Remove(name);
+        request.Headers.TryAddWithoutValidation(name, value);
+    }
+
     private static bool IsCookieForHost(string? cookieDomain, string host)
     {
         if (string.IsNullOrWhiteSpace(cookieDomain))
@@ -1127,9 +1186,62 @@ public class CloudflareHandler : DelegatingHandler
         public bool IsExpired => DateTime.UtcNow - ObtainedAtUtc > ResolvedChallengeUrlLifetime;
     }
 
+    private sealed class CachedDocumentHtml
+    {
+        public required string HtmlContent { get; init; }
+        public DateTime ObtainedAtUtc { get; init; }
+        public bool IsExpired => DateTime.UtcNow - ObtainedAtUtc > CachedDocumentHtmlLifetime;
+    }
+
      
      
      
+
+    private void RememberDocumentHtml(Uri? documentUri, string? htmlContent)
+    {
+        if (documentUri is null || string.IsNullOrWhiteSpace(htmlContent))
+            return;
+
+        var key = documentUri.AbsoluteUri;
+        CachedDocumentHtmlByUrl.AddOrUpdate(
+            key,
+            _ => new CachedDocumentHtml
+            {
+                HtmlContent = htmlContent,
+                ObtainedAtUtc = DateTime.UtcNow,
+            },
+            (_, existing) =>
+            {
+                if (!existing.IsExpired &&
+                    existing.HtmlContent.Length > 0 &&
+                    htmlContent.Length < existing.HtmlContent.Length * 0.7)
+                {
+                    return existing;
+                }
+
+                return new CachedDocumentHtml
+                {
+                    HtmlContent = htmlContent,
+                    ObtainedAtUtc = DateTime.UtcNow,
+                };
+            });
+    }
+
+    private static bool TryGetCachedDocumentHtml(Uri documentUri, out string htmlContent)
+    {
+        htmlContent = string.Empty;
+        if (!CachedDocumentHtmlByUrl.TryGetValue(documentUri.AbsoluteUri, out var cached))
+            return false;
+
+        if (cached.IsExpired)
+        {
+            CachedDocumentHtmlByUrl.TryRemove(documentUri.AbsoluteUri, out _);
+            return false;
+        }
+
+        htmlContent = cached.HtmlContent;
+        return !string.IsNullOrWhiteSpace(htmlContent);
+    }
 
     private void RememberResolvedChallengeUrl(Uri originalUri, string? finalUrl)
     {
@@ -1181,26 +1293,6 @@ public class CloudflareHandler : DelegatingHandler
     private static bool UrisMatch(Uri left, Uri right)
     {
         return string.Equals(left.AbsoluteUri, right.AbsoluteUri, StringComparison.Ordinal);
-    }
-
-    private static bool IsLikelyDocumentUrl(string url)
-    {
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-            return false;
-
-        var path = uri.AbsolutePath;
-        if (string.IsNullOrWhiteSpace(path) || path.EndsWith('/'))
-            return true;
-
-        var extension = Path.GetExtension(path);
-        if (string.IsNullOrWhiteSpace(extension))
-            return true;
-
-        return extension.Equals(".html", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".htm", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".php", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".asp", StringComparison.OrdinalIgnoreCase) ||
-               extension.Equals(".aspx", StringComparison.OrdinalIgnoreCase);
     }
 
     private static async Task<HttpRequestMessage> CloneRequestAsync(HttpRequestMessage original)
