@@ -1,0 +1,91 @@
+name: Publish Dynamic Providers
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - ".github/workflows/providers.yml"
+      - "NekoSharp.Core/**/*.cs"
+      - "NekoSharp.Core/**/*.csproj"
+      - "NekoSharp.DynamicProviders/**"
+      - "tools/providers/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: providers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: 10.0.x
+  PROJECT_FILE: NekoSharp.DynamicProviders/NekoSharp.DynamicProviders.csproj
+  CONFIGURATION: Release
+  OUTPUT_DLL: NekoSharp.DynamicProviders/bin/Release/net10.0/NekoSharp.DynamicProviders.dll
+  TARGET_DLL: providers/NekoSharp.DynamicProviders.dll
+  TARGET_MANIFEST: providers/manifest.json
+
+jobs:
+  publish:
+    name: Build and publish provider bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+          cache: true
+          cache-dependency-path: |
+            **/packages.lock.json
+            **/*.csproj
+            Directory.Packages.props
+            global.json
+            NuGet.config
+
+      - name: Restore dynamic providers project
+        run: dotnet restore ${{ env.PROJECT_FILE }}
+
+      - name: Build dynamic providers bundle
+        run: >
+          dotnet build ${{ env.PROJECT_FILE }}
+          --configuration ${{ env.CONFIGURATION }}
+          --no-restore
+          -p:ContinuousIntegrationBuild=true
+
+      - name: Generate manifest and copy DLL
+        run: |
+          chmod +x ./tools/providers/publish-dynamic-providers.sh
+          short_sha="${GITHUB_SHA::7}"
+          version="$(date -u +%Y.%m.%d).${{ github.run_number }}-${short_sha}"
+          assembly_url="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/providers/NekoSharp.DynamicProviders.dll"
+
+          ./tools/providers/publish-dynamic-providers.sh \
+            "${{ env.OUTPUT_DLL }}" \
+            "${{ env.TARGET_DLL }}" \
+            "${{ env.TARGET_MANIFEST }}" \
+            "${assembly_url}" \
+            "${version}"
+
+      - name: Commit published bundle
+        run: |
+          if [[ -z "$(git status --porcelain -- "${{ env.TARGET_DLL }}" "${{ env.TARGET_MANIFEST }}")" ]]; then
+            echo "Provider bundle already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ env.TARGET_DLL }}" "${{ env.TARGET_MANIFEST }}"
+          git commit -m "chore(providers): publish dynamic providers [skip ci]"
+          git push

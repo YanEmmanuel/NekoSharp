@@ -8,6 +8,7 @@ O projeto foi desenhado para separar claramente interface, domínio e ferramenta
 
 - `NekoSharp.App`: aplicação desktop (UI + ViewModels).
 - `NekoSharp.Core`: scrapers, serviços de download, persistência de configurações e tratamento de Cloudflare.
+- `NekoSharp.DynamicProviders`: bundle externo com os providers publicado para atualização dinâmica.
 - `NekoSharp.Tools`: CLI para geração de novos providers.
 - `NekoSharp.Tests`: diretório reservado para testes automatizados.
 
@@ -37,7 +38,7 @@ O projeto foi desenhado para separar claramente interface, domínio e ferramenta
 
 ## Atualização Dinâmica de Providers
 
-O app verifica, ao iniciar, um manifesto remoto de providers e baixa DLLs externas para:
+O app verifica, ao iniciar, um manifesto remoto de providers antes de registrar os scrapers e baixa DLLs externas para:
 
 - Linux: `~/.config/NekoSharp/providers`
 - Windows: `%AppData%/NekoSharp/providers`
@@ -62,6 +63,18 @@ Manifesto padrão esperado:
   ]
 }
 ```
+
+### Publicação automática dos providers
+
+Se a ideia é atualizar providers sem obrigar todo mundo a baixar o app de novo, o fluxo agora fica assim:
+
+1. Você altera arquivos em `NekoSharp.Core/Providers/**`.
+2. Faz push para `master` ou `main`.
+3. O workflow `.github/workflows/providers.yml` compila `NekoSharp.DynamicProviders`.
+4. O workflow publica `providers/NekoSharp.DynamicProviders.dll` e reescreve `providers/manifest.json`.
+5. No próximo startup, o app baixa a DLL nova antes de carregar os providers.
+
+Isso faz os providers remotos sobrescreverem os providers embutidos com o mesmo `Name`, sem precisar recompilar ou reinstalar o app.
 
 ## Requisitos
 
@@ -157,6 +170,7 @@ Observações (Windows):
 NekoSharp/
 ├── NekoSharp.App/
 ├── NekoSharp.Core/
+├── NekoSharp.DynamicProviders/
 ├── NekoSharp.Tools/
 ├── NekoSharp.Tests/
 ├── tools/
