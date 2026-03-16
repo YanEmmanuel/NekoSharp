@@ -100,7 +100,7 @@ public sealed class ComixScraper : IScraper
         var parsed = ParseSupportedUrl(url);
         const int limit = 100;
         var page = 1;
-        var bestByKey = new Dictionary<string, ComixChapterCandidate>(StringComparer.Ordinal);
+        var bestById = new Dictionary<int, ComixChapterCandidate>();
 
         while (true)
         {
@@ -122,9 +122,8 @@ public sealed class ComixScraper : IScraper
                 if (candidate.ChapterId <= 0)
                     continue;
 
-                var key = BuildChapterDedupKey(candidate);
-                if (!bestByKey.TryGetValue(key, out var current) || IsBetterChapter(candidate, current))
-                    bestByKey[key] = candidate;
+                if (!bestById.TryGetValue(candidate.ChapterId, out var current) || IsBetterChapter(candidate, current))
+                    bestById[candidate.ChapterId] = candidate;
             }
 
             if (itemCount == 0 || !HasNextPage(result))
@@ -133,17 +132,7 @@ public sealed class ComixScraper : IScraper
             page++;
         }
 
-        var chapters = bestByKey.Values
-            .OrderByDescending(static chapter => chapter.Number)
-            .ThenByDescending(static chapter => chapter.UpdatedAt)
-            .ThenByDescending(static chapter => chapter.ChapterId)
-            .Select(chapter => new Chapter
-            {
-                Number = chapter.Number,
-                Title = BuildChapterTitle(chapter),
-                Url = BuildChapterUrl(parsed.MangaSegment, chapter.ChapterId)
-            })
-            .ToList();
+        var chapters = BuildChapterList(parsed.MangaSegment, bestById.Values);
 
         _log?.Info($"[Comix] Loaded {chapters.Count} chapters for manga={parsed.HashId}");
         return chapters;
@@ -292,22 +281,61 @@ public sealed class ComixScraper : IScraper
         return string.Join(Environment.NewLine + Environment.NewLine, sections);
     }
 
-    private static string BuildChapterTitle(ComixChapterCandidate chapter)
+    internal static List<Chapter> BuildChapterList(string mangaSegment, IEnumerable<ComixChapterCandidate> candidates)
     {
-        if (chapter.Number <= 0)
-            return string.IsNullOrWhiteSpace(chapter.Name) ? $"Chapter {FormatChapterNumber(chapter.Number)}" : chapter.Name;
+        var materialized = candidates.ToList();
+        var duplicatedVariants = materialized
+            .GroupBy(BuildChapterVariantKey)
+            .Where(group => group.Count() > 1)
+            .Select(group => group.Key)
+            .ToHashSet(StringComparer.Ordinal);
 
-        var title = $"Chapter {FormatChapterNumber(chapter.Number)}";
-        return string.IsNullOrWhiteSpace(chapter.Name) ? title : $"{title}: {chapter.Name}";
+        return materialized
+            .OrderByDescending(static chapter => chapter.Number)
+            .ThenByDescending(static chapter => IsOfficialRelease(chapter))
+            .ThenByDescending(static chapter => chapter.UpdatedAt)
+            .ThenByDescending(static chapter => chapter.ChapterId)
+            .Select(chapter => new Chapter
+            {
+                Number = chapter.Number,
+                Title = BuildChapterTitle(chapter, duplicatedVariants.Contains(BuildChapterVariantKey(chapter))),
+                Url = BuildChapterUrl(mangaSegment, chapter.ChapterId)
+            })
+            .ToList();
+    }
+
+    private static string BuildChapterTitle(ComixChapterCandidate chapter, bool includeVariantLabel)
+    {
+        var baseTitle = chapter.Name.Trim();
+        if (!includeVariantLabel)
+            return baseTitle;
+
+        var variantLabel = BuildChapterVariantLabel(chapter);
+        if (string.IsNullOrWhiteSpace(baseTitle))
+            return variantLabel;
+
+        return string.IsNullOrWhiteSpace(variantLabel)
+            ? baseTitle
+            : $"{baseTitle} [{variantLabel}]";
     }
 
     private static string FormatChapterNumber(double number)
         => number.ToString("0.####################", CultureInfo.InvariantCulture);
 
-    private static string BuildChapterDedupKey(ComixChapterCandidate chapter)
+    private static string BuildChapterVariantKey(ComixChapterCandidate chapter)
     {
         var nameKey = NormalizeDedupName(chapter.Name);
         return $"{chapter.Number.ToString("0.####################", CultureInfo.InvariantCulture)}|{nameKey}";
+    }
+
+    private static string BuildChapterVariantLabel(ComixChapterCandidate chapter)
+    {
+        if (IsOfficialRelease(chapter))
+            return "Oficial";
+
+        return string.IsNullOrWhiteSpace(chapter.ScanlationGroupName)
+            ? "Não oficial"
+            : chapter.ScanlationGroupName.Trim();
     }
 
     private static string NormalizeDedupName(string? name)
@@ -324,8 +352,8 @@ public sealed class ComixScraper : IScraper
 
     private static bool IsBetterChapter(ComixChapterCandidate candidate, ComixChapterCandidate current)
     {
-        var officialCandidate = candidate.ScanlationGroupId == OfficialScanlationGroupId || candidate.IsOfficial == 1;
-        var officialCurrent = current.ScanlationGroupId == OfficialScanlationGroupId || current.IsOfficial == 1;
+        var officialCandidate = IsOfficialRelease(candidate);
+        var officialCurrent = IsOfficialRelease(current);
 
         if (officialCandidate != officialCurrent)
             return officialCandidate;
@@ -335,6 +363,9 @@ public sealed class ComixScraper : IScraper
 
         return candidate.UpdatedAt >= current.UpdatedAt;
     }
+
+    private static bool IsOfficialRelease(ComixChapterCandidate chapter)
+        => chapter.ScanlationGroupId == OfficialScanlationGroupId || chapter.IsOfficial == 1;
 
     private static bool HasNextPage(JsonElement result)
     {
@@ -523,7 +554,7 @@ public sealed class ComixScraper : IScraper
         };
     }
 
-    private readonly record struct ComixChapterCandidate(
+    internal readonly record struct ComixChapterCandidate(
         int ChapterId,
         double Number,
         string Name,
