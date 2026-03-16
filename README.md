@@ -26,7 +26,7 @@ O projeto foi desenhado para separar claramente interface, domínio e ferramenta
   - união vertical das páginas
   - detecção de cortes por comparação de pixels
   - recorte inteligente e salvamento no formato escolhido
-- Persistência de configurações em SQLite.
+- Persistência de configurações em SQLite. 
 - Janela de logs em tempo real.
 - Suporte a desafios Cloudflare com reaproveitamento de credenciais temporárias.
 
