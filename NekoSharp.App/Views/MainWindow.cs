@@ -1435,6 +1435,12 @@ public class MainWindow
                 if (_errorStatusPage != null)
                     _errorStatusPage.SetDescription(_vm.StatusMessage);
                 break;
+
+            case nameof(MainWindowViewModel.ProviderNames):
+            case nameof(MainWindowViewModel.ProviderCount):
+            case nameof(MainWindowViewModel.ProvidersButtonLabel):
+                RefreshProvidersUi();
+                break;
                 
             case nameof(MainWindowViewModel.OutputDirectory):
                 _outputDirLabel.SetText(_vm.OutputDirectory);

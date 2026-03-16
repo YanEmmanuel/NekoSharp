@@ -6,9 +6,10 @@ namespace NekoSharp.Core.Services;
 
 public class ScraperManager
 {
+    private readonly object _gate = new();
     private readonly List<IScraper> _scrapers = [];
 
-    public IReadOnlyList<IScraper> Scrapers => _scrapers.AsReadOnly();
+    public IReadOnlyList<IScraper> Scrapers => GetSnapshot();
 
     public void DiscoverAndRegisterAll(
         LogService? logService = null,
@@ -22,6 +23,17 @@ public class ScraperManager
             allowReplaceExisting: false,
             sourceLabel: "interno");
 
+        if (externalAssemblyPaths is null)
+            return;
+
+        DiscoverAndRegisterExternal(logService, cfStore, externalAssemblyPaths);
+    }
+
+    public void DiscoverAndRegisterExternal(
+        LogService? logService = null,
+        CloudflareCredentialStore? cfStore = null,
+        IEnumerable<string>? externalAssemblyPaths = null)
+    {
         if (externalAssemblyPaths is null)
             return;
 
@@ -126,48 +138,60 @@ public class ScraperManager
     private bool RegisterOrReplace(IScraper scraper, bool allowReplace, out string? replacedName)
     {
         replacedName = null;
-        var index = _scrapers.FindIndex(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase));
-
-        if (index >= 0)
+        lock (_gate)
         {
-            if (!allowReplace)
-                return false;
+            var index = _scrapers.FindIndex(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase));
 
-            replacedName = _scrapers[index].Name;
-            _scrapers[index] = scraper;
+            if (index >= 0)
+            {
+                if (!allowReplace)
+                    return false;
+
+                replacedName = _scrapers[index].Name;
+                _scrapers[index] = scraper;
+                return true;
+            }
+
+            _scrapers.Add(scraper);
             return true;
         }
-
-        _scrapers.Add(scraper);
-        return true;
     }
 
     public void Register(IScraper scraper)
     {
-        if (_scrapers.Any(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase)))
-            throw new InvalidOperationException($"Scraper '{scraper.Name}' já está registrado.");
+        lock (_gate)
+        {
+            if (_scrapers.Any(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"Scraper '{scraper.Name}' já está registrado.");
 
-        _scrapers.Add(scraper);
+            _scrapers.Add(scraper);
+        }
     }
 
     public bool TryRegister(IScraper scraper)
     {
-        if (_scrapers.Any(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase)))
-            return false;
+        lock (_gate)
+        {
+            if (_scrapers.Any(s => s.Name.Equals(scraper.Name, StringComparison.OrdinalIgnoreCase)))
+                return false;
 
-        _scrapers.Add(scraper);
-        return true;
+            _scrapers.Add(scraper);
+            return true;
+        }
     }
 
     public bool Unregister(string name)
     {
-        var scraper = _scrapers.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-        return scraper is not null && _scrapers.Remove(scraper);
+        lock (_gate)
+        {
+            var scraper = _scrapers.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            return scraper is not null && _scrapers.Remove(scraper);
+        }
     }
 
     public IScraper? GetScraperForUrl(string url)
     {
-        return _scrapers.FirstOrDefault(s => s.CanHandle(url));
+        return GetSnapshot().FirstOrDefault(s => s.CanHandle(url));
     }
 
     public IScraper? GetScraperByName(string providerKey)
@@ -175,12 +199,20 @@ public class ScraperManager
         if (string.IsNullOrWhiteSpace(providerKey))
             return null;
 
-        return _scrapers.FirstOrDefault(s =>
+        return GetSnapshot().FirstOrDefault(s =>
             s.Name.Equals(providerKey, StringComparison.OrdinalIgnoreCase));
     }
 
     public bool CanHandle(string url)
     {
-        return _scrapers.Any(s => s.CanHandle(url));
+        return GetSnapshot().Any(s => s.CanHandle(url));
+    }
+
+    private IReadOnlyList<IScraper> GetSnapshot()
+    {
+        lock (_gate)
+        {
+            return _scrapers.ToList().AsReadOnly();
+        }
     }
 }

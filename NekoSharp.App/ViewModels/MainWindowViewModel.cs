@@ -105,6 +105,14 @@ public partial class MainWindowViewModel : ObservableObject
 
     public string SupportedSites => string.Join(", ", ProviderNames);
 
+    public void NotifyProviderCatalogChanged()
+    {
+        OnPropertyChanged(nameof(ProviderNames));
+        OnPropertyChanged(nameof(ProviderCount));
+        OnPropertyChanged(nameof(ProvidersButtonLabel));
+        OnPropertyChanged(nameof(SupportedSites));
+    }
+
     public MainWindowViewModel(
         ScraperManager scraperManager,
         IDownloadService downloadService,

@@ -28,7 +28,17 @@ class Program
             return RunNativeSmoke();
         }
 
+        var logService = new LogService();
+        var settingsStore = new SettingsStore(logService: logService);
+        var cfStore = new CloudflareCredentialStore(logService: logService);
+        var libraryStore = new LibraryStore(logService: logService);
+        var scraperManager = new ScraperManager();
+        var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
+        var installedProviderAssemblies = providerUpdateService.GetInstalledProviderAssemblies();
+        scraperManager.DiscoverAndRegisterAll(logService, cfStore, installedProviderAssemblies);
+
         var application = Adw.Application.New(AppId, Gio.ApplicationFlags.FlagsNone);
+        var providerUpdateStarted = 0;
 
         application.OnActivate += (sender, args) =>
         {
@@ -36,26 +46,6 @@ class Program
 
             var styleManager = Adw.StyleManager.GetDefault();
             styleManager.ColorScheme = Adw.ColorScheme.Default;
-
-            var logService = new LogService();
-            var settingsStore = new SettingsStore(logService: logService);
-            var cfStore = new CloudflareCredentialStore(logService: logService);
-            var libraryStore = new LibraryStore(logService: logService);
-            var scraperManager = new ScraperManager();
-            var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
-
-            try
-            {
-                using var providerUpdateCts = new CancellationTokenSource(TimeSpan.FromSeconds(12));
-                var result = providerUpdateService.UpdateProvidersAsync(providerUpdateCts.Token).GetAwaiter().GetResult();
-                logService.Info($"[ProviderUpdate] {result.Message}");
-            }
-            catch (Exception ex)
-            {
-                logService.Warn($"[ProviderUpdate] Falha ao verificar atualizações dinâmicas: {ex.Message}");
-            }
-
-            scraperManager.DiscoverAndRegisterAll(logService, cfStore, providerUpdateService.GetInstalledProviderAssemblies());
 
             var downloadService = new DownloadService(scraperManager, logService: logService, cfStore: cfStore, settingsStore: settingsStore);
             var libraryService = new MangaLibraryService(scraperManager, downloadService, libraryStore, logService);
@@ -65,6 +55,51 @@ class Program
 
             var window = new MainWindow(viewModel, (Adw.Application)sender, logService);
             window.Present();
+
+            if (Interlocked.Exchange(ref providerUpdateStarted, 1) != 0)
+                return;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    logService.Info("[ProviderUpdate] Verificando atualizações de providers em background...");
+
+                    using var providerUpdateCts = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+                    var result = await providerUpdateService.UpdateProvidersAsync(providerUpdateCts.Token);
+                    logService.Info($"[ProviderUpdate] {result.Message}");
+
+                    if (result.DownloadedCount <= 0)
+                        return;
+
+                    var initialPaths = new HashSet<string>(installedProviderAssemblies, StringComparer.OrdinalIgnoreCase);
+                    var currentPaths = providerUpdateService.GetInstalledProviderAssemblies();
+                    var newlyAvailablePaths = currentPaths
+                        .Where(path => !initialPaths.Contains(path))
+                        .ToArray();
+
+                    if (newlyAvailablePaths.Length > 0)
+                    {
+                        scraperManager.DiscoverAndRegisterExternal(logService, cfStore, newlyAvailablePaths);
+
+                        GLib.Functions.IdleAdd(0, () =>
+                        {
+                            viewModel.NotifyProviderCatalogChanged();
+                            return false;
+                        });
+
+                        logService.Info("[ProviderUpdate] Novos providers foram carregados sem reiniciar o app.");
+                    }
+                    else
+                    {
+                        logService.Info("[ProviderUpdate] Providers atualizados em background. Reinicie o app para carregar as novas versões.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logService.Warn($"[ProviderUpdate] Falha ao verificar atualizações dinâmicas em background: {ex.Message}");
+                }
+            });
         };
 
         return application.RunWithSynchronizationContext(args);
