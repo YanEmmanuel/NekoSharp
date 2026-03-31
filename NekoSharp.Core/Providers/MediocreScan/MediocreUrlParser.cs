@@ -41,7 +41,8 @@ internal static partial class MediocreUrlParser
             var isKnownHost =
                 host.Equals("mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
                 host.Equals("www.mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
-                host.Equals("api.mediocretoons.site", StringComparison.OrdinalIgnoreCase);
+                host.Equals("api.mediocretoons.site", StringComparison.OrdinalIgnoreCase) ||
+                host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase);
 
             if (!isKnownHost)
                 return false;

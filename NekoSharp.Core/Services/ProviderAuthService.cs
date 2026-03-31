@@ -622,16 +622,23 @@ public sealed class ProviderAuthService : IProviderAuthService
         {
             foreach (var passKey in passwordKeys)
             {
-                var payload = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
+                var basePayload = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase)
                 {
                     [userKey] = usernameOrEmail,
                     [passKey] = password
                 };
 
-                foreach (var rememberKey in rememberKeys)
-                    payload[rememberKey] = _profile.LoginRememberValue;
+                yield return basePayload;
 
-                yield return payload;
+                foreach (var rememberKey in rememberKeys)
+                {
+                    var payload = new Dictionary<string, object>(basePayload, StringComparer.OrdinalIgnoreCase)
+                    {
+                        [rememberKey] = _profile.LoginRememberValue
+                    };
+
+                    yield return payload;
+                }
             }
         }
     }

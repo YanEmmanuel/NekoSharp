@@ -18,7 +18,7 @@ public class ProviderAuthHandlerTests
         });
 
         using var client = new HttpClient(new ProviderAuthHandler(auth, profile, inner: inner));
-        var response = await client.GetAsync("https://api.mediocretoons.site/capitulos/1");
+        var response = await client.GetAsync("https://api.mediocretoons.net/capitulos/1");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(1, auth.ApplyCalls);
@@ -38,7 +38,7 @@ public class ProviderAuthHandlerTests
         });
 
         using var client = new HttpClient(new ProviderAuthHandler(auth, profile, inner: inner));
-        var response = await client.GetAsync("https://api.mediocretoons.site/capitulos/2");
+        var response = await client.GetAsync("https://api.mediocretoons.net/capitulos/2");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(2, auth.ApplyCalls);
@@ -65,7 +65,7 @@ public class ProviderAuthHandlerTests
         });
 
         using var client = new HttpClient(new ProviderAuthHandler(auth, profile, inner: inner));
-        var response = await client.GetAsync("https://api.mediocretoons.site/capitulos/3");
+        var response = await client.GetAsync("https://api.mediocretoons.net/capitulos/3");
 
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(2, auth.ApplyCalls);
@@ -91,7 +91,7 @@ public class ProviderAuthHandlerTests
         using var client = new HttpClient(new ProviderAuthHandler(auth, profile, inner: inner));
 
         var ex = await Assert.ThrowsAsync<System.Security.Authentication.AuthenticationException>(
-            () => client.GetAsync("https://api.mediocretoons.site/capitulos/4"));
+            () => client.GetAsync("https://api.mediocretoons.net/capitulos/4"));
 
         Assert.Contains("cancelado", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(1, auth.RecoverCalls);

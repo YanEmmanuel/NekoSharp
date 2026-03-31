@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using NekoSharp.Core.Services;
 using Xunit;
 
@@ -47,12 +48,37 @@ public class ProviderCredentialAuthServiceTests
             using var http = new HttpClient(handler) { BaseAddress = new Uri(profile.ApiBaseUrl) };
             var service = new ProviderAuthService(profile, store: store, httpClient: http);
 
-            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.mediocretoons.site/capitulos/1");
+            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.mediocretoons.net/capitulos/1");
             var token = await service.ApplyAuthHeadersAsync(request);
 
             Assert.False(string.IsNullOrWhiteSpace(token));
             Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
             Assert.Equal(token, request.Headers.Authorization?.Parameter);
+            Assert.Equal(1, handler.LoginCalls);
+            Assert.Equal(1, handler.MeCalls);
+        }
+        finally
+        {
+            CleanupTempDbPath(dbPath);
+        }
+    }
+
+    [Fact]
+    public async Task LoginWithCredentialsAsync_UsesNetAuthEndpointsAndMinimalPayloadFirst()
+    {
+        var profile = ProviderAuthProfile.CreateMediocreScan();
+        var dbPath = CreateTempDbPath();
+        var handler = new StrictNetAuthHandler(token: BuildToken(DateTimeOffset.UtcNow.AddMinutes(30).ToUnixTimeSeconds()));
+
+        try
+        {
+            using var store = new ProviderAuthStore(dbPath);
+            using var http = new HttpClient(handler) { BaseAddress = new Uri(profile.ApiBaseUrl) };
+            var service = new ProviderAuthService(profile, store: store, httpClient: http);
+
+            var state = await service.LoginWithCredentialsAsync("user@example.com", "secret-123", rememberCredentials: false);
+
+            Assert.True(state.IsAuthenticated);
             Assert.Equal(1, handler.LoginCalls);
             Assert.Equal(1, handler.MeCalls);
         }
@@ -100,6 +126,70 @@ public class ProviderCredentialAuthServiceTests
             {
                 Content = new StringContent("not-found")
             });
+        }
+    }
+
+    private sealed class StrictNetAuthHandler : HttpMessageHandler
+    {
+        private readonly string _token;
+
+        public int LoginCalls { get; private set; }
+        public int MeCalls { get; private set; }
+
+        public StrictNetAuthHandler(string token)
+        {
+            _token = token;
+        }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var uri = request.RequestUri;
+            var host = uri?.Host ?? string.Empty;
+            var path = uri?.AbsolutePath ?? string.Empty;
+
+            if (host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase) &&
+                path.EndsWith("/auth/login", StringComparison.OrdinalIgnoreCase))
+            {
+                LoginCalls++;
+                var json = await request.Content!.ReadAsStringAsync(cancellationToken);
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                var hasMinimalPayload =
+                    root.TryGetProperty("email", out var email) &&
+                    email.GetString() == "user@example.com" &&
+                    root.TryGetProperty("senha", out var senha) &&
+                    senha.GetString() == "secret-123" &&
+                    root.EnumerateObject().Count() == 2;
+
+                if (!hasMinimalPayload)
+                {
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest)
+                    {
+                        Content = new StringContent("{\"error\":\"unexpected-payload\"}")
+                    };
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent($"{{\"access_token\":\"{_token}\",\"refresh_token\":\"refresh-1\"}}")
+                };
+            }
+
+            if (host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase) &&
+                path.EndsWith("/usuarios/me", StringComparison.OrdinalIgnoreCase))
+            {
+                MeCalls++;
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"data\":{\"nick\":\"tester\",\"email\":\"user@example.com\"}}")
+                };
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
+                Content = new StringContent("not-found")
+            };
         }
     }
 
