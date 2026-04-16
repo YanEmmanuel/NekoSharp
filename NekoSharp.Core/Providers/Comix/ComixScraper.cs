@@ -175,11 +175,13 @@ public sealed class ComixScraper : IScraper
         using var request = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
         using var response = await _http.SendAsync(request, ct);
 
+        var actualUrl = request.RequestUri?.ToString() ?? relativeUrl;
         var body = await response.Content.ReadAsStringAsync(ct);
         if (!response.IsSuccessStatusCode)
         {
+            _log?.Error($"[Comix] HTTP {(int)response.StatusCode} para '{actualUrl}'. Body: {Truncate(body, 500)}");
             throw new HttpRequestException(
-                $"Comix API retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'. Body: {body}");
+                $"Comix API retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'.");
         }
 
         using var doc = JsonDocument.Parse(body);
@@ -188,12 +190,18 @@ public sealed class ComixScraper : IScraper
         if (!root.TryGetProperty("result", out var result) ||
             result.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
         {
+            var apiStatus = GetInt(root, "status");
+            var apiMsg = ExtractApiMessage(root);
+            _log?.Error($"[Comix] API rejeitou request (status={apiStatus}): '{actualUrl}'. Msg: {apiMsg}");
             throw new InvalidOperationException(
-                $"Resposta inválida da API do Comix para '{relativeUrl}'. {ExtractApiMessage(root)}");
+                $"Resposta inválida da API do Comix (status={apiStatus}). {apiMsg}");
         }
 
         return result.Clone();
     }
+
+    private static string Truncate(string value, int maxLength)
+        => value.Length <= maxLength ? value : value[..maxLength] + "...";
 
     internal static ComixUrlRef ParseSupportedUrl(string url)
     {

@@ -25,6 +25,24 @@ public class ComixScraperTests
     }
 
     [Fact]
+    public void HttpClient_ResolvesFullUrlWithHashParams()
+    {
+        using var http = new System.Net.Http.HttpClient
+        {
+            BaseAddress = new System.Uri("https://comix.to/api/v2/")
+        };
+        var relativeUrl = ComixScraper.BuildChapterListRelativeUrl("r9qjm", 1);
+        using var request = new System.Net.Http.HttpRequestMessage(System.Net.Http.HttpMethod.Get, relativeUrl);
+        var resolvedUri = new System.Uri(http.BaseAddress!, request.RequestUri!);
+        var absString = resolvedUri.AbsoluteUri;
+
+        Assert.Contains("&time=1", absString);
+        Assert.Contains("&_=", absString);
+        Assert.DoesNotContain("%255B", absString);
+        Assert.DoesNotContain("%255D", absString);
+    }
+
+    [Fact]
     public void BuildChapterList_OfficialAndUnofficialSameChapter_KeepsBothWithDifferentTitles()
     {
         var chapters = ComixScraper.BuildChapterList(
