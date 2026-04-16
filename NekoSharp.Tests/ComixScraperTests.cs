@@ -6,6 +6,25 @@ namespace NekoSharp.Tests;
 public class ComixScraperTests
 {
     [Fact]
+    public void GenerateHash_KnownChapterPath_MatchesExtensionSource()
+    {
+        var token = ComixHash.GenerateHash("/manga/5vwvl/chapters", 0, 1);
+
+        Assert.Equal("xQm9tJfLwGhz_0Eq8S_YAHYkwp-q1PLfm50W5QJnyd1NnNYpAjXjyCoAzoOLrrymJN0xWS0NeDGz_rNrbqBjLLP1H9qi", token);
+    }
+
+    [Fact]
+    public void BuildChapterListRelativeUrl_AddsSignedParametersRequiredByApi()
+    {
+        var relativeUrl = ComixScraper.BuildChapterListRelativeUrl("5vwvl", 2);
+
+        Assert.Equal(
+            "manga/5vwvl/chapters?order%5Bnumber%5D=desc&limit=100&page=2&time=1&_=" +
+            "xQm9tJfLwGhz_0Eq8S_YAHYkwp-q1PLfm50W5QJnyd1NnNYpAjXjyCoAzoOLrrymJN0xWS0NeDGz_rNrbqBjLLP1H9qi",
+            relativeUrl);
+    }
+
+    [Fact]
     public void BuildChapterList_OfficialAndUnofficialSameChapter_KeepsBothWithDifferentTitles()
     {
         var chapters = ComixScraper.BuildChapterList(
@@ -17,7 +36,7 @@ public class ComixScraperTests
                     Name: "United Front",
                     Votes: 10,
                     UpdatedAt: 200,
-                    ScanlationGroupId: 9275,
+                    ScanlationGroupId: 10702,
                     ScanlationGroupName: string.Empty,
                     IsOfficial: 1),
                 new ComixScraper.ComixChapterCandidate(

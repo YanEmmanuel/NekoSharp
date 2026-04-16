@@ -14,7 +14,7 @@ public sealed class ComixScraper : IScraper
     public string BaseUrl => "https://comix.to";
 
     private const string ApiBaseUrl = "https://comix.to/api/v2/";
-    private const int OfficialScanlationGroupId = 9275;
+    private static readonly HashSet<int> OfficialScanlationGroupIds = [9275, 10702];
 
     private readonly HttpClient _http;
     private readonly LogService? _log;
@@ -106,10 +106,7 @@ public sealed class ComixScraper : IScraper
         {
             ct.ThrowIfCancellationRequested();
 
-            var result = await GetResultAsync(
-                $"manga/{Uri.EscapeDataString(parsed.HashId)}/chapters" +
-                $"?order%5Bnumber%5D=desc&limit={limit}&page={page}",
-                ct);
+            var result = await GetResultAsync(BuildChapterListRelativeUrl(parsed.HashId, page, limit), ct);
 
             if (!result.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
                 break;
@@ -204,6 +201,21 @@ public sealed class ComixScraper : IScraper
             throw new ArgumentException("URL do Comix inválida. Use /title/<hash>-slug ou /title/<hash>-slug/<chapterId>-slug.", nameof(url));
 
         return parsed;
+    }
+
+    internal static string BuildChapterListRelativeUrl(string hashId, int page, int limit = 100)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(hashId);
+        ArgumentOutOfRangeException.ThrowIfLessThan(page, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+
+        var trimmedHashId = hashId.Trim();
+        const long time = 1;
+        var path = $"/manga/{trimmedHashId}/chapters";
+        var hashToken = ComixHash.GenerateHash(path, 0, time);
+
+        return $"manga/{Uri.EscapeDataString(trimmedHashId)}/chapters" +
+               $"?order%5Bnumber%5D=desc&limit={limit}&page={page}&time={time}&_={Uri.EscapeDataString(hashToken)}";
     }
 
     private static string BuildMangaUrl(string hashId, string? slug)
@@ -365,7 +377,7 @@ public sealed class ComixScraper : IScraper
     }
 
     private static bool IsOfficialRelease(ComixChapterCandidate chapter)
-        => chapter.ScanlationGroupId == OfficialScanlationGroupId || chapter.IsOfficial == 1;
+        => OfficialScanlationGroupIds.Contains(chapter.ScanlationGroupId) || chapter.IsOfficial == 1;
 
     private static bool HasNextPage(JsonElement result)
     {
