@@ -103,6 +103,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         var page = 1;
         var scannedPages = 0;
         var byId = new Dictionary<int, Chapter>();
+        var expectedTotal = 0;
 
         while (scannedPages < 200)
         {
@@ -114,40 +115,38 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             if (!payload.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
                 break;
 
-            var count = 0;
-            foreach (var item in data.EnumerateArray())
-            {
-                var chapterId = GetInt(item, "id");
-                if (!chapterId.HasValue || chapterId.Value <= 0)
-                    continue;
-
-                count++;
-                byId[chapterId.Value] = MapChapter(item, chapterId.Value);
-            }
+            var count = MergeChapterArray(data, byId);
+            expectedTotal = Math.Max(expectedTotal, GetExpectedChapterCount(payload));
 
             if (count == 0)
                 break;
 
-            var hasNext = false;
-            if (payload.TryGetProperty("pagination", out var pagination) && pagination.ValueKind == JsonValueKind.Object)
-            {
-                var totalPages = GetInt(pagination, "totalPages");
-                hasNext = totalPages.HasValue ? page < totalPages.Value : count >= limit;
-            }
-            else
-            {
-                hasNext = count >= limit;
-            }
-
-            if (!hasNext)
+            if (!HasNextChapterPage(payload, page, count, limit))
                 break;
 
             page++;
         }
 
+        if (expectedTotal > byId.Count)
+        {
+            var obraPayload = await GetJsonAsync($"obras/{obraId}", ct);
+            expectedTotal = Math.Max(expectedTotal, GetInt(obraPayload, "total_capitulos") ?? 0);
+
+            if (obraPayload.TryGetProperty("capitulos", out var embeddedChapters) && embeddedChapters.ValueKind == JsonValueKind.Array)
+            {
+                var before = byId.Count;
+                var added = MergeChapterArray(embeddedChapters, byId);
+                if (added > 0)
+                    _log?.Debug($"[MediocreScan] Added {byId.Count - before} missing chapter(s) from obra payload for obra={obraId}");
+            }
+
+            if (expectedTotal > byId.Count)
+                _log?.Warn($"[MediocreScan] Chapter list for obra={obraId} is still incomplete after fallback ({byId.Count}/{expectedTotal})");
+        }
+
         var chapters = byId
-            .OrderBy(x => x.Value.Number)
-            .ThenBy(x => x.Key)
+            .OrderByDescending(x => x.Value.Number)
+            .ThenByDescending(x => x.Key)
             .Select(x => x.Value)
             .ToList();
 
@@ -286,6 +285,55 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         };
     }
 
+    internal static int MergeChapterArray(JsonElement chaptersJson, IDictionary<int, Chapter> chaptersById)
+    {
+        if (chaptersJson.ValueKind != JsonValueKind.Array)
+            return 0;
+
+        var merged = 0;
+        foreach (var item in chaptersJson.EnumerateArray())
+        {
+            var chapterId = GetInt(item, "id");
+            if (!chapterId.HasValue || chapterId.Value <= 0)
+                continue;
+
+            merged++;
+            chaptersById[chapterId.Value] = MapChapter(item, chapterId.Value);
+        }
+
+        return merged;
+    }
+
+    internal static bool HasNextChapterPage(JsonElement payload, int requestedPage, int itemCount, int pageSize)
+    {
+        if (!payload.TryGetProperty("pagination", out var pagination) || pagination.ValueKind != JsonValueKind.Object)
+            return itemCount >= pageSize;
+
+        var hasNextPage = GetBool(pagination, "hasNextPage");
+        if (hasNextPage.HasValue)
+            return hasNextPage.Value;
+
+        var currentPage = GetInt(pagination, "currentPage") ?? GetInt(pagination, "pagina_atual") ?? requestedPage;
+        var totalPages = GetInt(pagination, "totalPages") ?? GetInt(pagination, "paginas");
+        if (totalPages.HasValue)
+            return currentPage < totalPages.Value;
+
+        var totalItems = GetInt(pagination, "totalItems") ?? GetInt(pagination, "total");
+        var itemsPerPage = GetInt(pagination, "itemsPerPage") ?? GetInt(pagination, "itens_por_pagina");
+        if (totalItems.HasValue && itemsPerPage.HasValue && itemsPerPage.Value > 0)
+            return currentPage * itemsPerPage.Value < totalItems.Value;
+
+        return itemCount >= pageSize;
+    }
+
+    internal static int GetExpectedChapterCount(JsonElement payload)
+    {
+        if (!payload.TryGetProperty("pagination", out var pagination) || pagination.ValueKind != JsonValueKind.Object)
+            return 0;
+
+        return GetInt(pagination, "totalItems") ?? GetInt(pagination, "total") ?? 0;
+    }
+
     private static string BuildCoverUrl(int obraId, string? coverName)
     {
         if (string.IsNullOrWhiteSpace(coverName))
@@ -375,5 +423,19 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var value)
             ? value
             : null;
+    }
+
+    private static bool? GetBool(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out var value))
+            return null;
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
+            _ => null
+        };
     }
 }

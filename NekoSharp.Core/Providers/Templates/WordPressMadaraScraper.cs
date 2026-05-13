@@ -25,6 +25,7 @@ public abstract class WordPressMadaraScraper : IScraper
     protected virtual string ChaptersSelector => "li.wp-manga-chapter > a";
     protected virtual string ChaptersPlaceholderSelector => "[id^=\"manga-chapters-holder\"][data-id]";
     protected virtual bool EnableChapterAjax => true;
+    protected virtual bool UseNewChapterEndpoint => true;
     protected virtual bool ReverseChapterOrder => false;
     protected virtual string? ChapterLinkSelector => null;
     protected virtual string? ChapterTitleSelector => null;
@@ -289,9 +290,12 @@ public abstract class WordPressMadaraScraper : IScraper
     {
         try
         {
-            var links = await LoadChaptersFromNewAjaxAsync(mangaUrl, ct);
-            if (links.Count > 0)
-                return links;
+            if (UseNewChapterEndpoint)
+            {
+                var links = await LoadChaptersFromNewAjaxAsync(mangaUrl, ct);
+                if (links.Count > 0)
+                    return links;
+            }
         }
         catch
         {
