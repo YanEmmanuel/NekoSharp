@@ -2,15 +2,9 @@
   "providers": [
     {
       "name": "NekoSharp.DynamicProviders",
-<<<<<<< HEAD
-      "version": "2026.04.16.5-73dc537",
+      "version": "2026.05.13.6-5b8fe10",
       "assemblyUrl": "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/master/providers/NekoSharp.DynamicProviders.dll",
-      "sha256": "7AD3A45282B045E83D56998F789EA75496BE83431B117C54F67495342F35AF02",
-=======
-      "version": "2026.05.12.1-73dc537",
-      "assemblyUrl": "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/master/providers/NekoSharp.DynamicProviders.dll",
-      "sha256": "4CBADAF3341AB900A51D1AB11FD087D97A7EF629A3B5D77FA22943BA4D1723E4",
->>>>>>> 16390c2 (feat: Add TaiyoScraper and implement chapter and page retrieval; enhance MediocreScanScraper with pagination handling and tests)
+      "sha256": "57383420C9A618EF0FF264BE0DB760AEEE1AFFCD168CC4E1379D896E598FE571",
       "enabled": true
     }
   ]
