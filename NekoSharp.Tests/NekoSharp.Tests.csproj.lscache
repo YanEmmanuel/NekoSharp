@@ -2,12 +2,10 @@ version=1
 
 # This file caches language service data to improve the performance of C# Dev Kit.
 # It is not intended for manual editing. It can safely be deleted and will be
-# regenerated automatically.
+# regenerated automatically. For more information, see https://aka.ms/lscache
 #
-# To exclude from version control, add *.lscache to your .gitignore file.
-#
-# To disable caching, add the following to your VS Code settings:
-#   "dotnet.projectsystem.enableLanguageServiceCache": false
+# To control where cache files are stored, use the following VS Code setting:
+#   "dotnet.projectsystem.cacheInProjectFolder": true
 
 [project]
 language=C#
@@ -67,6 +65,7 @@ LibraryStoreTests.cs
 MangaLibraryServiceTests.cs
 MediocreAuthHandlerTests.cs
 MediocreAuthServiceTests.cs
+MediocreScanScraperTests.cs
 MediocreUrlParserTests.cs
 obj/Debug/net10.0/
  .NETCoreApp,Version=v10.0.AssemblyAttributes.cs
@@ -74,6 +73,7 @@ obj/Debug/net10.0/
  NekoSharp.Tests.GlobalUsings.g.cs
 ProviderCredentialAuthServiceTests.cs
 ProviderUpdateServiceTests.cs
+ScraperManagerTests.cs
 
 [metadataReferences]
 ../../../.asdf/installs/dotnet/10.0.100/packs/Microsoft.NETCore.App.Ref/10.0.0/ref/net10.0/
