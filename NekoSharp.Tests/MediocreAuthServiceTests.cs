@@ -23,7 +23,7 @@ public class ProviderAuthServiceTests
             ObtainedAtUtc = DateTime.UtcNow
         };
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.mediocretoons.net/capitulos/1");
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{profile.ApiBaseUrl}capitulos/1");
 
         ProviderAuthService.ApplyRequiredHeaders(request, credentials, profile);
 

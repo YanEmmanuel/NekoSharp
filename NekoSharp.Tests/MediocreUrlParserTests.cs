@@ -9,6 +9,7 @@ public class MediocreUrlParserTests
     [InlineData("https://mediocrescan.com/obra/198", 1, 198)]
     [InlineData("https://mediocrescan.com/obra/198/", 1, 198)]
     [InlineData("https://mediocrescan.com/capitulo/287905", 2, 287905)]
+    [InlineData("https://back.mediocrescan.com/capitulos/287905", 2, 287905)]
     [InlineData("https://api.mediocretoons.site/capitulos/287905", 2, 287905)]
     [InlineData("https://api.mediocretoons.net/capitulos/287905", 2, 287905)]
     public void TryParse_ValidUrls_ReturnsExpected(string url, int kind, int id)

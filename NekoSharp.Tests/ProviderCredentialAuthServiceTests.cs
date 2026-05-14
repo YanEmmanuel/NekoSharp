@@ -48,7 +48,7 @@ public class ProviderCredentialAuthServiceTests
             using var http = new HttpClient(handler) { BaseAddress = new Uri(profile.ApiBaseUrl) };
             var service = new ProviderAuthService(profile, store: store, httpClient: http);
 
-            using var request = new HttpRequestMessage(HttpMethod.Get, "https://api.mediocretoons.net/capitulos/1");
+            using var request = new HttpRequestMessage(HttpMethod.Get, $"{profile.ApiBaseUrl}capitulos/1");
             var token = await service.ApplyAuthHeadersAsync(request);
 
             Assert.False(string.IsNullOrWhiteSpace(token));
@@ -64,11 +64,11 @@ public class ProviderCredentialAuthServiceTests
     }
 
     [Fact]
-    public async Task LoginWithCredentialsAsync_UsesNetAuthEndpointsAndMinimalPayloadFirst()
+    public async Task LoginWithCredentialsAsync_UsesBackAuthEndpointsAndMinimalPayloadFirst()
     {
         var profile = ProviderAuthProfile.CreateMediocreScan();
         var dbPath = CreateTempDbPath();
-        var handler = new StrictNetAuthHandler(token: BuildToken(DateTimeOffset.UtcNow.AddMinutes(30).ToUnixTimeSeconds()));
+        var handler = new StrictBackAuthHandler(token: BuildToken(DateTimeOffset.UtcNow.AddMinutes(30).ToUnixTimeSeconds()));
 
         try
         {
@@ -129,14 +129,14 @@ public class ProviderCredentialAuthServiceTests
         }
     }
 
-    private sealed class StrictNetAuthHandler : HttpMessageHandler
+    private sealed class StrictBackAuthHandler : HttpMessageHandler
     {
         private readonly string _token;
 
         public int LoginCalls { get; private set; }
         public int MeCalls { get; private set; }
 
-        public StrictNetAuthHandler(string token)
+        public StrictBackAuthHandler(string token)
         {
             _token = token;
         }
@@ -147,7 +147,7 @@ public class ProviderCredentialAuthServiceTests
             var host = uri?.Host ?? string.Empty;
             var path = uri?.AbsolutePath ?? string.Empty;
 
-            if (host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase) &&
+            if (host.Equals("back.mediocrescan.com", StringComparison.OrdinalIgnoreCase) &&
                 path.EndsWith("/auth/login", StringComparison.OrdinalIgnoreCase))
             {
                 LoginCalls++;
@@ -176,7 +176,7 @@ public class ProviderCredentialAuthServiceTests
                 };
             }
 
-            if (host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase) &&
+            if (host.Equals("back.mediocrescan.com", StringComparison.OrdinalIgnoreCase) &&
                 path.EndsWith("/usuarios/me", StringComparison.OrdinalIgnoreCase))
             {
                 MeCalls++;
