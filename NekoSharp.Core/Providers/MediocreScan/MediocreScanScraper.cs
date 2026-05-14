@@ -56,7 +56,10 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             return false;
 
         return uri.Host.Equals("mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
-               uri.Host.Equals("www.mediocrescan.com", StringComparison.OrdinalIgnoreCase);
+               uri.Host.Equals("www.mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
+               uri.Host.Equals("back.mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
+               uri.Host.Equals("api.mediocretoons.site", StringComparison.OrdinalIgnoreCase) ||
+               uri.Host.Equals("api.mediocretoons.net", StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
@@ -71,9 +74,9 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 
         var obra = await GetJsonAsync($"obras/{obraId}", ct);
 
-        var name = GetString(obra, "nome") ?? $"Obra {obraId}";
-        var description = GetString(obra, "sinopse") ?? GetString(obra, "descricao") ?? string.Empty;
-        var coverUrl = BuildCoverUrl(obraId, GetString(obra, "imagem"));
+        var name = GetString(obra, "nome", "obr_nome") ?? $"Obra {obraId}";
+        var description = GetString(obra, "sinopse", "descricao", "obr_descricao") ?? string.Empty;
+        var coverUrl = BuildCoverUrl(obraId, GetString(obra, "imagem", "obr_imagem"));
 
         _log?.Debug($"[MediocreScan] Resolved obra={obraId} for manga info");
 
@@ -127,7 +130,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             page++;
         }
 
-        if (expectedTotal > byId.Count)
+        if (byId.Count == 0 || expectedTotal > byId.Count)
         {
             var obraPayload = await GetJsonAsync($"obras/{obraId}", ct);
             expectedTotal = Math.Max(expectedTotal, GetInt(obraPayload, "total_capitulos") ?? 0);
@@ -179,7 +182,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 
         foreach (var pageItem in pagesJson.EnumerateArray())
         {
-            var src = GetString(pageItem, "src");
+            var src = GetString(pageItem, "src", "pag_src", "pag_imagem", "pag_arquivo", "arquivo", "imagem", "url", "link");
             if (string.IsNullOrWhiteSpace(src))
                 continue;
 
@@ -221,10 +224,14 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 
         if (chapter.TryGetProperty("obra", out var obra) && obra.ValueKind == JsonValueKind.Object)
         {
-            var obraId = GetInt(obra, "id");
+            var obraId = GetInt(obra, "id", "obr_id");
             if (obraId.HasValue && obraId.Value > 0)
                 return obraId.Value;
         }
+
+        var directObraId = GetInt(chapter, "obra_id", "obr_id", "cap_obr_id");
+        if (directObraId.HasValue && directObraId.Value > 0)
+            return directObraId.Value;
 
         throw new InvalidOperationException($"Não foi possível resolver obra.id para capítulo {chapterId}.");
     }
@@ -271,9 +278,9 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 
     private static Chapter MapChapter(JsonElement chapterJson, int chapterId)
     {
-        var title = GetString(chapterJson, "nome") ?? $"Capítulo {chapterId}";
+        var title = GetString(chapterJson, "nome", "cap_nome") ?? $"Capítulo {chapterId}";
 
-        var number = GetDouble(chapterJson, "numero");
+        var number = GetDouble(chapterJson, "numero", "cap_num");
         if (!number.HasValue)
             number = ChapterHelper.ExtractChapterNumber(title);
 
@@ -293,7 +300,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         var merged = 0;
         foreach (var item in chaptersJson.EnumerateArray())
         {
-            var chapterId = GetInt(item, "id");
+            var chapterId = GetInt(item, "id", "cap_id");
             if (!chapterId.HasValue || chapterId.Value <= 0)
                 continue;
 
@@ -343,7 +350,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             return absolute.ToString();
 
         var clean = coverName.TrimStart('/');
-        return $"https://cdn.mediocretoons.site/obras/{obraId}/{clean}";
+        return $"https://cdn.mediocrescan.com/obras/{obraId}/{clean}";
     }
 
     private static string BuildPageImageUrl(int obraId, string chapterFolder, string src)
@@ -359,17 +366,21 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
     {
         if (chapterPayload.TryGetProperty("obra", out var obra) && obra.ValueKind == JsonValueKind.Object)
         {
-            var obraId = GetInt(obra, "id");
+            var obraId = GetInt(obra, "id", "obr_id");
             if (obraId.HasValue && obraId.Value > 0)
                 return obraId.Value;
         }
+
+        var directObraId = GetInt(chapterPayload, "obra_id", "obr_id", "cap_obr_id");
+        if (directObraId.HasValue && directObraId.Value > 0)
+            return directObraId.Value;
 
         return null;
     }
 
     private static string ResolveChapterFolder(JsonElement chapterPayload, int chapterId)
     {
-        var raw = GetString(chapterPayload, "numero");
+        var raw = GetString(chapterPayload, "numero", "cap_num");
         if (string.IsNullOrWhiteSpace(raw))
             return chapterId.ToString(CultureInfo.InvariantCulture);
 
@@ -384,27 +395,35 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         return number.ToString("0.###", CultureInfo.InvariantCulture);
     }
 
-    private static string? GetString(JsonElement element, string propertyName)
+    private static string? GetString(JsonElement element, params string[] propertyNames)
     {
         if (element.ValueKind != JsonValueKind.Object)
             return null;
 
-        if (!element.TryGetProperty(propertyName, out var value))
-            return null;
-
-        return value.ValueKind switch
+        foreach (var propertyName in propertyNames)
         {
-            JsonValueKind.String => value.GetString(),
-            JsonValueKind.Number => value.GetRawText(),
-            JsonValueKind.True => "true",
-            JsonValueKind.False => "false",
-            _ => null
-        };
+            if (!element.TryGetProperty(propertyName, out var value))
+                continue;
+
+            var result = value.ValueKind switch
+            {
+                JsonValueKind.String => value.GetString(),
+                JsonValueKind.Number => value.GetRawText(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                _ => null
+            };
+
+            if (!string.IsNullOrWhiteSpace(result))
+                return result;
+        }
+
+        return null;
     }
 
-    private static int? GetInt(JsonElement element, string propertyName)
+    private static int? GetInt(JsonElement element, params string[] propertyNames)
     {
-        var raw = GetString(element, propertyName);
+        var raw = GetString(element, propertyNames);
         if (string.IsNullOrWhiteSpace(raw))
             return null;
 
@@ -413,9 +432,9 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             : null;
     }
 
-    private static double? GetDouble(JsonElement element, string propertyName)
+    private static double? GetDouble(JsonElement element, params string[] propertyNames)
     {
-        var raw = GetString(element, propertyName);
+        var raw = GetString(element, propertyNames);
         if (string.IsNullOrWhiteSpace(raw))
             return null;
 

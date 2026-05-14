@@ -8,6 +8,7 @@ public class MediocreUrlParserTests
     [Theory]
     [InlineData("https://mediocrescan.com/obra/198", 1, 198)]
     [InlineData("https://mediocrescan.com/obra/198/", 1, 198)]
+    [InlineData("https://back.mediocrescan.com/obras/259", 1, 259)]
     [InlineData("https://mediocrescan.com/capitulo/287905", 2, 287905)]
     [InlineData("https://back.mediocrescan.com/capitulos/287905", 2, 287905)]
     [InlineData("https://api.mediocretoons.site/capitulos/287905", 2, 287905)]

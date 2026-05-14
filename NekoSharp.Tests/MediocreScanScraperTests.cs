@@ -75,4 +75,37 @@ public class MediocreScanScraperTests
         Assert.Equal(112, chaptersById[287904].Number);
         Assert.Equal("https://mediocrescan.com/capitulo/287904", chaptersById[287904].Url);
     }
+
+    [Fact]
+    public void MergeChapterArray_SupportsCurrentBackApiChapterFields()
+    {
+        using var doc = JsonDocument.Parse("""
+        {
+          "capitulos": [
+            {
+              "cap_id": 518274,
+              "cap_nome": "Capítulo 124",
+              "cap_num": 124,
+              "cap_tipo": "imagem"
+            },
+            {
+              "cap_id": 517927,
+              "cap_nome": "Capítulo 123",
+              "cap_num": 123,
+              "cap_tipo": "imagem"
+            }
+          ]
+        }
+        """);
+
+        var chaptersById = new Dictionary<int, Chapter>();
+
+        var merged = MediocreScanScraper.MergeChapterArray(doc.RootElement.GetProperty("capitulos"), chaptersById);
+
+        Assert.Equal(2, merged);
+        Assert.Equal(2, chaptersById.Count);
+        Assert.Equal("Capítulo 124", chaptersById[518274].Title);
+        Assert.Equal(124, chaptersById[518274].Number);
+        Assert.Equal("https://mediocrescan.com/capitulo/518274", chaptersById[518274].Url);
+    }
 }

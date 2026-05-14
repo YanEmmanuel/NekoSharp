@@ -13,7 +13,7 @@ internal readonly record struct MediocreUrlRef(MediocreUrlKind Kind, int Id);
 
 internal static partial class MediocreUrlParser
 {
-    [GeneratedRegex("^/obra/(?<id>\\d+)(?:/|$)", RegexOptions.IgnoreCase)]
+    [GeneratedRegex("^/obras?/(?<id>\\d+)(?:/|$)", RegexOptions.IgnoreCase)]
     private static partial Regex ObraRegex();
 
     [GeneratedRegex("^/capitulo/(?<id>\\d+)(?:/|$)", RegexOptions.IgnoreCase)]
