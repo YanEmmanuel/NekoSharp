@@ -1057,7 +1057,7 @@ public class MainWindow
         _errorStatusPage = Adw.StatusPage.New();
         _errorStatusPage.SetIconName("dialog-error-symbolic");
         _errorStatusPage.SetTitle("Algo deu errado");
-        _errorStatusPage.SetDescription(_vm.StatusMessage);
+        SetErrorDescription(_vm.StatusMessage);
         _errorStatusPage.SetVexpand(true);
 
         _errorSearchContainer = Gtk.Box.New(Gtk.Orientation.Vertical, 12);
@@ -1433,7 +1433,7 @@ public class MainWindow
             case nameof(MainWindowViewModel.StatusType):
                 UpdateStatusBar();
                 if (_errorStatusPage != null)
-                    _errorStatusPage.SetDescription(_vm.StatusMessage);
+                    SetErrorDescription(_vm.StatusMessage);
                 break;
 
             case nameof(MainWindowViewModel.ProviderNames):
@@ -1533,6 +1533,11 @@ public class MainWindow
             "warning" => "⚠",
             _ => "ℹ"
         });
+    }
+
+    private void SetErrorDescription(string message)
+    {
+        _errorStatusPage.SetDescription(WebUtility.HtmlEncode(message));
     }
 
     private void OnLibraryItemsCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
