@@ -108,4 +108,46 @@ public class MediocreScanScraperTests
         Assert.Equal(124, chaptersById[518274].Number);
         Assert.Equal("https://mediocrescan.com/capitulo/518274", chaptersById[518274].Url);
     }
+
+    [Fact]
+    public void MapPageArray_SupportsCurrentCdnManifestFields()
+    {
+        using var doc = JsonDocument.Parse("""
+        [
+          {
+            "url": "obras/259/capitulos/124/bc699ffa7ad00dd9bb85890246d399607a01f6b4.webp",
+            "ordem": 3
+          },
+          {
+            "url": "obras/259/capitulos/124/da6bd4e5153804d99585f2d687725a445031475b.webp",
+            "ordem": 1
+          }
+        ]
+        """);
+
+        var pages = MediocreScanScraper.MapPageArray(doc.RootElement, obraId: 259, chapterFolder: "124");
+
+        Assert.Equal(2, pages.Count);
+        Assert.Equal(1, pages[0].Number);
+        Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/da6bd4e5153804d99585f2d687725a445031475b.webp", pages[0].ImageUrl);
+        Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/bc699ffa7ad00dd9bb85890246d399607a01f6b4.webp", pages[1].ImageUrl);
+        Assert.All(pages, page => Assert.Equal("https://mediocrescan.com/", page.RefererUrl));
+    }
+
+    [Fact]
+    public void MapPageArray_SupportsLegacyInlinePageSrcFields()
+    {
+        using var doc = JsonDocument.Parse("""
+        [
+          { "src": "001.webp" },
+          { "src": "002.webp" }
+        ]
+        """);
+
+        var pages = MediocreScanScraper.MapPageArray(doc.RootElement, obraId: 259, chapterFolder: "124");
+
+        Assert.Equal(2, pages.Count);
+        Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/001.webp", pages[0].ImageUrl);
+        Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/002.webp", pages[1].ImageUrl);
+    }
 }

@@ -10,6 +10,8 @@ namespace NekoSharp.Core.Providers.MediocreScan;
 
 public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 {
+    private const string CdnBaseUrl = "https://cdn.mediocrescan.com";
+
     public string Name => "Mediocre Scan";
     public string BaseUrl => _authProfile.SiteBaseUrl;
 
@@ -113,7 +115,16 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             ct.ThrowIfCancellationRequested();
             scannedPages++;
 
-            var payload = await GetJsonAsync($"capitulos?obr_id={obraId}&page={page}&limite={limit}&order=desc", ct);
+            JsonElement payload;
+            try
+            {
+                payload = await GetJsonAsync($"capitulos?obr_id={obraId}&page={page}&limite={limit}&order=desc", ct);
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                _log?.Warn($"[MediocreScan] Endpoint paginado de capítulos retornou 404 para obra={obraId}. Usando fallback do payload da obra.");
+                break;
+            }
 
             if (!payload.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array)
                 break;
@@ -173,25 +184,25 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             obraId = await ResolveObraIdFromChapterAsync(chapterId, ct);
         }
 
-        if (!payload.TryGetProperty("paginas", out var pagesJson) || pagesJson.ValueKind != JsonValueKind.Array)
-            return [];
-
         var chapterFolder = ResolveChapterFolder(payload, chapterId);
-        var pages = new List<Page>();
-        var index = 1;
-
-        foreach (var pageItem in pagesJson.EnumerateArray())
+        if (payload.TryGetProperty("paginas", out var pagesJson) && pagesJson.ValueKind == JsonValueKind.Array)
         {
-            var src = GetString(pageItem, "src", "pag_src", "pag_imagem", "pag_arquivo", "arquivo", "imagem", "url", "link");
-            if (string.IsNullOrWhiteSpace(src))
-                continue;
-
-            pages.Add(new Page
-            {
-                Number = index++,
-                ImageUrl = BuildPageImageUrl(obraId.Value, chapterFolder, src)
-            });
+            var inlinePages = MapPageArray(pagesJson, obraId.Value, chapterFolder);
+            if (inlinePages.Count > 0)
+                return inlinePages;
         }
+
+        var chapterUuid = GetString(payload, "cap_uuid", "uuid");
+        if (string.IsNullOrWhiteSpace(chapterUuid))
+            throw new InvalidOperationException($"Capítulo {chapterId} não trouxe páginas nem cap_uuid para consultar o CDN.");
+
+        var manifestUrl = BuildChapterPagesManifestUrl(obraId.Value, chapterFolder, chapterUuid);
+        var manifest = await GetJsonAsync(manifestUrl, ct);
+        var pages = MapPageArray(manifest, obraId.Value, chapterFolder);
+
+        var expectedPageCount = GetInt(payload, "cap_paginas_count", "paginas_count");
+        if (expectedPageCount.HasValue && expectedPageCount.Value != pages.Count)
+            _log?.Warn($"[MediocreScan] Capítulo {chapterId} informou {expectedPageCount} página(s), mas o CDN retornou {pages.Count}.");
 
         return pages;
     }
@@ -239,13 +250,17 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
     private async Task<JsonElement> GetJsonAsync(string relativeUrl, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
+        ApplyRequestHeaders(request);
+
         using var response = await _http.SendAsync(request, ct);
 
         var body = await response.Content.ReadAsStringAsync(ct);
         if (!response.IsSuccessStatusCode)
         {
             throw new HttpRequestException(
-                $"Mediocre API retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'. Body: {body}");
+                $"Mediocre API retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'. Body: {body}",
+                inner: null,
+                response.StatusCode);
         }
 
         using var doc = JsonDocument.Parse(body);
@@ -341,6 +356,39 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
         return GetInt(pagination, "totalItems") ?? GetInt(pagination, "total") ?? 0;
     }
 
+    internal static List<Page> MapPageArray(JsonElement pagesJson, int obraId, string chapterFolder)
+    {
+        if (pagesJson.ValueKind != JsonValueKind.Array)
+            return [];
+
+        var entries = new List<(int SortOrder, string ImageUrl)>();
+        var index = 1;
+
+        foreach (var pageItem in pagesJson.EnumerateArray())
+        {
+            var src = GetString(pageItem, "url", "src", "pag_src", "pag_imagem", "pag_arquivo", "arquivo", "imagem", "link");
+            if (string.IsNullOrWhiteSpace(src))
+            {
+                index++;
+                continue;
+            }
+
+            var sortOrder = GetInt(pageItem, "ordem", "order", "numero", "num") ?? index;
+            entries.Add((sortOrder, BuildPageImageUrl(obraId, chapterFolder, src)));
+            index++;
+        }
+
+        return entries
+            .OrderBy(entry => entry.SortOrder)
+            .Select((entry, pageIndex) => new Page
+            {
+                Number = pageIndex + 1,
+                ImageUrl = entry.ImageUrl,
+                RefererUrl = "https://mediocrescan.com/"
+            })
+            .ToList();
+    }
+
     private static string BuildCoverUrl(int obraId, string? coverName)
     {
         if (string.IsNullOrWhiteSpace(coverName))
@@ -350,7 +398,7 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             return absolute.ToString();
 
         var clean = coverName.TrimStart('/');
-        return $"https://cdn.mediocrescan.com/obras/{obraId}/{clean}";
+        return $"{CdnBaseUrl}/obras/{obraId}/{clean}";
     }
 
     private static string BuildPageImageUrl(int obraId, string chapterFolder, string src)
@@ -359,7 +407,15 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             return absolute.ToString();
 
         var clean = src.TrimStart('/');
-        return $"https://cdn.mediocrescan.com/obras/{obraId}/capitulos/{chapterFolder}/{clean}";
+        if (clean.StartsWith("obras/", StringComparison.OrdinalIgnoreCase))
+            return $"{CdnBaseUrl}/{clean}";
+
+        return $"{CdnBaseUrl}/obras/{obraId}/capitulos/{chapterFolder}/{clean}";
+    }
+
+    private static string BuildChapterPagesManifestUrl(int obraId, string chapterFolder, string chapterUuid)
+    {
+        return $"{CdnBaseUrl}/obras/{obraId}/capitulos/{chapterFolder}/{Uri.EscapeDataString(chapterUuid)}.json";
     }
 
     private static int? TryGetObraId(JsonElement chapterPayload)
@@ -456,5 +512,22 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
             JsonValueKind.String when bool.TryParse(value.GetString(), out var parsed) => parsed,
             _ => null
         };
+    }
+
+    private void ApplyRequestHeaders(HttpRequestMessage request)
+    {
+        request.Headers.Remove("Accept");
+        request.Headers.TryAddWithoutValidation("Accept", _authProfile.AcceptHeaderValue);
+
+        request.Headers.Remove("Origin");
+        request.Headers.TryAddWithoutValidation("Origin", _authProfile.OriginHeaderValue);
+
+        request.Headers.Referrer = new Uri(_authProfile.RefererHeaderValue);
+
+        request.Headers.Remove("User-Agent");
+        request.Headers.TryAddWithoutValidation("User-Agent", UserAgentProvider.Default);
+
+        request.Headers.Remove(_authProfile.XAppKeyHeaderName);
+        request.Headers.TryAddWithoutValidation(_authProfile.XAppKeyHeaderName, _authProfile.XAppKeyHeaderValue);
     }
 }
