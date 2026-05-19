@@ -65,6 +65,7 @@ public partial class MainWindowViewModel : ObservableObject
 
     [ObservableProperty] private int _maxConcurrentChapters = 3;
     [ObservableProperty] private int _maxConcurrentPageDownloads = 4;
+    [ObservableProperty] private MangaDexChapterLanguage _mangaDexChapterLanguage = MangaDexChapterLanguage.Portuguese;
 
     [ObservableProperty] private bool _isMediocreAuthBusy;
     [ObservableProperty] private string _mediocreAuthStatus = "Desconectado";
@@ -171,6 +172,9 @@ public partial class MainWindowViewModel : ObservableObject
             var ssLossyQ = await _settingsStore.GetIntAsync(SmartStitchSettings.KeyLossyQuality, 100);
             var concChapters = await _settingsStore.GetIntAsync("Download.MaxConcurrentChapters", 3);
             var concPages = await _settingsStore.GetIntAsync("Download.MaxConcurrentPages", 4);
+            var mangaDexChapterLanguage = await _settingsStore.GetEnumAsync(
+                MangaDexSettings.ChapterLanguageKey,
+                MangaDexChapterLanguage.Portuguese);
 
             GLib.Functions.IdleAdd(0, () =>
             {
@@ -195,6 +199,7 @@ public partial class MainWindowViewModel : ObservableObject
 
                 MaxConcurrentChapters = Math.Clamp(concChapters, 1, 10);
                 MaxConcurrentPageDownloads = Math.Clamp(concPages, 1, 12);
+                MangaDexChapterLanguage = mangaDexChapterLanguage;
 
                 return false;
             });
@@ -818,6 +823,12 @@ public partial class MainWindowViewModel : ObservableObject
         _settingsStore.SetIntAsync("Download.MaxConcurrentPages", v);
     }
 
+    partial void OnMangaDexChapterLanguageChanged(MangaDexChapterLanguage value)
+    {
+        _settingsStore.SetEnumAsync(MangaDexSettings.ChapterLanguageKey, value);
+        _ = RefreshCurrentMangaDexChaptersForLanguageChangeAsync();
+    }
+
     partial void OnIsFetchingChanged(bool value) => NotifyCanExecuteStateChanged();
 
     partial void OnIsDownloadingChanged(bool value) => NotifyCanExecuteStateChanged();
@@ -861,6 +872,47 @@ public partial class MainWindowViewModel : ObservableObject
         RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
         RefreshCloudflareCacheInfoCommand.NotifyCanExecuteChanged();
         ClearCloudflareCacheCommand.NotifyCanExecuteChanged();
+    }
+
+    private async Task RefreshCurrentMangaDexChaptersForLanguageChangeAsync()
+    {
+        if (!IsMangaLoaded || IsFetching || IsDownloading || string.IsNullOrWhiteSpace(MangaUrl))
+            return;
+
+        var scraper = _scraperManager.GetScraperForUrl(MangaUrl);
+        if (scraper is null || !string.Equals(scraper.Name, "MangaDex", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        try
+        {
+            IsFetching = true;
+            SetStatus("Atualizando capítulos do MangaDex com o idioma selecionado...", "info");
+
+            var chapters = await scraper.GetChaptersAsync(MangaUrl);
+
+            Chapters.Clear();
+            foreach (var chapter in chapters)
+                Chapters.Add(new ChapterViewModel(chapter));
+
+            if (Manga is not null)
+                Manga.Chapters = chapters;
+
+            TotalChapters = Chapters.Count;
+            CompletedChapters = 0;
+
+            var languageLabel = MangaDexChapterLanguage == MangaDexChapterLanguage.English
+                ? "English"
+                : "Português";
+            SetStatus($"Capítulos do MangaDex atualizados para {languageLabel}.", "success");
+        }
+        catch (Exception ex)
+        {
+            SetStatus($"Erro ao atualizar capítulos do MangaDex: {ex.Message}", "error");
+        }
+        finally
+        {
+            IsFetching = false;
+        }
     }
 
     [RelayCommand(CanExecute = nameof(CanRunMediocreAuthAction))]

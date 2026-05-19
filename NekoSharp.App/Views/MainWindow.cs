@@ -528,12 +528,44 @@ public class MainWindow
         };
 
         page.Add(group);
+        page.Add(BuildMangaDexSettingsGroup());
         page.Add(BuildCloudflareSettingsGroup());
         page.Add(BuildMediocreAuthSettingsGroup());
 
         page.Add(BuildSmartStitchSettingsGroup());
 
         return page;
+    }
+
+    private Adw.PreferencesGroup BuildMangaDexSettingsGroup()
+    {
+        var group = Adw.PreferencesGroup.New();
+        group.SetTitle("MangaDex");
+        group.SetDescription("Escolha qual idioma de capítulos o provider do MangaDex deve buscar.");
+
+        var languageRow = Adw.ComboRow.New();
+        languageRow.SetTitle("Idioma dos capítulos");
+        languageRow.SetSubtitle("A troca afeta a próxima busca de capítulos no MangaDex.");
+        languageRow.SetModel(Gtk.StringList.New(new[] { "Português", "English" }));
+        languageRow.SetSelected((uint)_vm.MangaDexChapterLanguage);
+        languageRow.OnNotify += (_, args) =>
+        {
+            if (args.Pspec.GetName() == "selected")
+                _vm.MangaDexChapterLanguage = (MangaDexChapterLanguage)languageRow.GetSelected();
+        };
+
+        _vm.PropertyChanged += (_, args) =>
+        {
+            if (args.PropertyName == nameof(_vm.MangaDexChapterLanguage))
+            {
+                var val = (uint)_vm.MangaDexChapterLanguage;
+                if (languageRow.GetSelected() != val)
+                    languageRow.SetSelected(val);
+            }
+        };
+
+        group.Add(languageRow);
+        return group;
     }
 
     private Adw.PreferencesGroup BuildCloudflareSettingsGroup()

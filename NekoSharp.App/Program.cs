@@ -35,7 +35,7 @@ class Program
         var scraperManager = new ScraperManager();
         var providerUpdateService = new ProviderUpdateService(settingsStore, logService: logService);
         var installedProviderAssemblies = providerUpdateService.GetInstalledProviderAssemblies();
-        scraperManager.DiscoverAndRegisterAll(logService, cfStore, installedProviderAssemblies);
+        scraperManager.DiscoverAndRegisterAll(logService, cfStore, settingsStore, installedProviderAssemblies);
 
         var application = Adw.Application.New(AppId, Gio.ApplicationFlags.FlagsNone);
         var providerUpdateStarted = 0;
@@ -80,7 +80,7 @@ class Program
 
                     if (newlyAvailablePaths.Length > 0)
                     {
-                        scraperManager.DiscoverAndRegisterExternal(logService, cfStore, newlyAvailablePaths);
+                        scraperManager.DiscoverAndRegisterExternal(logService, cfStore, settingsStore, newlyAvailablePaths);
 
                         GLib.Functions.IdleAdd(0, () =>
                         {

@@ -2,9 +2,11 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Models;
 using NekoSharp.Core.Services;
+using PuppeteerSharp;
 
 namespace NekoSharp.Core.Providers.Comix;
 
@@ -13,11 +15,16 @@ public sealed class ComixScraper : IScraper
     public string Name => "Comix";
     public string BaseUrl => "https://comix.to";
 
-    private const string ApiBaseUrl = "https://comix.to/api/v2/";
+    private const string ApiBaseUrl = "https://comix.to/api/v1/";
     private static readonly HashSet<int> OfficialScanlationGroupIds = [9275, 10702];
+    private static readonly Regex RelativeDateRegex = new(
+        "^(?<amount>\\d+)\\s*(?<unit>s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly TimeSpan TokenCaptureTimeout = TimeSpan.FromSeconds(30);
 
     private readonly HttpClient _http;
     private readonly LogService? _log;
+    private readonly CloudflareCredentialStore? _cfStore;
 
     public ComixScraper() : this(null, null) { }
 
@@ -26,6 +33,7 @@ public sealed class ComixScraper : IScraper
     public ComixScraper(LogService? logService, CloudflareCredentialStore? cfStore)
     {
         _log = logService;
+        _cfStore = cfStore;
 
         var inner = new HttpClientHandler
         {
@@ -67,18 +75,11 @@ public sealed class ComixScraper : IScraper
     public async Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
     {
         var parsed = ParseSupportedUrl(url);
-        var result = await GetResultAsync(
-            $"manga/{Uri.EscapeDataString(parsed.HashId)}" +
-            "?includes[]=demographic" +
-            "&includes[]=genre" +
-            "&includes[]=theme" +
-            "&includes[]=author" +
-            "&includes[]=artist" +
-            "&includes[]=publisher",
-            ct);
+        var result = await GetResultAsync($"manga/{Uri.EscapeDataString(parsed.HashId)}", ct);
 
         var title = GetString(result, "title") ?? $"Comix {parsed.HashId}";
         var slug = GetString(result, "slug");
+        var canonicalUrl = GetString(result, "url");
         var coverUrl =
             GetNestedString(result, "poster", "large") ??
             GetNestedString(result, "poster", "medium") ??
@@ -90,7 +91,7 @@ public sealed class ComixScraper : IScraper
             Name = title,
             CoverUrl = coverUrl,
             Description = BuildDescription(result),
-            Url = BuildMangaUrl(parsed.HashId, slug),
+            Url = BuildMangaUrl(parsed.HashId, slug, canonicalUrl),
             SiteName = Name
         };
     }
@@ -98,6 +99,11 @@ public sealed class ComixScraper : IScraper
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
     {
         var parsed = ParseSupportedUrl(url);
+        var mangaUrl = BuildMangaUrl(parsed.HashId, null, $"/title/{parsed.MangaSegment.Trim('/')}");
+        var token = await CaptureTokenAsync(
+            pageUrl: mangaUrl,
+            pathSuffix: $"/api/v1/manga/{parsed.HashId}/chapters",
+            ct);
         const int limit = 100;
         var page = 1;
         var bestById = new Dictionary<int, ComixChapterCandidate>();
@@ -106,7 +112,7 @@ public sealed class ComixScraper : IScraper
         {
             ct.ThrowIfCancellationRequested();
 
-            var result = await GetResultAsync(BuildChapterListRelativeUrl(parsed.HashId, page, limit), ct);
+            var result = await GetResultAsync(BuildChapterListRelativeUrl(parsed.HashId, page, limit, token), ct);
 
             if (!result.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
                 break;
@@ -135,7 +141,7 @@ public sealed class ComixScraper : IScraper
         return chapters;
     }
 
-    public async Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+    public async Task<List<NekoSharp.Core.Models.Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(chapter);
 
@@ -143,20 +149,22 @@ public sealed class ComixScraper : IScraper
         if (parsed.Kind != ComixUrlKind.Chapter || parsed.ChapterId <= 0)
             throw new ArgumentException("Capítulo inválido do Comix. Use uma URL no formato /title/<hash>/<chapterId>.", nameof(chapter));
 
-        var result = await GetResultAsync($"chapters/{parsed.ChapterId}", ct);
-        if (!result.TryGetProperty("images", out var images) || images.ValueKind != JsonValueKind.Array)
+        var token = await CaptureTokenAsync(
+            pageUrl: chapter.Url,
+            pathSuffix: $"/api/v1/chapters/{parsed.ChapterId}",
+            ct);
+        var result = await GetResultAsync(BuildPageListRelativeUrl(parsed.ChapterId, token), ct);
+
+        var imageUrls = ParsePageImageUrls(result);
+        if (imageUrls.Count == 0)
             throw new InvalidOperationException($"Capítulo {parsed.ChapterId} não possui imagens.");
 
-        var pages = new List<Page>();
+        var pages = new List<NekoSharp.Core.Models.Page>();
         var pageNumber = 1;
 
-        foreach (var image in images.EnumerateArray())
+        foreach (var imageUrl in imageUrls)
         {
-            var imageUrl = GetString(image, "url");
-            if (string.IsNullOrWhiteSpace(imageUrl))
-                continue;
-
-            pages.Add(new Page
+            pages.Add(new NekoSharp.Core.Models.Page
             {
                 Number = pageNumber++,
                 ImageUrl = imageUrl,
@@ -211,32 +219,184 @@ public sealed class ComixScraper : IScraper
         return parsed;
     }
 
-    internal static string BuildChapterListRelativeUrl(string hashId, int page, int limit = 100)
+    internal static string BuildChapterListRelativeUrl(string hashId, int page, int limit, string token)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(hashId);
         ArgumentOutOfRangeException.ThrowIfLessThan(page, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
 
         var trimmedHashId = hashId.Trim();
-        const long time = 1;
-        var path = $"/manga/{trimmedHashId}/chapters";
-        var hashToken = ComixHash.GenerateHash(path, 0, time);
-
         return $"manga/{Uri.EscapeDataString(trimmedHashId)}/chapters" +
-               $"?order%5Bnumber%5D=desc&limit={limit}&page={page}&time={time}&_={Uri.EscapeDataString(hashToken)}";
+               $"?order%5Bnumber%5D=desc&limit={limit}&page={page}&_={Uri.EscapeDataString(token)}";
     }
 
-    private static string BuildMangaUrl(string hashId, string? slug)
+    internal static string BuildPageListRelativeUrl(int chapterId, string token)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(chapterId, 1);
+        ArgumentException.ThrowIfNullOrWhiteSpace(token);
+        return $"chapters/{chapterId}?_={Uri.EscapeDataString(token)}";
+    }
+
+    private async Task<string> CaptureTokenAsync(string pageUrl, string pathSuffix, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(pageUrl);
+        ArgumentException.ThrowIfNullOrWhiteSpace(pathSuffix);
+
+        _log?.Debug($"[Comix] Capturing API token from {pageUrl}");
+
+        await using var browser = await LaunchBrowserAsync(ct);
+        await using var page = await browser.NewPageAsync();
+
+        var creds = _cfStore is null ? null : await _cfStore.TryGetAsync("comix.to");
+        var userAgent = creds?.UserAgent;
+        if (string.IsNullOrWhiteSpace(userAgent))
+            userAgent = UserAgentProvider.Default;
+
+        await page.SetUserAgentAsync(userAgent);
+        await ApplyStoredCookiesAsync(page, pageUrl, creds);
+
+        var tokenTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        void OnRequest(object? _, RequestEventArgs e)
+        {
+            if (!Uri.TryCreate(e.Request.Url, UriKind.Absolute, out var requestUri))
+                return;
+
+            if (!requestUri.AbsolutePath.EndsWith(pathSuffix, StringComparison.Ordinal))
+                return;
+
+            var token = ExtractTokenFromUrl(requestUri);
+            if (!string.IsNullOrWhiteSpace(token))
+                tokenTcs.TrySetResult(token);
+        }
+
+        page.Request += OnRequest;
+
+        try
+        {
+            await page.GoToAsync(pageUrl, new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                Timeout = (int)TokenCaptureTimeout.TotalMilliseconds
+            });
+
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var delayTask = Task.Delay(TokenCaptureTimeout, timeoutCts.Token);
+            var completed = await Task.WhenAny(tokenTcs.Task, delayTask);
+            if (completed != tokenTcs.Task)
+                throw new TimeoutException($"Timed out waiting for Comix token for '{pathSuffix}'.");
+
+            timeoutCts.Cancel();
+            return await tokenTcs.Task;
+        }
+        finally
+        {
+            page.Request -= OnRequest;
+        }
+    }
+
+    private static string? ExtractTokenFromUrl(Uri requestUri)
+    {
+        var query = requestUri.Query.TrimStart('?');
+        if (string.IsNullOrWhiteSpace(query))
+            return null;
+
+        foreach (var pair in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var idx = pair.IndexOf('=');
+            var name = idx >= 0 ? pair[..idx] : pair;
+            if (!name.Equals("_", StringComparison.Ordinal))
+                continue;
+
+            var rawValue = idx >= 0 ? pair[(idx + 1)..] : string.Empty;
+            return Uri.UnescapeDataString(rawValue);
+        }
+
+        return null;
+    }
+
+    private static async Task ApplyStoredCookiesAsync(IPage page, string pageUrl, CloudflareCredentials? creds)
+    {
+        if (creds is null || creds.AllCookies.Count == 0)
+            return;
+
+        var pageUri = new Uri(pageUrl);
+        var cookieOrigin = pageUri.GetLeftPart(UriPartial.Authority);
+        var cookies = creds.AllCookies
+            .Where(static kv => !string.IsNullOrWhiteSpace(kv.Key))
+            .Select(kv => new CookieParam
+            {
+                Name = kv.Key,
+                Value = kv.Value,
+                Url = cookieOrigin,
+                Path = "/",
+                Secure = pageUri.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase),
+            })
+            .ToArray();
+
+        if (cookies.Length > 0)
+            await page.SetCookieAsync(cookies);
+    }
+
+    private async Task<IBrowser> LaunchBrowserAsync(CancellationToken ct)
+    {
+        var options = new LaunchOptions
+        {
+            Headless = true,
+            DefaultViewport = null,
+            Args = ["--no-sandbox", "--disable-setuid-sandbox"],
+        };
+
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            return await Puppeteer.LaunchAsync(options);
+        }
+        catch
+        {
+            var fetcher = new BrowserFetcher();
+            var installed = await fetcher.DownloadAsync();
+            options.ExecutablePath = fetcher.GetExecutablePath(installed.BuildId);
+
+            ct.ThrowIfCancellationRequested();
+            return await Puppeteer.LaunchAsync(options);
+        }
+    }
+
+    private static string BuildMangaUrl(string hashId, string? slug, string? canonicalUrl)
+    {
+        if (!string.IsNullOrWhiteSpace(canonicalUrl))
+        {
+            var trimmedCanonicalUrl = canonicalUrl.Trim();
+            if (trimmedCanonicalUrl.StartsWith("/title/", StringComparison.OrdinalIgnoreCase))
+                return $"{BaseUrlStatic}{trimmedCanonicalUrl}";
+        }
+
         var slugPart = string.IsNullOrWhiteSpace(slug)
             ? hashId
             : $"{hashId}-{slug.Trim().Trim('/')}";
 
-        return $"https://comix.to/title/{slugPart}";
+        return $"{BaseUrlStatic}/title/{slugPart}";
     }
 
-    private static string BuildChapterUrl(string mangaSegment, int chapterId)
-        => $"https://comix.to/title/{mangaSegment.Trim('/')}/{chapterId}";
+    private static string BuildChapterUrl(string mangaSegment, int chapterId, string? sourceUrl)
+    {
+        if (!string.IsNullOrWhiteSpace(sourceUrl))
+        {
+            var trimmedSourceUrl = sourceUrl.Trim();
+            if (trimmedSourceUrl.StartsWith("/title/", StringComparison.OrdinalIgnoreCase))
+                return $"{BaseUrlStatic}{trimmedSourceUrl}";
+
+            if (trimmedSourceUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                trimmedSourceUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                return trimmedSourceUrl;
+        }
+
+        return $"{BaseUrlStatic}/title/{mangaSegment.Trim('/')}/{chapterId}";
+    }
+
+    private const string BaseUrlStatic = "https://comix.to";
 
     private static string BuildDescription(JsonElement manga)
     {
@@ -247,6 +407,8 @@ public sealed class ComixScraper : IScraper
             sections.Add(synopsis);
 
         var altTitles = GetStringArray(manga, "alt_titles");
+        if (altTitles.Count == 0)
+            altTitles = GetStringArray(manga, "altTitles");
         if (altTitles.Count > 0)
             sections.Add("Alternative Names:\n" + string.Join('\n', altTitles));
 
@@ -264,31 +426,61 @@ public sealed class ComixScraper : IScraper
         if (!string.IsNullOrWhiteSpace(status))
             metadata.Add($"Status: {status}");
 
-        var authors = GetTermTitles(manga, "author");
+        var authors = GetTermTitles(manga, "authors");
+        if (authors.Count == 0)
+            authors = GetTermTitles(manga, "author");
         if (authors.Count > 0)
             metadata.Add($"Author: {string.Join(", ", authors)}");
 
-        var artists = GetTermTitles(manga, "artist");
+        var artists = GetTermTitles(manga, "artists");
+        if (artists.Count == 0)
+            artists = GetTermTitles(manga, "artist");
         if (artists.Count > 0)
             metadata.Add($"Artist: {string.Join(", ", artists)}");
 
-        var demographics = GetTermTitles(manga, "demographic");
+        var demographics = GetTermTitles(manga, "demographics");
+        if (demographics.Count == 0)
+            demographics = GetTermTitles(manga, "demographic");
         if (demographics.Count > 0)
             metadata.Add($"Demographics: {string.Join(", ", demographics)}");
 
-        var genres = GetTermTitles(manga, "genre");
+        var genres = GetTermTitles(manga, "genres");
+        if (genres.Count == 0)
+            genres = GetTermTitles(manga, "genre");
         if (genres.Count > 0)
             metadata.Add($"Genres: {string.Join(", ", genres)}");
 
-        var themes = GetTermTitles(manga, "theme");
-        if (themes.Count > 0)
-            metadata.Add($"Themes: {string.Join(", ", themes)}");
+        var tags = GetTermTitles(manga, "tags");
+        if (tags.Count == 0)
+            tags = GetTermTitles(manga, "theme");
+        if (tags.Count > 0)
+            metadata.Add($"Tags: {string.Join(", ", tags)}");
 
         var publishers = GetTermTitles(manga, "publisher");
         if (publishers.Count > 0)
             metadata.Add($"Publisher: {string.Join(", ", publishers)}");
 
-        var score = GetDouble(manga, "rated_avg");
+        var contentRating = GetString(manga, "contentRating") ?? GetString(manga, "content_rating");
+        if (!string.IsNullOrWhiteSpace(contentRating))
+            metadata.Add($"Content rating: {FormatLabelValue(contentRating)}");
+
+        var rank = GetInt(manga, "rank");
+        if (rank.HasValue && rank.Value > 0)
+            metadata.Add($"Rank: #{rank.Value}");
+
+        var ratedCount = GetLong(manga, "ratedCount") ?? GetLong(manga, "rated_count");
+        if (ratedCount.HasValue && ratedCount.Value > 0)
+            metadata.Add($"Rated by: {ratedCount.Value}");
+
+        var followsTotal = GetLong(manga, "followsTotal") ?? GetLong(manga, "follows_total");
+        if (followsTotal.HasValue && followsTotal.Value > 0)
+            metadata.Add($"Followed by: {followsTotal.Value}");
+
+        var originalLanguage = GetString(manga, "originalLanguage") ?? GetString(manga, "original_language");
+        if (!string.IsNullOrWhiteSpace(originalLanguage))
+            metadata.Add($"Language: {originalLanguage.Trim().ToUpperInvariant()}");
+
+        var score = GetDouble(manga, "ratedAvg") ?? GetDouble(manga, "rated_avg");
         if (score.HasValue && score.Value > 0)
             metadata.Add($"Score: {score.Value.ToString("0.##", CultureInfo.InvariantCulture)}/10");
 
@@ -299,6 +491,44 @@ public sealed class ComixScraper : IScraper
             sections.Add(string.Join(Environment.NewLine, metadata));
 
         return string.Join(Environment.NewLine + Environment.NewLine, sections);
+    }
+
+    private static List<string> ParsePageImageUrls(JsonElement result)
+    {
+        var pageUrls = new List<string>();
+
+        if (result.TryGetProperty("images", out var legacyImages) && legacyImages.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var image in legacyImages.EnumerateArray())
+            {
+                var imageUrl = GetString(image, "url");
+                if (!string.IsNullOrWhiteSpace(imageUrl))
+                    pageUrls.Add(imageUrl);
+            }
+
+            if (pageUrls.Count > 0)
+                return pageUrls;
+        }
+
+        if (!result.TryGetProperty("pages", out var pages) || pages.ValueKind != JsonValueKind.Object)
+            return pageUrls;
+
+        var baseUrl = (GetString(pages, "baseUrl") ?? string.Empty).TrimEnd('/');
+        if (!pages.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+            return pageUrls;
+
+        foreach (var item in items.EnumerateArray())
+        {
+            var imagePath = GetString(item, "url");
+            if (string.IsNullOrWhiteSpace(imagePath))
+                continue;
+
+            pageUrls.Add(imagePath.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                ? imagePath
+                : $"{baseUrl}/{imagePath.TrimStart('/')}");
+        }
+
+        return pageUrls;
     }
 
     internal static List<Chapter> BuildChapterList(string mangaSegment, IEnumerable<ComixChapterCandidate> candidates)
@@ -319,7 +549,7 @@ public sealed class ComixScraper : IScraper
             {
                 Number = chapter.Number,
                 Title = BuildChapterTitle(chapter, duplicatedVariants.Contains(BuildChapterVariantKey(chapter))),
-                Url = BuildChapterUrl(mangaSegment, chapter.ChapterId)
+                Url = BuildChapterUrl(mangaSegment, chapter.ChapterId, chapter.SourceUrl)
             })
             .ToList();
     }
@@ -389,8 +619,19 @@ public sealed class ComixScraper : IScraper
 
     private static bool HasNextPage(JsonElement result)
     {
-        if (!result.TryGetProperty("pagination", out var pagination) || pagination.ValueKind != JsonValueKind.Object)
+        JsonElement pagination;
+        if (result.TryGetProperty("meta", out var meta) && meta.ValueKind == JsonValueKind.Object)
+        {
+            pagination = meta;
+        }
+        else if (result.TryGetProperty("pagination", out var legacyPagination) && legacyPagination.ValueKind == JsonValueKind.Object)
+        {
+            pagination = legacyPagination;
+        }
+        else
+        {
             return false;
+        }
 
         var page = GetInt(pagination, "current_page") ?? GetInt(pagination, "page") ?? 1;
         var lastPage = GetInt(pagination, "last_page") ?? GetInt(pagination, "lastPage") ?? page;
@@ -400,16 +641,53 @@ public sealed class ComixScraper : IScraper
     private static ComixChapterCandidate ParseChapterCandidate(JsonElement item)
     {
         return new ComixChapterCandidate(
-            ChapterId: GetInt(item, "chapter_id") ?? 0,
+            ChapterId: GetInt(item, "id") ?? GetInt(item, "chapter_id") ?? 0,
             Number: GetDouble(item, "number") ?? 0,
+            SourceUrl: GetString(item, "url") ?? string.Empty,
             Name: GetString(item, "name") ?? string.Empty,
             Votes: GetInt(item, "votes") ?? 0,
-            UpdatedAt: GetLong(item, "updated_at") ?? GetLong(item, "created_at") ?? 0,
-            ScanlationGroupId: GetInt(item, "scanlation_group_id") ?? 0,
-            ScanlationGroupName: GetNestedString(item, "scanlation_group", "name") ?? string.Empty,
-            IsOfficial: GetBooleanishInt(item, "is_official"));
+            UpdatedAt: GetLong(item, "updated_at") ??
+                GetLong(item, "created_at") ??
+                ParseRelativeTimestamp(GetString(item, "createdAtFormatted")),
+            ScanlationGroupId: GetInt(item, "groupId") ?? GetInt(item, "scanlation_group_id") ?? 0,
+            ScanlationGroupName: GetNestedString(item, "group", "name") ??
+                GetNestedString(item, "scanlation_group", "name") ??
+                string.Empty,
+            IsOfficial: GetBooleanishInt(item, "isOfficial") != 0
+                ? 1
+                : GetBooleanishInt(item, "is_official"));
     }
 
+    private static long ParseRelativeTimestamp(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return 0L;
+
+        var match = RelativeDateRegex.Match(value.Trim().ToLowerInvariant().Replace(" ago", string.Empty));
+        if (!match.Success)
+            return 0L;
+
+        var amount = int.TryParse(match.Groups["amount"].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedAmount)
+            ? parsedAmount
+            : 0;
+        if (amount <= 0)
+            return 0L;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var adjusted = match.Groups["unit"].Value switch
+        {
+            "s" or "sec" or "secs" => utcNow.AddSeconds(-amount),
+            "m" or "min" or "mins" => utcNow.AddMinutes(-amount),
+            "h" or "hr" or "hrs" => utcNow.AddHours(-amount),
+            "d" or "day" or "days" => utcNow.AddDays(-amount),
+            "w" or "week" or "weeks" => utcNow.AddDays(-7 * amount),
+            "mo" or "mos" or "month" or "months" => utcNow.AddMonths(-amount),
+            "y" or "yr" or "yrs" or "year" or "years" => utcNow.AddYears(-amount),
+            _ => utcNow
+        };
+
+        return adjusted.ToUnixTimeSeconds();
+    }
     private static string ExtractApiMessage(JsonElement root)
     {
         if (root.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String)
@@ -574,9 +852,16 @@ public sealed class ComixScraper : IScraper
         };
     }
 
+    private static string FormatLabelValue(string value)
+    {
+        var normalized = value.Trim().Replace('_', ' ');
+        return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(normalized);
+    }
+
     internal readonly record struct ComixChapterCandidate(
         int ChapterId,
         double Number,
+        string SourceUrl,
         string Name,
         int Votes,
         long UpdatedAt,

@@ -14,24 +14,27 @@ public class ScraperManager
     public void DiscoverAndRegisterAll(
         LogService? logService = null,
         CloudflareCredentialStore? cfStore = null,
+        ISettingsStore? settingsStore = null,
         IEnumerable<string>? externalAssemblyPaths = null)
     {
         DiscoverAndRegisterFromAssembly(
             typeof(ScraperManager).Assembly,
             logService,
             cfStore,
+            settingsStore,
             allowReplaceExisting: false,
             sourceLabel: "interno");
 
         if (externalAssemblyPaths is null)
             return;
 
-        DiscoverAndRegisterExternal(logService, cfStore, externalAssemblyPaths);
+        DiscoverAndRegisterExternal(logService, cfStore, settingsStore, externalAssemblyPaths);
     }
 
     public void DiscoverAndRegisterExternal(
         LogService? logService = null,
         CloudflareCredentialStore? cfStore = null,
+        ISettingsStore? settingsStore = null,
         IEnumerable<string>? externalAssemblyPaths = null)
     {
         if (externalAssemblyPaths is null)
@@ -41,11 +44,15 @@ public class ScraperManager
                      .Where(static p => !string.IsNullOrWhiteSpace(p))
                      .Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            DiscoverAndRegisterFromAssemblyPath(path, logService, cfStore);
+            DiscoverAndRegisterFromAssemblyPath(path, logService, cfStore, settingsStore);
         }
     }
 
-    private void DiscoverAndRegisterFromAssemblyPath(string assemblyPath, LogService? logService, CloudflareCredentialStore? cfStore)
+    private void DiscoverAndRegisterFromAssemblyPath(
+        string assemblyPath,
+        LogService? logService,
+        CloudflareCredentialStore? cfStore,
+        ISettingsStore? settingsStore)
     {
         var fullPath = Path.GetFullPath(assemblyPath);
         if (!File.Exists(fullPath))
@@ -61,6 +68,7 @@ public class ScraperManager
                 assembly,
                 logService,
                 cfStore,
+                settingsStore,
                 allowReplaceExisting: true,
                 sourceLabel: Path.GetFileName(fullPath));
         }
@@ -74,6 +82,7 @@ public class ScraperManager
         Assembly assembly,
         LogService? logService,
         CloudflareCredentialStore? cfStore,
+        ISettingsStore? settingsStore,
         bool allowReplaceExisting,
         string sourceLabel)
     {
@@ -99,7 +108,7 @@ public class ScraperManager
         {
             try
             {
-                var scraper = CreateScraperInstance(type, logService, cfStore);
+                var scraper = CreateScraperInstance(type, logService, cfStore, settingsStore);
                 if (scraper is null)
                     continue;
 
@@ -122,15 +131,31 @@ public class ScraperManager
         }
     }
 
-    private static IScraper? CreateScraperInstance(Type type, LogService? logService, CloudflareCredentialStore? cfStore)
+    private static IScraper? CreateScraperInstance(
+        Type type,
+        LogService? logService,
+        CloudflareCredentialStore? cfStore,
+        ISettingsStore? settingsStore)
     {
+        var ctorFullWithSettings = type.GetConstructor([typeof(LogService), typeof(CloudflareCredentialStore), typeof(ISettingsStore)]);
+        if (ctorFullWithSettings is not null)
+            return Activator.CreateInstance(type, logService, cfStore, settingsStore) as IScraper;
+
         var ctorFull = type.GetConstructor([typeof(LogService), typeof(CloudflareCredentialStore)]);
         if (ctorFull is not null)
             return Activator.CreateInstance(type, logService, cfStore) as IScraper;
 
+        var ctorLogWithSettings = type.GetConstructor([typeof(LogService), typeof(ISettingsStore)]);
+        if (ctorLogWithSettings is not null)
+            return Activator.CreateInstance(type, logService, settingsStore) as IScraper;
+
         var ctorWithLog = type.GetConstructor([typeof(LogService)]);
         if (ctorWithLog is not null)
             return Activator.CreateInstance(type, logService) as IScraper;
+
+        var ctorWithSettings = type.GetConstructor([typeof(ISettingsStore)]);
+        if (ctorWithSettings is not null)
+            return Activator.CreateInstance(type, settingsStore) as IScraper;
 
         return Activator.CreateInstance(type) as IScraper;
     }

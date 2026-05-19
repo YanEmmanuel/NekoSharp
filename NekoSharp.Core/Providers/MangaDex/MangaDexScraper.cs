@@ -16,11 +16,16 @@ public sealed class MangaDexScraper : IScraper
     public string ApiUrl => "https://api.mangadex.org";
 
     private readonly HttpClient _http;
+    private readonly ISettingsStore? _settingsStore;
 
-    public MangaDexScraper() : this(null) { }
+    public MangaDexScraper() : this(null, null) { }
 
-    public MangaDexScraper(LogService? logService)
+    public MangaDexScraper(LogService? logService) : this(logService, null) { }
+
+    public MangaDexScraper(LogService? logService, ISettingsStore? settingsStore)
     {
+        _settingsStore = settingsStore;
+
         HttpMessageHandler handler = logService != null
             ? new LoggingHttpHandler(logService, new HttpClientHandler())
             : new HttpClientHandler();
@@ -82,6 +87,8 @@ public sealed class MangaDexScraper : IScraper
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
     {
         var mangaId = ExtractMangaId(url);
+        var chapterLanguage = await GetPreferredChapterLanguageAsync();
+        var translatedLanguageQuery = BuildTranslatedLanguageQuery(chapterLanguage);
         var chapters = new List<Chapter>();
         var offset = 0;
         const int limit = 100;
@@ -89,7 +96,7 @@ public sealed class MangaDexScraper : IScraper
         while (true)
         {
             var response = await _http.GetFromJsonAsync<JsonElement>(
-                $"{ApiUrl}/manga/{mangaId}/feed?translatedLanguage[]=pt-br" +
+                $"{ApiUrl}/manga/{mangaId}/feed?{translatedLanguageQuery}" +
                          $"&limit={limit}" +
                          $"&includes[]=scanlation_group" +
                          $"&includes[]=user" +
@@ -117,7 +124,9 @@ public sealed class MangaDexScraper : IScraper
                         
                 chapters.Add(new Chapter
                 {
-                    Title = string.IsNullOrEmpty(chapterTitle) ? $"Capítulo {chapterNum}" : chapterTitle,
+                    Title = string.IsNullOrEmpty(chapterTitle)
+                        ? BuildFallbackChapterTitle(chapterNum, chapterLanguage)
+                        : chapterTitle,
                     Number = num,
                     Url = $"{ApiUrl}/at-home/server/{chapterId}"
                 });
@@ -215,5 +224,37 @@ public sealed class MangaDexScraper : IScraper
         }
 
         return string.Empty;
+    }
+
+    private async Task<MangaDexChapterLanguage> GetPreferredChapterLanguageAsync()
+    {
+        if (_settingsStore is null)
+            return MangaDexChapterLanguage.Portuguese;
+
+        return await _settingsStore.GetEnumAsync(
+            MangaDexSettings.ChapterLanguageKey,
+            MangaDexChapterLanguage.Portuguese);
+    }
+
+    private static string BuildTranslatedLanguageQuery(MangaDexChapterLanguage chapterLanguage)
+    {
+        return chapterLanguage switch
+        {
+            MangaDexChapterLanguage.English => "translatedLanguage[]=en",
+            _ => "translatedLanguage[]=pt-br&translatedLanguage[]=pt",
+        };
+    }
+
+    private static string BuildFallbackChapterTitle(string? chapterNumber, MangaDexChapterLanguage chapterLanguage)
+    {
+        var normalizedNumber = string.IsNullOrWhiteSpace(chapterNumber)
+            ? "?"
+            : chapterNumber.Trim();
+
+        return chapterLanguage switch
+        {
+            MangaDexChapterLanguage.English => $"Chapter {normalizedNumber}",
+            _ => $"Capítulo {normalizedNumber}",
+        };
     }
 }

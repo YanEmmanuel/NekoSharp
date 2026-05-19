@@ -530,6 +530,16 @@ public class CloudflareHandler : DelegatingHandler
                 };
 
                 var htmlContent = solvedHtmlContent ?? string.Empty;
+                string? finalUrl;
+                try
+                {
+                    finalUrl = page.Url;
+                }
+                catch (Exception ex)
+                {
+                    _log?.Debug($"[Cloudflare] Failed to capture final page URL before closing browser: {ex.Message}");
+                    finalUrl = targetUrl;
+                }
 
                 BrowserTransportSessions.AddOrUpdate(
                     host,
@@ -556,7 +566,7 @@ public class CloudflareHandler : DelegatingHandler
                 {
                     Credentials = creds,
                     HtmlContent = htmlContent,
-                    FinalUrl = page.Url,
+                    FinalUrl = finalUrl,
                 };
             }
             finally
