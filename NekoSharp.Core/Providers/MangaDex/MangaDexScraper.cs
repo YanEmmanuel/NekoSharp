@@ -140,7 +140,8 @@ public sealed class MangaDexScraper : IScraper
 
     public async Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
     {
-        var response = await _http.GetFromJsonAsync<JsonElement>(chapter.Url, ct);
+        var atHomeRequestUrl = BuildAtHomeRequestUrl(chapter.Url);
+        var response = await _http.GetFromJsonAsync<JsonElement>(atHomeRequestUrl, ct);
                 
         var baseUrl = response.GetProperty("baseUrl").GetString()!;
         var chapterData = response.GetProperty("chapter");
@@ -156,7 +157,8 @@ public sealed class MangaDexScraper : IScraper
             pages.Add(new Page
             {
                 Number = pageNum++,
-                ImageUrl = $"{baseUrl}/data/{hash}/{fileName}"
+                ImageUrl = $"{baseUrl}/data/{hash}/{fileName}",
+                RefererUrl = atHomeRequestUrl
             });
         }
                 
@@ -256,5 +258,24 @@ public sealed class MangaDexScraper : IScraper
             MangaDexChapterLanguage.English => $"Chapter {normalizedNumber}",
             _ => $"Capítulo {normalizedNumber}",
         };
+    }
+
+    private static string BuildAtHomeRequestUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return url;
+
+        if (!uri.Host.Equals("api.mangadex.org", StringComparison.OrdinalIgnoreCase) ||
+            !uri.AbsolutePath.StartsWith("/at-home/server/", StringComparison.OrdinalIgnoreCase))
+        {
+            return url;
+        }
+
+        var query = uri.Query.AsSpan().TrimStart('?');
+        if (query.Contains("forcePort443=true", StringComparison.OrdinalIgnoreCase))
+            return url;
+
+        var separator = string.IsNullOrEmpty(uri.Query) ? "?" : "&";
+        return $"{url}{separator}forcePort443=true";
     }
 }

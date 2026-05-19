@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Net;
+using System.Text.Json;
 using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Models;
 using SixLabors.ImageSharp;
@@ -339,21 +340,22 @@ public class DownloadService : IDownloadService
     private async Task DownloadFileWithRetryAsync(string url, string filePath, string referer, CancellationToken ct)
     {
         Exception? lastTransientException = null;
-        var host = GetHost(url);
-        var hostThrottle = _hostThrottles.GetOrAdd(host, static _ => new HostThrottleState());
+        var currentUrl = url;
 
         for (int attempt = 0; attempt <= _retryDelays.Length; attempt++)
         {
             var isLastAttempt = attempt == _retryDelays.Length;
             var attemptNumber = attempt + 1;
             var timeout = GetAttemptTimeout(attempt);
+            var host = GetHost(currentUrl);
+            var hostThrottle = _hostThrottles.GetOrAdd(host, static _ => new HostThrottleState());
 
             try
             {
                 await hostThrottle.WaitBeforeAttemptAsync(ct);
                 await using var _ = await AcquireDownloadSlotAsync(ct);
 
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
+                using var request = new HttpRequestMessage(HttpMethod.Get, currentUrl);
                 if (Uri.TryCreate(referer, UriKind.Absolute, out var refererUri))
                     request.Headers.Referrer = refererUri;
                 else
@@ -371,7 +373,7 @@ public class DownloadService : IDownloadService
 
                 if (!response.IsSuccessStatusCode && IsTransientStatusCode(response.StatusCode) && !isLastAttempt)
                     throw new HttpRequestException(
-                        $"Servidor retornou {(int)response.StatusCode} ({response.StatusCode}) para {url}.",
+                        $"Servidor retornou {(int)response.StatusCode} ({response.StatusCode}) para {currentUrl}.",
                         inner: null,
                         response.StatusCode);
 
@@ -387,29 +389,31 @@ public class DownloadService : IDownloadService
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
             {
                 lastTransientException = new TimeoutException(
-                    $"Tempo esgotado ao baixar {url} na tentativa {attemptNumber}.",
+                    $"Tempo esgotado ao baixar {currentUrl} na tentativa {attemptNumber}.",
                     ex);
 
+                currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
                 var cooldown = hostThrottle.ReportFailure(timeoutLike: true);
                 if (isLastAttempt)
                     break;
 
-                await DelayBeforeRetryAsync(url, attemptNumber, cooldown, timeout, ct);
+                await DelayBeforeRetryAsync(currentUrl, attemptNumber, cooldown, timeout, ct);
             }
             catch (Exception ex) when (!isLastAttempt && IsTransientDownloadException(ex))
             {
                 lastTransientException = ex;
+                currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
 
                 var timeoutLike = ex is TimeoutException ||
                                   ex is TaskCanceledException ||
                                   ex is HttpRequestException hre && hre.StatusCode == HttpStatusCode.RequestTimeout;
 
                 var cooldown = hostThrottle.ReportFailure(timeoutLike);
-                await DelayBeforeRetryAsync(url, attemptNumber, cooldown, timeout, ct);
+                await DelayBeforeRetryAsync(currentUrl, attemptNumber, cooldown, timeout, ct);
             }
         }
 
-        throw BuildFinalDownloadException(url, lastTransientException);
+        throw BuildFinalDownloadException(currentUrl, lastTransientException);
     }
 
     private async Task DelayBeforeRetryAsync(
@@ -518,6 +522,81 @@ public class DownloadService : IDownloadService
         {
             return "host-desconhecido";
         }
+    }
+
+    private async Task<string> TryRefreshTransientDownloadUrlAsync(string currentUrl, string referer, CancellationToken ct)
+    {
+        if (!TryParseMangaDexAtHomeReferer(referer, out var atHomeUri))
+            return currentUrl;
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, EnsureMangaDexForcePort443(atHomeUri));
+            request.Headers.Add("Accept", "application/json");
+
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            response.EnsureSuccessStatusCode();
+
+            await using var contentStream = await response.Content.ReadAsStreamAsync(ct);
+            using var document = await JsonDocument.ParseAsync(contentStream, cancellationToken: ct);
+
+            var root = document.RootElement;
+            var baseUrl = root.GetProperty("baseUrl").GetString();
+            var chapter = root.GetProperty("chapter");
+            var hash = chapter.GetProperty("hash").GetString();
+            if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(hash))
+                return currentUrl;
+
+            if (!Uri.TryCreate(currentUrl, UriKind.Absolute, out var currentUri))
+                return currentUrl;
+
+            var segments = currentUri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 3)
+                return currentUrl;
+
+            var modeSegment = string.Equals(segments[0], "data-saver", StringComparison.OrdinalIgnoreCase)
+                ? "data-saver"
+                : "data";
+            var fileName = segments[^1];
+            var refreshedUrl = $"{baseUrl.TrimEnd('/')}/{modeSegment}/{hash}/{fileName}";
+
+            if (!string.Equals(refreshedUrl, currentUrl, StringComparison.OrdinalIgnoreCase))
+                _log?.Debug($"[Download] MangaDex atualizou URL da página para novo host: {GetHost(currentUrl)} -> {GetHost(refreshedUrl)}");
+
+            return refreshedUrl;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return currentUrl;
+        }
+        catch (Exception ex)
+        {
+            _log?.Debug($"[Download] Falha ao renovar URL do MangaDex para retry: {ex.Message}");
+            return currentUrl;
+        }
+    }
+
+    private static bool TryParseMangaDexAtHomeReferer(string referer, out Uri atHomeUri)
+    {
+        if (Uri.TryCreate(referer, UriKind.Absolute, out atHomeUri!) &&
+            atHomeUri.Host.Equals("api.mangadex.org", StringComparison.OrdinalIgnoreCase) &&
+            atHomeUri.AbsolutePath.StartsWith("/at-home/server/", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        atHomeUri = null!;
+        return false;
+    }
+
+    private static Uri EnsureMangaDexForcePort443(Uri atHomeUri)
+    {
+        var query = atHomeUri.Query.AsSpan().TrimStart('?');
+        if (query.Contains("forcePort443=true", StringComparison.OrdinalIgnoreCase))
+            return atHomeUri;
+
+        var separator = string.IsNullOrEmpty(atHomeUri.Query) ? "?" : "&";
+        return new Uri($"{atHomeUri}{separator}forcePort443=true");
     }
 
     private static Exception BuildFinalDownloadException(string url, Exception? lastTransientException)

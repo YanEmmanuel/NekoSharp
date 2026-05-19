@@ -87,6 +87,85 @@ public class DownloadServiceTests
         }
     }
 
+    [Fact]
+    public async Task DownloadChapterAsync_WhenMangaDexImageHostFails_RefreshesAtHomeUrlForRetry()
+    {
+        const string staleImageUrl = "https://old-cdn.mangadex.network/data/oldhash/001.png";
+        const string refreshedImageUrl = "https://new-cdn.mangadex.network/data/newhash/001.png";
+        const string atHomeUrl = "https://api.mangadex.org/at-home/server/chapter-id?forcePort443=true";
+
+        var handler = new TrackingHttpMessageHandler((request, attempt, cancellationToken) =>
+        {
+            var url = request.RequestUri?.ToString();
+            if (string.Equals(url, staleImageUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new HttpRequestException("cdn indisponível", null, HttpStatusCode.GatewayTimeout);
+            }
+
+            if (string.Equals(url, atHomeUrl, StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""
+                        {
+                          "baseUrl": "https://new-cdn.mangadex.network",
+                          "chapter": {
+                            "hash": "newhash"
+                          }
+                        }
+                        """)
+                });
+            }
+
+            if (string.Equals(url, refreshedImageUrl, StringComparison.OrdinalIgnoreCase))
+                return Task.FromResult(CreateImageResponse());
+
+            throw new InvalidOperationException($"URL inesperada no teste: {url}");
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var service = CreateService(
+            httpClient,
+            attemptTimeouts: [TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200)],
+            retryDelays: [TimeSpan.FromMilliseconds(15)]);
+
+        var manga = CreateManga();
+        var chapter = new Chapter
+        {
+            Number = 1,
+            Title = "Capítulo 1",
+            Url = atHomeUrl,
+            Pages =
+            [
+                new Page
+                {
+                    Number = 1,
+                    ImageUrl = staleImageUrl,
+                    RefererUrl = atHomeUrl
+                }
+            ]
+        };
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+
+            Assert.Equal(1, handler.GetAttempts(staleImageUrl));
+            Assert.Equal(1, handler.GetAttempts(atHomeUrl));
+            Assert.Equal(1, handler.GetAttempts(refreshedImageUrl));
+            Assert.True(File.Exists(chapter.Pages[0].LocalPath));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
     private static DownloadService CreateService(
         HttpClient httpClient,
         TimeSpan[]? attemptTimeouts = null,
