@@ -310,6 +310,39 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         return (html, hasMore, newOffset);
     }
 
+    internal static string MergeCookieHeader(
+        string? existingHeader,
+        IReadOnlyDictionary<string, string> incomingCookies)
+    {
+        var merged = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        if (!string.IsNullOrWhiteSpace(existingHeader))
+        {
+            foreach (var segment in existingHeader.Split(
+                         ';',
+                         StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var separatorIndex = segment.IndexOf('=');
+                if (separatorIndex <= 0)
+                    continue;
+
+                var name = segment[..separatorIndex].Trim();
+                if (string.IsNullOrWhiteSpace(name))
+                    continue;
+
+                merged[name] = segment[(separatorIndex + 1)..].Trim();
+            }
+        }
+
+        foreach (var cookie in incomingCookies)
+        {
+            if (!string.IsNullOrWhiteSpace(cookie.Key))
+                merged[cookie.Key.Trim()] = cookie.Value ?? string.Empty;
+        }
+
+        return string.Join("; ", merged.Select(static cookie => $"{cookie.Key}={cookie.Value}"));
+    }
+
     private static string DecodeBase64Url(string encoded)
     {
         return Encoding.UTF8.GetString(Convert.FromBase64String(encoded)).Trim();
@@ -740,7 +773,7 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             var existingCookies = request.Headers.TryGetValues("Cookie", out var values)
                 ? string.Join("; ", values)
                 : null;
-            var cookieHeader = CloudflareHandler.MergeCookieHeader(existingCookies, cookies);
+            var cookieHeader = MergeCookieHeader(existingCookies, cookies);
 
             request.Headers.Remove("Cookie");
             request.Headers.TryAddWithoutValidation("Cookie", cookieHeader);

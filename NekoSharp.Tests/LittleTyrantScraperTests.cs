@@ -1,5 +1,4 @@
 using NekoSharp.Core.Providers.LittleTyrant;
-using NekoSharp.Core.Services;
 using Xunit;
 
 namespace NekoSharp.Tests;
@@ -53,7 +52,7 @@ public sealed class LittleTyrantScraperTests
     [Fact]
     public void MergeCookieHeader_PreservesExistingProviderCookies()
     {
-        var merged = CloudflareHandler.MergeCookieHeader(
+        var merged = LittleTyrantScraper.MergeCookieHeader(
             "wordpress_logged_in_hash=abc123; wordpress_sec_hash=def456",
             new Dictionary<string, string>
             {
@@ -70,14 +69,17 @@ public sealed class LittleTyrantScraperTests
     [Fact]
     public void MergeCookieHeader_OverridesDuplicateNamesWithIncomingCookies()
     {
-        var merged = CloudflareHandler.MergeCookieHeader(
+        var merged = LittleTyrantScraper.MergeCookieHeader(
             "cf_clearance=old; wordpress_logged_in_hash=abc123",
             new Dictionary<string, string>
             {
                 ["cf_clearance"] = "new",
             });
 
-        var parsed = CloudflareHandler.ParseCookieHeader(merged);
+        var parsed = merged
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(segment => segment.Split('=', 2))
+            .ToDictionary(parts => parts[0], parts => parts[1], StringComparer.Ordinal);
         Assert.Equal("new", parsed["cf_clearance"]);
         Assert.Equal("abc123", parsed["wordpress_logged_in_hash"]);
     }
