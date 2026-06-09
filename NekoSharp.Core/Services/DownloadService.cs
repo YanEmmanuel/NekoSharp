@@ -25,10 +25,13 @@ public class DownloadService : IDownloadService
     private readonly TimeSpan[] _attemptTimeouts;
     private readonly TimeSpan[] _retryDelays;
     private readonly ConcurrentDictionary<string, HostThrottleState> _hostThrottles = new(StringComparer.OrdinalIgnoreCase);
+    private readonly TransientFailureGate _transientFailureGate = new();
     private readonly SemaphoreSlim _downloadSlotSignal = new(0);
     private int _waitingDownloadSlots;
     private int _activeDownloads;
     private int _maxConcurrentDownloads = 4;
+    private int _adaptiveMaxConcurrentDownloads = int.MaxValue;
+    private int _successfulDownloadsSinceThrottle;
 
     private static readonly TimeSpan[] DefaultAttemptTimeouts = [
         TimeSpan.FromSeconds(15),
@@ -118,7 +121,11 @@ public class DownloadService : IDownloadService
 
         if (chapter.Pages.Count == 0)
         {
-            chapter.Pages = await scraper.GetPagesAsync(chapter, ct);
+            chapter.Pages = await ExecuteProviderOperationWithRetryAsync(
+                () => scraper.GetPagesAsync(chapter, ct),
+                scraper.Name,
+                "carregar páginas do capítulo",
+                ct);
         }
 
         var mangaDir = DownloadPaths.GetMangaDirectory(outputDirectory, manga);
@@ -161,6 +168,13 @@ public class DownloadService : IDownloadService
                 
             var fileName = $"{page.Number:D3}{targetExtension}";
             var filePath = Path.Combine(tempDir, fileName);
+
+            if (File.Exists(filePath) && new FileInfo(filePath).Length > 0)
+            {
+                page.LocalPath = filePath;
+                ReportPageCompleted();
+                return;
+            }
 
             bool needsConversion = targetStartFormat != ImageFormat.Original &&
                                    !string.Equals(originalExtension, targetExtension, StringComparison.OrdinalIgnoreCase) && 
@@ -205,13 +219,17 @@ public class DownloadService : IDownloadService
             }
                 
             page.LocalPath = filePath;
+            ReportPageCompleted();
 
-            var completed = Interlocked.Increment(ref completedPages);
-            progress?.Report(new DownloadProgress
+            void ReportPageCompleted()
             {
-                CurrentPage = completed,
-                TotalPages = totalPages
-            });
+                var completed = Interlocked.Increment(ref completedPages);
+                progress?.Report(new DownloadProgress
+                {
+                    CurrentPage = completed,
+                    TotalPages = totalPages
+                });
+            }
         });
 
         await Task.WhenAll(tasks);
@@ -354,21 +372,24 @@ public class DownloadService : IDownloadService
         IScraper scraper,
         CancellationToken ct)
     {
-        Exception? lastTransientException = null;
         var currentUrl = url;
+        var attempt = 0;
 
-        for (int attempt = 0; attempt <= _retryDelays.Length; attempt++)
+        while (true)
         {
-            var isLastAttempt = attempt == _retryDelays.Length;
             var attemptNumber = attempt + 1;
             var timeout = GetAttemptTimeout(attempt);
             var host = GetHost(currentUrl);
             var hostThrottle = _hostThrottles.GetOrAdd(host, static _ => new HostThrottleState());
+            var partialFilePath = filePath + ".part";
 
             try
             {
+                await _transientFailureGate.WaitBeforeAttemptAsync(ct);
                 await hostThrottle.WaitBeforeAttemptAsync(ct);
                 await using var _ = await AcquireDownloadSlotAsync(ct);
+                await _transientFailureGate.WaitBeforeAttemptAsync(ct);
+                await hostThrottle.WaitBeforeAttemptAsync(ct);
 
                 using var request = new HttpRequestMessage(HttpMethod.Get, currentUrl);
                 if (Uri.TryCreate(referer, UriKind.Absolute, out var refererUri))
@@ -389,7 +410,7 @@ public class DownloadService : IDownloadService
                     HttpCompletionOption.ResponseHeadersRead,
                     timeoutCts.Token);
 
-                if (!response.IsSuccessStatusCode && IsTransientStatusCode(response.StatusCode) && !isLastAttempt)
+                if (!response.IsSuccessStatusCode && IsTransientStatusCode(response.StatusCode))
                     throw new HttpRequestException(
                         $"Servidor retornou {(int)response.StatusCode} ({response.StatusCode}) para {currentUrl}.",
                         inner: null,
@@ -397,29 +418,39 @@ public class DownloadService : IDownloadService
 
                 response.EnsureSuccessStatusCode();
 
+                TryDeleteFile(partialFilePath);
                 await using var contentStream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
-                await using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192, true);
-                await contentStream.CopyToAsync(fileStream, timeoutCts.Token);
+                await using (var fileStream = new FileStream(
+                                 partialFilePath,
+                                 FileMode.Create,
+                                 FileAccess.Write,
+                                 FileShare.None,
+                                 8192,
+                                 true))
+                {
+                    await contentStream.CopyToAsync(fileStream, timeoutCts.Token);
+                }
+
+                File.Move(partialFilePath, filePath, overwrite: true);
 
                 hostThrottle.ReportSuccess();
+                ReportDownloadSuccess();
                 return;
             }
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
             {
-                lastTransientException = new TimeoutException(
+                TryDeleteFile(partialFilePath);
+                var timeoutException = new TimeoutException(
                     $"Tempo esgotado ao baixar {currentUrl} na tentativa {attemptNumber}.",
                     ex);
 
                 currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
                 var cooldown = hostThrottle.ReportFailure(timeoutLike: true);
-                if (isLastAttempt)
-                    break;
-
-                await DelayBeforeRetryAsync(currentUrl, attemptNumber, cooldown, timeout, ct);
+                await PauseAndRetryAsync(currentUrl, attemptNumber, cooldown, timeout, timeoutException, ct);
             }
-            catch (Exception ex) when (!isLastAttempt && IsTransientDownloadException(ex))
+            catch (Exception ex) when (IsTransientDownloadException(ex))
             {
-                lastTransientException = ex;
+                TryDeleteFile(partialFilePath);
                 currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
 
                 var timeoutLike = ex is TimeoutException ||
@@ -427,27 +458,88 @@ public class DownloadService : IDownloadService
                                   ex is HttpRequestException hre && hre.StatusCode == HttpStatusCode.RequestTimeout;
 
                 var cooldown = hostThrottle.ReportFailure(timeoutLike);
-                await DelayBeforeRetryAsync(currentUrl, attemptNumber, cooldown, timeout, ct);
+                await PauseAndRetryAsync(currentUrl, attemptNumber, cooldown, timeout, ex, ct);
             }
-        }
+            catch
+            {
+                TryDeleteFile(partialFilePath);
+                throw;
+            }
 
-        throw BuildFinalDownloadException(currentUrl, lastTransientException);
+            attempt++;
+        }
     }
 
-    private async Task DelayBeforeRetryAsync(
+    private async Task PauseAndRetryAsync(
         string url,
         int attemptNumber,
         TimeSpan hostCooldown,
         TimeSpan timeout,
+        Exception exception,
         CancellationToken ct)
     {
         var retryDelay = GetRetryDelay(attemptNumber - 1);
         var waitTime = retryDelay > hostCooldown ? retryDelay : hostCooldown;
+        _transientFailureGate.Pause(waitTime);
+        ReduceAdaptiveConcurrency();
 
-        _log?.Debug(
-            $"[Download] Retry {attemptNumber} agendado para {GetHost(url)} em {waitTime.TotalMilliseconds:0}ms (timeout {timeout.TotalSeconds:0}s).");
+        _log?.Warn(
+            $"[Download] Falha transitória em {GetHost(url)}: {exception.Message} " +
+            $"Pausando downloads por {waitTime.TotalSeconds:0.##}s antes da tentativa {attemptNumber + 1} " +
+            $"(timeout atual {timeout.TotalSeconds:0}s, concorrência {GetEffectiveMaxConcurrentDownloads()}).");
 
-        await Task.Delay(waitTime, ct);
+        await _transientFailureGate.WaitBeforeAttemptAsync(ct);
+    }
+
+    private async Task<T> ExecuteProviderOperationWithRetryAsync<T>(
+        Func<Task<T>> operation,
+        string providerName,
+        string operationName,
+        CancellationToken ct)
+    {
+        var attempt = 0;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            await _transientFailureGate.WaitBeforeAttemptAsync(ct);
+
+            try
+            {
+                return await operation();
+            }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                var timeout = new TimeoutException(
+                    $"Tempo esgotado ao {operationName} no provider {providerName}.",
+                    ex);
+                await PauseProviderOperationAsync(providerName, operationName, attempt, timeout, ct);
+            }
+            catch (Exception ex) when (IsTransientDownloadException(ex))
+            {
+                await PauseProviderOperationAsync(providerName, operationName, attempt, ex, ct);
+            }
+
+            attempt++;
+        }
+    }
+
+    private async Task PauseProviderOperationAsync(
+        string providerName,
+        string operationName,
+        int attempt,
+        Exception exception,
+        CancellationToken ct)
+    {
+        var waitTime = GetRetryDelay(attempt);
+        _transientFailureGate.Pause(waitTime);
+        ReduceAdaptiveConcurrency();
+
+        _log?.Warn(
+            $"[Download] Provider {providerName} falhou ao {operationName}: {exception.Message} " +
+            $"Nova tentativa em {waitTime.TotalSeconds:0.##}s.");
+
+        await _transientFailureGate.WaitBeforeAttemptAsync(ct);
     }
 
     private async ValueTask<DownloadSlotLease> AcquireDownloadSlotAsync(CancellationToken ct)
@@ -479,7 +571,7 @@ public class DownloadService : IDownloadService
         while (true)
         {
             var active = Volatile.Read(ref _activeDownloads);
-            var limit = MaxConcurrentDownloads;
+            var limit = GetEffectiveMaxConcurrentDownloads();
             if (active >= limit)
                 return false;
 
@@ -494,6 +586,66 @@ public class DownloadService : IDownloadService
 
         if (Volatile.Read(ref _waitingDownloadSlots) > 0)
             _downloadSlotSignal.Release();
+    }
+
+    private int GetEffectiveMaxConcurrentDownloads()
+    {
+        var configured = MaxConcurrentDownloads;
+        var adaptive = Volatile.Read(ref _adaptiveMaxConcurrentDownloads);
+        return adaptive == int.MaxValue ? configured : Math.Min(configured, adaptive);
+    }
+
+    private void ReduceAdaptiveConcurrency()
+    {
+        while (true)
+        {
+            var configured = MaxConcurrentDownloads;
+            var current = Volatile.Read(ref _adaptiveMaxConcurrentDownloads);
+            var effective = current == int.MaxValue ? configured : Math.Min(configured, current);
+            var reduced = Math.Max(1, effective / 2);
+
+            if (reduced >= effective)
+                break;
+
+            if (Interlocked.CompareExchange(ref _adaptiveMaxConcurrentDownloads, reduced, current) == current)
+                break;
+        }
+
+        Interlocked.Exchange(ref _successfulDownloadsSinceThrottle, 0);
+    }
+
+    private void ReportDownloadSuccess()
+    {
+        var current = Volatile.Read(ref _adaptiveMaxConcurrentDownloads);
+        if (current == int.MaxValue)
+            return;
+
+        var requiredSuccesses = Math.Max(4, current * 4);
+        if (Interlocked.Increment(ref _successfulDownloadsSinceThrottle) < requiredSuccesses)
+            return;
+
+        Interlocked.Exchange(ref _successfulDownloadsSinceThrottle, 0);
+
+        while (true)
+        {
+            current = Volatile.Read(ref _adaptiveMaxConcurrentDownloads);
+            if (current == int.MaxValue)
+                return;
+
+            var configured = MaxConcurrentDownloads;
+            var increased = current + 1;
+            var replacement = increased >= configured ? int.MaxValue : increased;
+            if (Interlocked.CompareExchange(ref _adaptiveMaxConcurrentDownloads, replacement, current) != current)
+                continue;
+
+            var waiting = Volatile.Read(ref _waitingDownloadSlots);
+            if (waiting > 0)
+                _downloadSlotSignal.Release(Math.Min(waiting, GetEffectiveMaxConcurrentDownloads()));
+
+            _log?.Debug(
+                $"[Download] Concorrência recuperada para {GetEffectiveMaxConcurrentDownloads()} após downloads estáveis.");
+            return;
+        }
     }
 
     private TimeSpan GetAttemptTimeout(int attempt)
@@ -617,14 +769,16 @@ public class DownloadService : IDownloadService
         return new Uri($"{atHomeUri}{separator}forcePort443=true");
     }
 
-    private static Exception BuildFinalDownloadException(string url, Exception? lastTransientException)
+    private static void TryDeleteFile(string path)
     {
-        if (lastTransientException is null)
-            return new HttpRequestException($"Falha ao baixar {url}.");
-
-        return new HttpRequestException(
-            $"Falha ao baixar {url} após múltiplas tentativas: {lastTransientException.Message}",
-            lastTransientException);
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+        }
     }
 
     private static string GetFileExtension(string url)
@@ -739,6 +893,39 @@ public class DownloadService : IDownloadService
                     _blockedUntilUtc = candidate;
 
                 return cooldown;
+            }
+        }
+    }
+
+    private sealed class TransientFailureGate
+    {
+        private readonly object _sync = new();
+        private DateTimeOffset _blockedUntilUtc = DateTimeOffset.MinValue;
+
+        public void Pause(TimeSpan delay)
+        {
+            var candidate = DateTimeOffset.UtcNow + delay;
+            lock (_sync)
+            {
+                if (candidate > _blockedUntilUtc)
+                    _blockedUntilUtc = candidate;
+            }
+        }
+
+        public async Task WaitBeforeAttemptAsync(CancellationToken ct)
+        {
+            while (true)
+            {
+                TimeSpan delay;
+                lock (_sync)
+                {
+                    delay = _blockedUntilUtc - DateTimeOffset.UtcNow;
+                }
+
+                if (delay <= TimeSpan.Zero)
+                    return;
+
+                await Task.Delay(delay, ct);
             }
         }
     }

@@ -88,6 +88,88 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task DownloadChapterAsync_WhenTransientFailuresExceedRetrySchedule_KeepsRetrying()
+    {
+        var handler = new TrackingHttpMessageHandler((_, attempt, _) =>
+        {
+            if (attempt <= 4)
+            {
+                throw new HttpRequestException(
+                    "servidor temporariamente indisponível",
+                    null,
+                    HttpStatusCode.ServiceUnavailable);
+            }
+
+            return Task.FromResult(CreateImageResponse());
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var service = CreateService(
+            httpClient,
+            attemptTimeouts: [TimeSpan.FromMilliseconds(200)],
+            retryDelays: [TimeSpan.FromMilliseconds(10)]);
+
+        var manga = CreateManga();
+        var chapter = CreateChapter(1, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+
+            Assert.Equal(5, handler.GetAttempts(chapter.Pages[0].ImageUrl));
+            Assert.True(File.Exists(chapter.Pages[0].LocalPath));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_WhenPageDiscoveryTimesOut_RetriesProviderOperation()
+    {
+        var handler = new TrackingHttpMessageHandler((_, _, _) =>
+            Task.FromResult(CreateImageResponse()));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new RetryingPagesScraper();
+        var service = CreateService(
+            httpClient,
+            retryDelays: [TimeSpan.FromMilliseconds(10)],
+            scraper: scraper);
+        var manga = CreateManga();
+        var chapter = new Chapter
+        {
+            Number = 1,
+            Title = "Capítulo 1",
+            Url = "https://manga.example/series/teste/1"
+        };
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+
+            Assert.Equal(2, scraper.PageDiscoveryAttempts);
+            Assert.Single(chapter.Pages);
+            Assert.True(File.Exists(chapter.Pages[0].LocalPath));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
     public async Task DownloadChapterAsync_WhenMangaDexImageHostFails_RefreshesAtHomeUrlForRetry()
     {
         const string staleImageUrl = "https://old-cdn.mangadex.network/data/oldhash/001.png";
@@ -331,6 +413,39 @@ public class DownloadServiceTests
         {
             _applyAuthentication(request);
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class RetryingPagesScraper : IScraper
+    {
+        private int _pageDiscoveryAttempts;
+
+        public int PageDiscoveryAttempts => Volatile.Read(ref _pageDiscoveryAttempts);
+        public string Name => "Retrying Pages";
+        public string BaseUrl => "https://manga.example";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(CreateManga());
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _pageDiscoveryAttempts) == 1)
+                throw new TimeoutException("provider demorou para responder");
+
+            return Task.FromResult(new List<Page>
+            {
+                new()
+                {
+                    Number = 1,
+                    ImageUrl = "https://img.example/001/001.jpg",
+                    RefererUrl = chapter.Url
+                }
+            });
         }
     }
 
