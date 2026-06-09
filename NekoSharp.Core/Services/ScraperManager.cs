@@ -172,6 +172,10 @@ public class ScraperManager
                 if (!allowReplace)
                     return false;
 
+                var existing = _scrapers[index];
+                if (ShouldPreserveExistingProvider(existing, scraper))
+                    return false;
+
                 replacedName = _scrapers[index].Name;
                 _scrapers[index] = scraper;
                 return true;
@@ -180,6 +184,18 @@ public class ScraperManager
             _scrapers.Add(scraper);
             return true;
         }
+    }
+
+    private static bool ShouldPreserveExistingProvider(IScraper existing, IScraper replacement)
+    {
+        if (existing is IAuthenticatedRequestProvider &&
+            replacement is not IAuthenticatedRequestProvider)
+        {
+            return true;
+        }
+
+        return existing is IInteractiveAuthProvider &&
+               replacement is not IInteractiveAuthProvider;
     }
 
     public void Register(IScraper scraper)

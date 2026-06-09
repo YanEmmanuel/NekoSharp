@@ -94,6 +94,10 @@ public partial class MainWindowViewModel : ObservableObject
     public ObservableCollection<ChapterViewModel> Chapters { get; } = [];
     public ObservableCollection<LibraryMangaEntry> LibraryItems { get; } = [];
     public ObservableCollection<LogEntryViewModel> LogEntries { get; } = [];
+    private readonly List<ProviderAuthCardViewModel> _authProviders = [];
+
+    public IReadOnlyList<ProviderAuthCardViewModel> AuthProviders => _authProviders;
+    public bool CanUseProviderAuthActions => !IsFetching && !IsDownloading && !IsLibraryBusy;
 
     public IReadOnlyList<string> ProviderNames => _scraperManager.Scrapers
         .Select(s => s.Name)
@@ -108,10 +112,13 @@ public partial class MainWindowViewModel : ObservableObject
 
     public void NotifyProviderCatalogChanged()
     {
+        RebuildProviderAuthCards();
         OnPropertyChanged(nameof(ProviderNames));
         OnPropertyChanged(nameof(ProviderCount));
         OnPropertyChanged(nameof(ProvidersButtonLabel));
         OnPropertyChanged(nameof(SupportedSites));
+        OnPropertyChanged(nameof(AuthProviders));
+        _ = RefreshAllProviderAuthStatesAsync();
     }
 
     public MainWindowViewModel(
@@ -131,6 +138,7 @@ public partial class MainWindowViewModel : ObservableObject
         _downloadService.MaxConcurrentDownloads = MaxConcurrentPageDownloads;
 
         LoadSettings();
+        RebuildProviderAuthCards();
 
         _logService.OnLogAdded += entry =>
         {
@@ -149,6 +157,12 @@ public partial class MainWindowViewModel : ObservableObject
 
         _ = RefreshLibraryAsync();
         _ = RefreshCloudflareCacheInfoAsync();
+    }
+
+    public async Task RefreshAllProviderAuthStatesAsync(CancellationToken ct = default)
+    {
+        foreach (var authProvider in _authProviders)
+            await authProvider.RefreshStateAsync(ct);
     }
 
     private void LoadSettings()
@@ -872,6 +886,23 @@ public partial class MainWindowViewModel : ObservableObject
         RefreshMediocreAuthStateCommand.NotifyCanExecuteChanged();
         RefreshCloudflareCacheInfoCommand.NotifyCanExecuteChanged();
         ClearCloudflareCacheCommand.NotifyCanExecuteChanged();
+        OnPropertyChanged(nameof(CanUseProviderAuthActions));
+    }
+
+    private void RebuildProviderAuthCards()
+    {
+        _authProviders.Clear();
+
+        foreach (var scraper in _scraperManager.Scrapers
+                     .Where(static scraper => scraper is IInteractiveAuthProvider)
+                     .OrderBy(static scraper => scraper.Name, StringComparer.CurrentCultureIgnoreCase))
+        {
+            _authProviders.Add(new ProviderAuthCardViewModel(
+                scraper.Name,
+                (IInteractiveAuthProvider)scraper,
+                scraper as ICredentialAuthProvider,
+                SetStatus));
+        }
     }
 
     private async Task RefreshCurrentMangaDexChaptersForLanguageChangeAsync()

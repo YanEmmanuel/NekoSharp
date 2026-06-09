@@ -19,6 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\NekoSharp.App\NekoSharp.App.csproj" />
     <ProjectReference Include="..\NekoSharp.Core\NekoSharp.Core.csproj" />
   </ItemGroup>
 

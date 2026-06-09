@@ -166,13 +166,57 @@ public class DownloadServiceTests
         }
     }
 
+    [Fact]
+    public async Task DownloadChapterAsync_AppliesProviderAuthenticationToImageRequests()
+    {
+        const string expectedCookie = "wordpress_logged_in_hash=session-value";
+        var authenticationCalls = 0;
+
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+        {
+            Assert.True(request.Headers.TryGetValues("Cookie", out var cookieValues));
+            Assert.Contains(expectedCookie, string.Join("; ", cookieValues));
+            Assert.Equal("LittleTyrantBrowser/1.0", request.Headers.UserAgent.ToString());
+            return Task.FromResult(CreateImageResponse());
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new AuthenticatedStubScraper(request =>
+        {
+            Interlocked.Increment(ref authenticationCalls);
+            request.Headers.TryAddWithoutValidation("Cookie", expectedCookie);
+            request.Headers.UserAgent.ParseAdd("LittleTyrantBrowser/1.0");
+        });
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(1, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+
+            Assert.Equal(1, authenticationCalls);
+            Assert.True(File.Exists(chapter.Pages[0].LocalPath));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
     private static DownloadService CreateService(
         HttpClient httpClient,
         TimeSpan[]? attemptTimeouts = null,
-        TimeSpan[]? retryDelays = null)
+        TimeSpan[]? retryDelays = null,
+        IScraper? scraper = null)
     {
         var scraperManager = new ScraperManager();
-        scraperManager.Register(new StubScraper());
+        scraperManager.Register(scraper ?? new StubScraper());
 
         return new DownloadService(
             scraperManager,
@@ -257,6 +301,36 @@ public class DownloadServiceTests
         public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
         {
             return Task.FromResult(chapter.Pages);
+        }
+    }
+
+    private sealed class AuthenticatedStubScraper : IScraper, IAuthenticatedRequestProvider
+    {
+        private readonly Action<HttpRequestMessage> _applyAuthentication;
+
+        public AuthenticatedStubScraper(Action<HttpRequestMessage> applyAuthentication)
+        {
+            _applyAuthentication = applyAuthentication;
+        }
+
+        public string Name => "Authenticated Stub";
+        public string BaseUrl => "https://manga.example";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(CreateManga());
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+            => Task.FromResult(chapter.Pages);
+
+        public Task ApplyRequestAuthenticationAsync(HttpRequestMessage request, CancellationToken ct = default)
+        {
+            _applyAuthentication(request);
+            return Task.CompletedTask;
         }
     }
 

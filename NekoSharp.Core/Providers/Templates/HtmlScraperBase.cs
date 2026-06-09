@@ -138,13 +138,17 @@ public abstract class HtmlScraperBase : IScraper
         if (string.IsNullOrWhiteSpace(href))
             return null;
 
-        if (Uri.TryCreate(href, UriKind.Absolute, out var absolute))
+        var trimmedHref = href.Trim();
+
+        if (Uri.TryCreate(trimmedHref, UriKind.Absolute, out var absolute) &&
+            (absolute.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+             absolute.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
             return absolute.ToString();
 
         if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var baseUri))
             return null;
 
-        return Uri.TryCreate(baseUri, href, out var combined)
+        return Uri.TryCreate(baseUri, trimmedHref, out var combined)
             ? combined.ToString()
             : null;
     }

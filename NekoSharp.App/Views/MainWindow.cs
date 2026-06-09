@@ -78,6 +78,8 @@ public class MainWindow
 
     private readonly Dictionary<ChapterViewModel, ChapterRowWidgets> _chapterRows = new();
     private readonly Dictionary<long, Gtk.Widget> _libraryRows = new();
+    private Gtk.Box _providerAuthCardsBox = null!;
+    private readonly Dictionary<ProviderAuthCardViewModel, ProviderAuthCardWidgets> _providerAuthCardWidgets = new();
 
     public MainWindow(MainWindowViewModel viewModel, Adw.Application app, LogService? logService = null)
     {
@@ -530,7 +532,7 @@ public class MainWindow
         page.Add(group);
         page.Add(BuildMangaDexSettingsGroup());
         page.Add(BuildCloudflareSettingsGroup());
-        page.Add(BuildMediocreAuthSettingsGroup());
+        page.Add(BuildProviderAuthSettingsGroup());
 
         page.Add(BuildSmartStitchSettingsGroup());
 
@@ -624,63 +626,122 @@ public class MainWindow
         return group;
     }
 
-    private Adw.PreferencesGroup BuildMediocreAuthSettingsGroup()
+    private Adw.PreferencesGroup BuildProviderAuthSettingsGroup()
     {
         var group = Adw.PreferencesGroup.New();
         group.SetTitle("Autenticação de Providers");
-        group.SetDescription("Configure login automático para providers que exigem autenticação.");
+        group.SetDescription("Abra o login no navegador para providers baseados em cookie ou use credenciais salvas quando disponível.");
+
+        _providerAuthCardsBox = Gtk.Box.New(Gtk.Orientation.Vertical, 12);
+        _providerAuthCardsBox.SetMarginTop(4);
+        group.Add(_providerAuthCardsBox);
+
+        RefreshProviderAuthSettingsUi();
+        return group;
+    }
+
+    private void RefreshProviderAuthSettingsUi()
+    {
+        if (_providerAuthCardsBox == null)
+            return;
+
+        for (var child = _providerAuthCardsBox.GetFirstChild(); child is not null;)
+        {
+            var next = child.GetNextSibling();
+            _providerAuthCardsBox.Remove(child);
+            child = next;
+        }
+
+        _providerAuthCardWidgets.Clear();
+
+        if (_vm.AuthProviders.Count == 0)
+        {
+            var emptyLabel = Gtk.Label.New("Nenhum provider com autenticação disponível.");
+            emptyLabel.SetHalign(Gtk.Align.Start);
+            emptyLabel.AddCssClass("dim-label");
+            _providerAuthCardsBox.Append(emptyLabel);
+            return;
+        }
+
+        for (var index = 0; index < _vm.AuthProviders.Count; index++)
+        {
+            var authProvider = _vm.AuthProviders[index];
+            var cardWidget = BuildProviderAuthCard(authProvider);
+            _providerAuthCardsBox.Append(cardWidget);
+
+            if (index < _vm.AuthProviders.Count - 1)
+                _providerAuthCardsBox.Append(Gtk.Separator.New(Gtk.Orientation.Horizontal));
+        }
+    }
+
+    private Gtk.Widget BuildProviderAuthCard(ProviderAuthCardViewModel authProvider)
+    {
+        var cardBox = Gtk.Box.New(Gtk.Orientation.Vertical, 6);
+        cardBox.SetMarginBottom(4);
+
+        var titleLabel = Gtk.Label.New(authProvider.ProviderName);
+        titleLabel.SetHalign(Gtk.Align.Start);
+        titleLabel.AddCssClass("heading");
+        cardBox.Append(titleLabel);
 
         var statusRow = Adw.ActionRow.New();
-        statusRow.SetTitle("MediocreScan");
-        statusRow.SetSubtitle(BuildMediocreAuthSubtitle());
+        statusRow.SetTitle("Sessão");
+        statusRow.SetSubtitle(authProvider.StatusSubtitle);
         statusRow.SetActivatable(false);
-        group.Add(statusRow);
+        cardBox.Append(statusRow);
 
-        var emailRow = Adw.ActionRow.New();
-        emailRow.SetTitle("Email");
-        emailRow.SetSubtitle("Conta usada no MediocreScan");
-        var emailEntry = Gtk.Entry.New();
-        emailEntry.SetHexpand(true);
-        emailEntry.SetPlaceholderText("seuemail@exemplo.com");
-        emailEntry.SetText(_vm.MediocreAuthEmail);
-        emailEntry.OnNotify += (_, args) =>
-        {
-            if (args.Pspec.GetName() == "text")
-                _vm.MediocreAuthEmail = emailEntry.GetText();
-        };
-        emailRow.AddSuffix(emailEntry);
-        emailRow.SetActivatable(false);
-        group.Add(emailRow);
+        Gtk.Entry? usernameEntry = null;
+        Gtk.PasswordEntry? passwordEntry = null;
+        Gtk.Switch? rememberSwitch = null;
 
-        var passwordRow = Adw.ActionRow.New();
-        passwordRow.SetTitle("Senha");
-        passwordRow.SetSubtitle("A senha é salva localmente para login automático");
-        var passwordEntry = Gtk.PasswordEntry.New();
-        passwordEntry.SetHexpand(true);
-        passwordEntry.SetText(_vm.MediocreAuthPassword);
-        passwordEntry.OnNotify += (_, args) =>
+        if (authProvider.SupportsCredentials)
         {
-            if (args.Pspec.GetName() == "text")
-                _vm.MediocreAuthPassword = passwordEntry.GetText();
-        };
-        passwordRow.AddSuffix(passwordEntry);
-        passwordRow.SetActivatable(false);
-        group.Add(passwordRow);
+            var usernameRow = Adw.ActionRow.New();
+            usernameRow.SetTitle("Email ou usuário");
+            usernameRow.SetSubtitle($"Login direto do {authProvider.ProviderName}");
+            usernameEntry = Gtk.Entry.New();
+            usernameEntry.SetHexpand(true);
+            usernameEntry.SetPlaceholderText("seuemail@exemplo.com");
+            usernameEntry.SetText(authProvider.UsernameOrEmail);
+            usernameEntry.OnNotify += (_, args) =>
+            {
+                if (args.Pspec.GetName() == "text")
+                    authProvider.UsernameOrEmail = usernameEntry.GetText();
+            };
+            usernameRow.AddSuffix(usernameEntry);
+            usernameRow.SetActivatable(false);
+            cardBox.Append(usernameRow);
 
-        var rememberRow = Adw.ActionRow.New();
-        rememberRow.SetTitle("Lembrar credenciais");
-        rememberRow.SetSubtitle("Se ativado, o app tenta logar automaticamente quando necessário");
-        var rememberSwitch = Gtk.Switch.New();
-        rememberSwitch.SetValign(Gtk.Align.Center);
-        rememberSwitch.SetActive(_vm.MediocreRememberCredentials);
-        rememberSwitch.OnNotify += (_, args) =>
-        {
-            if (args.Pspec.GetName() == "active")
-                _vm.MediocreRememberCredentials = rememberSwitch.GetActive();
-        };
-        rememberRow.AddSuffix(rememberSwitch);
-        rememberRow.SetActivatableWidget(rememberSwitch);
-        group.Add(rememberRow);
+            var passwordRow = Adw.ActionRow.New();
+            passwordRow.SetTitle("Senha");
+            passwordRow.SetSubtitle("A senha pode ser salva localmente para login automático");
+            passwordEntry = Gtk.PasswordEntry.New();
+            passwordEntry.SetHexpand(true);
+            passwordEntry.SetText(authProvider.Password);
+            passwordEntry.OnNotify += (_, args) =>
+            {
+                if (args.Pspec.GetName() == "text")
+                    authProvider.Password = passwordEntry.GetText();
+            };
+            passwordRow.AddSuffix(passwordEntry);
+            passwordRow.SetActivatable(false);
+            cardBox.Append(passwordRow);
+
+            var rememberRow = Adw.ActionRow.New();
+            rememberRow.SetTitle("Lembrar credenciais");
+            rememberRow.SetSubtitle("Se ativado, o app tenta logar automaticamente quando necessário");
+            rememberSwitch = Gtk.Switch.New();
+            rememberSwitch.SetValign(Gtk.Align.Center);
+            rememberSwitch.SetActive(authProvider.RememberCredentials);
+            rememberSwitch.OnNotify += (_, args) =>
+            {
+                if (args.Pspec.GetName() == "active")
+                    authProvider.RememberCredentials = rememberSwitch.GetActive();
+            };
+            rememberRow.AddSuffix(rememberSwitch);
+            rememberRow.SetActivatableWidget(rememberSwitch);
+            cardBox.Append(rememberRow);
+        }
 
         var actionsContainer = Gtk.Box.New(Gtk.Orientation.Vertical, 6);
         actionsContainer.SetMarginTop(4);
@@ -690,7 +751,7 @@ public class MainWindow
         actionsTitle.AddCssClass("heading");
         actionsContainer.Append(actionsTitle);
 
-        var actionsSubtitle = Gtk.Label.New("Escolha como autenticar no provider");
+        var actionsSubtitle = Gtk.Label.New("Escolha como autenticar neste provider");
         actionsSubtitle.SetHalign(Gtk.Align.Start);
         actionsSubtitle.AddCssClass("dim-label");
         actionsContainer.Append(actionsSubtitle);
@@ -702,114 +763,170 @@ public class MainWindow
         actionsGrid.SetHexpand(false);
         actionsContainer.Append(actionsGrid);
 
-        var credentialLoginBtn = Gtk.Button.NewWithLabel("Salvar e conectar");
-        credentialLoginBtn.AddCssClass("flatpak-button");
-        credentialLoginBtn.AddCssClass("compact-button");
-        credentialLoginBtn.AddCssClass("suggested-action");
-        credentialLoginBtn.OnClicked += (_, _) =>
+        Gtk.Button? credentialLoginBtn = null;
+        Gtk.Button? clearSavedBtn = null;
+
+        if (authProvider.SupportsCredentials)
         {
-            if (_vm.LoginMediocreWithCredentialsCommand.CanExecute(null))
-                _vm.LoginMediocreWithCredentialsCommand.Execute(null);
-        };
-        actionsGrid.Attach(credentialLoginBtn, 0, 0, 1, 1);
+            credentialLoginBtn = Gtk.Button.NewWithLabel("Salvar e conectar");
+            credentialLoginBtn.AddCssClass("flatpak-button");
+            credentialLoginBtn.AddCssClass("compact-button");
+            credentialLoginBtn.AddCssClass("suggested-action");
+            credentialLoginBtn.OnClicked += async (_, _) =>
+            {
+                try
+                {
+                    await authProvider.LoginWithCredentialsAsync();
+                }
+                catch
+                {
+                }
+            };
+            actionsGrid.Attach(credentialLoginBtn, 0, 0, 1, 1);
+        }
 
         var browserLoginBtn = Gtk.Button.NewWithLabel("Login no navegador");
         browserLoginBtn.AddCssClass("flatpak-button");
         browserLoginBtn.AddCssClass("compact-button");
-        browserLoginBtn.OnClicked += (_, _) =>
+        browserLoginBtn.OnClicked += async (_, _) =>
         {
-            if (_vm.ConnectMediocreAuthCommand.CanExecute(null))
-                _vm.ConnectMediocreAuthCommand.Execute(null);
+            try
+            {
+                await authProvider.ConnectInBrowserAsync();
+            }
+            catch
+            {
+            }
         };
-        actionsGrid.Attach(browserLoginBtn, 1, 0, 1, 1);
+        actionsGrid.Attach(browserLoginBtn, authProvider.SupportsCredentials ? 1 : 0, 0, 1, 1);
 
         var clearSessionBtn = Gtk.Button.NewWithLabel("Limpar sessão");
         clearSessionBtn.AddCssClass("flatpak-button");
         clearSessionBtn.AddCssClass("compact-button");
-        clearSessionBtn.OnClicked += (_, _) =>
+        clearSessionBtn.OnClicked += async (_, _) =>
         {
-            if (_vm.ClearMediocreAuthCommand.CanExecute(null))
-                _vm.ClearMediocreAuthCommand.Execute(null);
+            try
+            {
+                await authProvider.ClearAuthAsync();
+            }
+            catch
+            {
+            }
         };
         actionsGrid.Attach(clearSessionBtn, 0, 1, 1, 1);
 
-        var clearSavedBtn = Gtk.Button.NewWithLabel("Esquecer login salvo");
-        clearSavedBtn.AddCssClass("flatpak-button");
-        clearSavedBtn.AddCssClass("compact-button");
-        clearSavedBtn.OnClicked += (_, _) =>
+        if (authProvider.SupportsCredentials)
         {
-            if (_vm.ClearMediocreSavedCredentialsCommand.CanExecute(null))
-                _vm.ClearMediocreSavedCredentialsCommand.Execute(null);
-        };
-        actionsGrid.Attach(clearSavedBtn, 1, 1, 1, 1);
+            clearSavedBtn = Gtk.Button.NewWithLabel("Esquecer login salvo");
+            clearSavedBtn.AddCssClass("flatpak-button");
+            clearSavedBtn.AddCssClass("compact-button");
+            clearSavedBtn.OnClicked += async (_, _) =>
+            {
+                try
+                {
+                    await authProvider.ClearSavedCredentialsAsync();
+                }
+                catch
+                {
+                }
+            };
+            actionsGrid.Attach(clearSavedBtn, 1, 1, 1, 1);
+        }
 
         var refreshBtn = Gtk.Button.NewWithLabel("Atualizar status");
         refreshBtn.AddCssClass("flatpak-button");
         refreshBtn.AddCssClass("compact-button");
-        refreshBtn.OnClicked += (_, _) =>
+        refreshBtn.OnClicked += async (_, _) =>
         {
-            if (_vm.RefreshMediocreAuthStateCommand.CanExecute(null))
-                _vm.RefreshMediocreAuthStateCommand.Execute(null);
+            await authProvider.RefreshStateAsync();
         };
         actionsGrid.Attach(refreshBtn, 0, 2, 2, 1);
 
-        foreach (var button in new[] { credentialLoginBtn, browserLoginBtn, clearSessionBtn, clearSavedBtn, refreshBtn })
+        foreach (var button in new[] { credentialLoginBtn, browserLoginBtn, clearSessionBtn, clearSavedBtn, refreshBtn }.Where(static button => button is not null))
         {
-            button.SetHexpand(false);
+            button!.SetHexpand(false);
             button.SetVexpand(false);
             button.SetHalign(Gtk.Align.Start);
             button.SetValign(Gtk.Align.Center);
         }
 
-        group.Add(actionsContainer);
+        cardBox.Append(actionsContainer);
 
-        _vm.PropertyChanged += (_, args) =>
-        {
-            switch (args.PropertyName)
-            {
-                case nameof(_vm.MediocreAuthStatus):
-                case nameof(_vm.MediocreAuthUser):
-                case nameof(_vm.MediocreAuthLastUpdated):
-                case nameof(_vm.HasSavedMediocreCredentials):
-                    statusRow.SetSubtitle(BuildMediocreAuthSubtitle());
-                    break;
-                case nameof(_vm.MediocreAuthEmail):
-                    if (emailEntry.GetText() != _vm.MediocreAuthEmail)
-                        emailEntry.SetText(_vm.MediocreAuthEmail);
-                    break;
-                case nameof(_vm.MediocreAuthPassword):
-                    if (passwordEntry.GetText() != _vm.MediocreAuthPassword)
-                        passwordEntry.SetText(_vm.MediocreAuthPassword);
-                    break;
-                case nameof(_vm.MediocreRememberCredentials):
-                    if (rememberSwitch.GetActive() != _vm.MediocreRememberCredentials)
-                        rememberSwitch.SetActive(_vm.MediocreRememberCredentials);
-                    break;
-                case nameof(_vm.IsMediocreAuthBusy):
-                case nameof(_vm.IsFetching):
-                case nameof(_vm.IsDownloading):
-                case nameof(_vm.IsLibraryBusy):
-                    var canUseAuth = !_vm.IsMediocreAuthBusy && !_vm.IsFetching && !_vm.IsDownloading && !_vm.IsLibraryBusy;
-                    emailEntry.SetSensitive(canUseAuth);
-                    passwordEntry.SetSensitive(canUseAuth);
-                    rememberSwitch.SetSensitive(canUseAuth);
-                    credentialLoginBtn.SetSensitive(canUseAuth);
-                    browserLoginBtn.SetSensitive(canUseAuth);
-                    clearSessionBtn.SetSensitive(canUseAuth);
-                    clearSavedBtn.SetSensitive(canUseAuth);
-                    refreshBtn.SetSensitive(canUseAuth);
-                    break;
-            }
-        };
+        var widgets = new ProviderAuthCardWidgets(
+            statusRow,
+            usernameEntry,
+            passwordEntry,
+            rememberSwitch,
+            credentialLoginBtn,
+            browserLoginBtn,
+            clearSessionBtn,
+            clearSavedBtn,
+            refreshBtn);
 
-        return group;
+        _providerAuthCardWidgets[authProvider] = widgets;
+        authProvider.PropertyChanged += (_, args) => OnProviderAuthCardPropertyChanged(authProvider, widgets, args);
+        UpdateProviderAuthCardSensitivity(authProvider, widgets);
+
+        return cardBox;
     }
 
-    private string BuildMediocreAuthSubtitle()
+    private void OnProviderAuthCardPropertyChanged(
+        ProviderAuthCardViewModel authProvider,
+        ProviderAuthCardWidgets widgets,
+        PropertyChangedEventArgs args)
     {
-        var user = string.IsNullOrWhiteSpace(_vm.MediocreAuthUser) ? "-" : _vm.MediocreAuthUser;
-        var saved = _vm.HasSavedMediocreCredentials ? "sim" : "não";
-        return $"Status: {_vm.MediocreAuthStatus} • Usuário: {user} • Login salvo: {saved} • Atualizado: {_vm.MediocreAuthLastUpdated}";
+        switch (args.PropertyName)
+        {
+            case nameof(ProviderAuthCardViewModel.StatusSubtitle):
+                widgets.StatusRow.SetSubtitle(authProvider.StatusSubtitle);
+                break;
+            case nameof(ProviderAuthCardViewModel.UsernameOrEmail):
+                if (widgets.UsernameEntry is not null &&
+                    widgets.UsernameEntry.GetText() != authProvider.UsernameOrEmail)
+                {
+                    widgets.UsernameEntry.SetText(authProvider.UsernameOrEmail);
+                }
+                break;
+            case nameof(ProviderAuthCardViewModel.Password):
+                if (widgets.PasswordEntry is not null &&
+                    widgets.PasswordEntry.GetText() != authProvider.Password)
+                {
+                    widgets.PasswordEntry.SetText(authProvider.Password);
+                }
+                break;
+            case nameof(ProviderAuthCardViewModel.RememberCredentials):
+                if (widgets.RememberSwitch is not null &&
+                    widgets.RememberSwitch.GetActive() != authProvider.RememberCredentials)
+                {
+                    widgets.RememberSwitch.SetActive(authProvider.RememberCredentials);
+                }
+                break;
+            case nameof(ProviderAuthCardViewModel.IsBusy):
+                UpdateProviderAuthCardSensitivity(authProvider, widgets);
+                break;
+        }
+    }
+
+    private void UpdateProviderAuthCardsSensitivity()
+    {
+        foreach (var (authProvider, widgets) in _providerAuthCardWidgets)
+            UpdateProviderAuthCardSensitivity(authProvider, widgets);
+    }
+
+    private void UpdateProviderAuthCardSensitivity(
+        ProviderAuthCardViewModel authProvider,
+        ProviderAuthCardWidgets widgets)
+    {
+        var canUseAuth = _vm.CanUseProviderAuthActions && !authProvider.IsBusy;
+
+        widgets.UsernameEntry?.SetSensitive(canUseAuth);
+        widgets.PasswordEntry?.SetSensitive(canUseAuth);
+        widgets.RememberSwitch?.SetSensitive(canUseAuth);
+        widgets.CredentialLoginButton?.SetSensitive(canUseAuth);
+        widgets.BrowserLoginButton.SetSensitive(canUseAuth);
+        widgets.ClearSessionButton.SetSensitive(canUseAuth);
+        widgets.ClearSavedButton?.SetSensitive(canUseAuth);
+        widgets.RefreshButton.SetSensitive(canUseAuth);
     }
 
     private string BuildCloudflareCacheSubtitle()
@@ -1397,6 +1514,7 @@ public class MainWindow
                 else _fetchingSpinner.Stop();
                 UpdateLibrarySectionState();
                 UpdateFollowButtonState();
+                UpdateProviderAuthCardsSensitivity();
                 break;
 
             case nameof(MainWindowViewModel.IsMangaLoaded):
@@ -1435,12 +1553,14 @@ public class MainWindow
                 _downloadAllBtn.SetSensitive(!_vm.IsDownloading);
                 UpdateLibrarySectionState();
                 UpdateFollowButtonState();
+                UpdateProviderAuthCardsSensitivity();
                 break;
 
             case nameof(MainWindowViewModel.IsLibraryBusy):
             case nameof(MainWindowViewModel.LibraryNewChaptersTotal):
                 UpdateLibrarySectionState();
                 UpdateFollowButtonState();
+                UpdateProviderAuthCardsSensitivity();
                 break;
 
             case nameof(MainWindowViewModel.IsCurrentMangaFollowed):
@@ -1472,6 +1592,14 @@ public class MainWindow
             case nameof(MainWindowViewModel.ProviderCount):
             case nameof(MainWindowViewModel.ProvidersButtonLabel):
                 RefreshProvidersUi();
+                break;
+
+            case nameof(MainWindowViewModel.AuthProviders):
+                RefreshProviderAuthSettingsUi();
+                break;
+
+            case nameof(MainWindowViewModel.CanUseProviderAuthActions):
+                UpdateProviderAuthCardsSensitivity();
                 break;
                 
             case nameof(MainWindowViewModel.OutputDirectory):
@@ -2011,4 +2139,15 @@ public class MainWindow
              
         }
     }
+
+    private sealed record ProviderAuthCardWidgets(
+        Adw.ActionRow StatusRow,
+        Gtk.Entry? UsernameEntry,
+        Gtk.PasswordEntry? PasswordEntry,
+        Gtk.Switch? RememberSwitch,
+        Gtk.Button? CredentialLoginButton,
+        Gtk.Button BrowserLoginButton,
+        Gtk.Button ClearSessionButton,
+        Gtk.Button? ClearSavedButton,
+        Gtk.Button RefreshButton);
 }

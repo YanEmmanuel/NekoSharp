@@ -178,14 +178,24 @@ public class DownloadService : IDownloadService
 
             if (!needsConversion)
             {
-                await DownloadFileWithRetryAsync(page.ImageUrl, filePath, page.RefererUrl ?? chapter.Url, ct);
+                await DownloadFileWithRetryAsync(
+                    page.ImageUrl,
+                    filePath,
+                    page.RefererUrl ?? chapter.Url,
+                    scraper,
+                    ct);
             }
             else
             {
                 var tempFile = Path.Combine(tempDir, $"{page.Number:D3}_tmp{originalExtension}");
                 try
                 {
-                    await DownloadFileWithRetryAsync(page.ImageUrl, tempFile, page.RefererUrl ?? chapter.Url, ct);
+                    await DownloadFileWithRetryAsync(
+                        page.ImageUrl,
+                        tempFile,
+                        page.RefererUrl ?? chapter.Url,
+                        scraper,
+                        ct);
                     await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
                 }
                 finally
@@ -337,7 +347,12 @@ public class DownloadService : IDownloadService
         }
     }
 
-    private async Task DownloadFileWithRetryAsync(string url, string filePath, string referer, CancellationToken ct)
+    private async Task DownloadFileWithRetryAsync(
+        string url,
+        string filePath,
+        string referer,
+        IScraper scraper,
+        CancellationToken ct)
     {
         Exception? lastTransientException = null;
         var currentUrl = url;
@@ -362,6 +377,9 @@ public class DownloadService : IDownloadService
                     request.Headers.TryAddWithoutValidation("Referer", referer);
 
                 request.Headers.Add("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5");
+
+                if (scraper is IAuthenticatedRequestProvider authenticatedProvider)
+                    await authenticatedProvider.ApplyRequestAuthenticationAsync(request, ct);
 
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeoutCts.CancelAfter(timeout);

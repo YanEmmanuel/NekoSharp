@@ -1,3 +1,4 @@
+using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Services;
 using Xunit;
 
@@ -29,6 +30,20 @@ public class ScraperManagerTests
 
         Assert.NotNull(scraper);
         Assert.Equal("FlowerManga.net", scraper.Name);
+    }
+
+    [Fact]
+    public void DiscoverAndRegisterAll_DoesNotReplaceAuthenticatedProviderWithLegacyVersion()
+    {
+        var manager = new ScraperManager();
+
+        manager.DiscoverAndRegisterAll(externalAssemblyPaths: [FindDynamicProvidersPackage()]);
+
+        var scraper = manager.GetScraperByName("Little Tyrant");
+
+        Assert.NotNull(scraper);
+        Assert.IsAssignableFrom<IInteractiveAuthProvider>(scraper);
+        Assert.IsAssignableFrom<IAuthenticatedRequestProvider>(scraper);
     }
 
     private static string FindDynamicProvidersPackage()

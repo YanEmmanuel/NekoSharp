@@ -20,7 +20,12 @@ public sealed class ComixScraper : IScraper
     private static readonly Regex RelativeDateRegex = new(
         "^(?<amount>\\d+)\\s*(?<unit>s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex ChapterNumberRegex = new(
+        @"(?:\bCh(?:apter)?\.?\s*|chapter-)(?<number>\d+(?:\.\d+)?)",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex WhitespaceRegex = new(@"\s+", RegexOptions.Compiled);
     private static readonly TimeSpan TokenCaptureTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ChapterDomTimeout = TimeSpan.FromSeconds(45);
 
     private readonly HttpClient _http;
     private readonly LogService? _log;
@@ -100,28 +105,39 @@ public sealed class ComixScraper : IScraper
     {
         var parsed = ParseSupportedUrl(url);
         var mangaUrl = BuildMangaUrl(parsed.HashId, null, $"/title/{parsed.MangaSegment.Trim('/')}");
-        var token = await CaptureTokenAsync(
-            pageUrl: mangaUrl,
-            pathSuffix: $"/api/v1/manga/{parsed.HashId}/chapters",
-            ct);
-        const int limit = 100;
-        var page = 1;
         var bestById = new Dictionary<int, ComixChapterCandidate>();
+        var seenPageSignatures = new HashSet<string>(StringComparer.Ordinal);
 
-        while (true)
+        await using var browser = await LaunchBrowserAsync(ct);
+        await using var page = await browser.NewPageAsync();
+        await PrepareBrowserPageAsync(page, mangaUrl);
+
+        await page.GoToAsync(mangaUrl, new NavigationOptions
+        {
+            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+            Timeout = (int)ChapterDomTimeout.TotalMilliseconds
+        });
+
+        for (var pageNumber = 1; pageNumber <= 200; pageNumber++)
         {
             ct.ThrowIfCancellationRequested();
 
-            var result = await GetResultAsync(BuildChapterListRelativeUrl(parsed.HashId, page, limit, token), ct);
+            await page.WaitForSelectorAsync(".mchap-list .mchap-item", new WaitForSelectorOptions
+            {
+                Timeout = (int)ChapterDomTimeout.TotalMilliseconds
+            });
 
-            if (!result.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array)
+            var snapshot = await CaptureChapterDomSnapshotAsync(page, ct);
+            if (snapshot.Items.Count == 0)
                 break;
 
-            var itemCount = 0;
-            foreach (var item in items.EnumerateArray())
+            var pageSignature = string.Join('|', snapshot.Items.Select(static item => item.Href));
+            if (!seenPageSignatures.Add(pageSignature))
+                break;
+
+            foreach (var item in snapshot.Items)
             {
-                itemCount++;
-                var candidate = ParseChapterCandidate(item);
+                var candidate = ParseChapterDomItem(item, mangaUrl);
                 if (candidate.ChapterId <= 0)
                     continue;
 
@@ -129,10 +145,14 @@ public sealed class ComixScraper : IScraper
                     bestById[candidate.ChapterId] = candidate;
             }
 
-            if (itemCount == 0 || !HasNextPage(result))
+            if (!snapshot.HasNextPage)
                 break;
 
-            page++;
+            var firstHref = snapshot.Items[0].Href;
+            if (!await ClickNextChapterPageAsync(page))
+                break;
+
+            await WaitForChapterPageChangeAsync(page, firstHref, ct);
         }
 
         var chapters = BuildChapterList(parsed.MangaSegment, bestById.Values);
@@ -295,6 +315,136 @@ public sealed class ComixScraper : IScraper
             page.Request -= OnRequest;
         }
     }
+
+    private async Task PrepareBrowserPageAsync(IPage page, string pageUrl)
+    {
+        var creds = _cfStore is null ? null : await _cfStore.TryGetAsync("comix.to");
+        var userAgent = creds?.UserAgent;
+        if (string.IsNullOrWhiteSpace(userAgent))
+            userAgent = UserAgentProvider.Default;
+
+        await page.SetUserAgentAsync(userAgent);
+        await ApplyStoredCookiesAsync(page, pageUrl, creds);
+    }
+
+    private static async Task<ComixChapterDomSnapshot> CaptureChapterDomSnapshotAsync(IPage page, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        var json = await page.EvaluateFunctionAsync<string>(
+            """
+            () => {
+                const clean = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+                const items = Array.from(document.querySelectorAll('.mchap-list .mchap-item')).map((li) => {
+                    const link = li.querySelector('a.mchap-row__primary[href]');
+                    const likesText = clean(li.querySelector('.mchap-row__likes')?.textContent);
+                    const likesMatch = likesText.match(/\d+/);
+                    return {
+                        Href: link ? link.getAttribute('href') || '' : '',
+                        ChapterLabel: clean(li.querySelector('.mchap-row__ch')?.textContent),
+                        Title: clean(li.querySelector('.mchap-row__title')?.textContent),
+                        Likes: likesMatch ? Number(likesMatch[0]) : 0,
+                        Time: clean(li.querySelector('.mchap-row__time')?.textContent)
+                    };
+                }).filter((item) => item.Href);
+
+                const nextButton = Array.from(document.querySelectorAll('button[aria-label="Next page"]'))
+                    .find((button) => !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+
+                return JSON.stringify({
+                    Items: items,
+                    HasNextPage: Boolean(nextButton)
+                });
+            }
+            """);
+
+        return JsonSerializer.Deserialize<ComixChapterDomSnapshot>(json) ?? new ComixChapterDomSnapshot();
+    }
+
+    private static ComixChapterCandidate ParseChapterDomItem(ComixChapterDomItem item, string pageUrl)
+    {
+        var sourceUrl = ToComixAbsoluteUrl(item.Href, pageUrl);
+        var chapterId = 0;
+        if (ComixUrlParser.TryParse(sourceUrl, out var parsed))
+            chapterId = parsed.ChapterId;
+
+        return new ComixChapterCandidate(
+            ChapterId: chapterId,
+            Number: ParseChapterNumber(item.ChapterLabel, sourceUrl),
+            SourceUrl: sourceUrl,
+            Name: NormalizeText(item.Title),
+            Votes: item.Likes,
+            UpdatedAt: ParseRelativeTimestamp(item.Time),
+            ScanlationGroupId: 0,
+            ScanlationGroupName: string.Empty,
+            IsOfficial: 0);
+    }
+
+    private static double ParseChapterNumber(string? label, string? sourceUrl)
+    {
+        var text = $"{label} {sourceUrl}";
+        var match = ChapterNumberRegex.Match(text);
+        if (!match.Success)
+            return 0;
+
+        return double.TryParse(match.Groups["number"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var number)
+            ? number
+            : 0;
+    }
+
+    private static async Task<bool> ClickNextChapterPageAsync(IPage page)
+    {
+        return await page.EvaluateFunctionAsync<bool>(
+            """
+            () => {
+                const button = Array.from(document.querySelectorAll('button[aria-label="Next page"]'))
+                    .find((candidate) => !candidate.disabled && candidate.getAttribute('aria-disabled') !== 'true');
+                if (!button) return false;
+                button.click();
+                return true;
+            }
+            """);
+    }
+
+    private static async Task WaitForChapterPageChangeAsync(IPage page, string firstHref, CancellationToken ct)
+    {
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var changed = await page.EvaluateFunctionAsync<bool>(
+                """
+                (previousHref) => {
+                    const currentHref = document.querySelector('.mchap-list .mchap-item a.mchap-row__primary[href]')
+                        ?.getAttribute('href') || '';
+                    return currentHref.length > 0 && currentHref !== previousHref;
+                }
+                """,
+                firstHref);
+
+            if (changed)
+                return;
+
+            await Task.Delay(250, ct);
+        }
+    }
+
+    private static string ToComixAbsoluteUrl(string href, string pageUrl)
+    {
+        if (Uri.TryCreate(href, UriKind.Absolute, out var absolute))
+            return absolute.ToString();
+
+        var baseUri = Uri.TryCreate(pageUrl, UriKind.Absolute, out var parsedBase)
+            ? parsedBase
+            : new Uri(BaseUrlStatic);
+
+        return new Uri(baseUri, href).ToString();
+    }
+
+    private static string NormalizeText(string? value)
+        => string.IsNullOrWhiteSpace(value)
+            ? string.Empty
+            : WhitespaceRegex.Replace(value.Trim(), " ");
 
     private static string? ExtractTokenFromUrl(Uri requestUri)
     {
@@ -856,6 +1006,21 @@ public sealed class ComixScraper : IScraper
     {
         var normalized = value.Trim().Replace('_', ' ');
         return CultureInfo.InvariantCulture.TextInfo.ToTitleCase(normalized);
+    }
+
+    private sealed class ComixChapterDomSnapshot
+    {
+        public List<ComixChapterDomItem> Items { get; set; } = [];
+        public bool HasNextPage { get; set; }
+    }
+
+    private sealed class ComixChapterDomItem
+    {
+        public string Href { get; set; } = string.Empty;
+        public string ChapterLabel { get; set; } = string.Empty;
+        public string Title { get; set; } = string.Empty;
+        public int Likes { get; set; }
+        public string Time { get; set; } = string.Empty;
     }
 
     internal readonly record struct ComixChapterCandidate(

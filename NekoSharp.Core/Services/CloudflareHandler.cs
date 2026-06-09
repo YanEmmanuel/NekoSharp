@@ -466,6 +466,16 @@ public class CloudflareHandler : DelegatingHandler
                     {
                         _log?.Info("[Cloudflare] Challenge page cleared! Waiting 3s for cookies to settle…");
                         await Task.Delay(3_000, ct);
+
+                        try
+                        {
+                            solvedHtmlContent = await page.GetContentAsync();
+                        }
+                        catch
+                        {
+                            solvedHtmlContent = content;
+                        }
+
                         try
                         {
                             await page.WaitForNetworkIdleAsync(new WaitForNetworkIdleOptions
@@ -475,9 +485,9 @@ public class CloudflareHandler : DelegatingHandler
                                 Timeout = 10_000,
                             });
                         }
-                        catch (Exception ex) when (ex is WaitTaskTimeoutException or TimeoutException)
+                        catch (Exception ex) when (ex is not OperationCanceledException)
                         {
-                            _log?.Debug("[Cloudflare] Network idle wait timed out after challenge. Capturing current page state.");
+                            _log?.Debug($"[Cloudflare] Network idle wait failed after challenge ({ex.GetType().Name}). Capturing available browser state.");
                         }
 
                         try
@@ -608,9 +618,62 @@ public class CloudflareHandler : DelegatingHandler
         request.Headers.Remove("User-Agent");
         request.Headers.TryAddWithoutValidation("User-Agent", creds.UserAgent);
 
-        var cookieHeader = string.Join("; ", creds.AllCookies.Select(kv => $"{kv.Key}={kv.Value}"));
+        var cookieHeader = MergeCookieHeader(
+            GetCookieHeader(request),
+            creds.AllCookies);
+
         request.Headers.Remove("Cookie");
-        request.Headers.TryAddWithoutValidation("Cookie", cookieHeader);
+        if (!string.IsNullOrWhiteSpace(cookieHeader))
+            request.Headers.TryAddWithoutValidation("Cookie", cookieHeader);
+    }
+
+    internal static string MergeCookieHeader(string? existingHeader, IReadOnlyDictionary<string, string> incomingCookies)
+    {
+        var merged = ParseCookieHeader(existingHeader);
+        foreach (var cookie in incomingCookies)
+        {
+            if (string.IsNullOrWhiteSpace(cookie.Key))
+                continue;
+
+            merged[cookie.Key.Trim()] = cookie.Value ?? string.Empty;
+        }
+
+        return BuildCookieHeader(merged);
+    }
+
+    internal static Dictionary<string, string> ParseCookieHeader(string? header)
+    {
+        var cookies = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(header))
+            return cookies;
+
+        foreach (var segment in header.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separatorIndex = segment.IndexOf('=');
+            if (separatorIndex <= 0)
+                continue;
+
+            var name = segment[..separatorIndex].Trim();
+            if (string.IsNullOrWhiteSpace(name))
+                continue;
+
+            var value = segment[(separatorIndex + 1)..].Trim();
+            cookies[name] = value;
+        }
+
+        return cookies;
+    }
+
+    internal static string BuildCookieHeader(IReadOnlyDictionary<string, string> cookies)
+    {
+        return string.Join("; ", cookies.Select(static kv => $"{kv.Key}={kv.Value}"));
+    }
+
+    private static string? GetCookieHeader(HttpRequestMessage request)
+    {
+        return request.Headers.TryGetValues("Cookie", out var values)
+            ? string.Join("; ", values)
+            : null;
     }
 
     private async Task<HttpResponseMessage?> TrySendWithBrowserTransportAsync(
