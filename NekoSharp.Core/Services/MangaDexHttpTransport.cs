@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace NekoSharp.Core.Services;
 
-internal static class MangaDexHttpTransport
+public static class MangaDexHttpTransport
 {
     private static readonly TimeSpan SystemDnsTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan AddressConnectTimeout = TimeSpan.FromSeconds(3);
