@@ -188,6 +188,12 @@ public class ScraperManager
 
     private static bool ShouldPreserveExistingProvider(IScraper existing, IScraper replacement)
     {
+        if (existing is ICustomPageDownloadProvider &&
+            replacement is not ICustomPageDownloadProvider)
+        {
+            return true;
+        }
+
         if (existing is IAuthenticatedRequestProvider &&
             replacement is not IAuthenticatedRequestProvider)
         {

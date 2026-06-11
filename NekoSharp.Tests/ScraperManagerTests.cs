@@ -46,6 +46,19 @@ public class ScraperManagerTests
         Assert.IsAssignableFrom<IAuthenticatedRequestProvider>(scraper);
     }
 
+    [Fact]
+    public void DiscoverAndRegisterAll_DoesNotReplaceCustomDownloadProviderWithLegacyVersion()
+    {
+        var manager = new ScraperManager();
+
+        manager.DiscoverAndRegisterAll(externalAssemblyPaths: [FindDynamicProvidersPackage()]);
+
+        var scraper = manager.GetScraperByName("Comix");
+
+        Assert.NotNull(scraper);
+        Assert.IsAssignableFrom<ICustomPageDownloadProvider>(scraper);
+    }
+
     private static string FindDynamicProvidersPackage()
     {
         var current = new DirectoryInfo(Environment.CurrentDirectory);

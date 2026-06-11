@@ -26,9 +26,9 @@ public sealed class MangaDexScraper : IScraper
     {
         _settingsStore = settingsStore;
 
-        HttpMessageHandler handler = logService != null
-            ? new LoggingHttpHandler(logService, new HttpClientHandler())
-            : new HttpClientHandler();
+        HttpMessageHandler handler = MangaDexHttpTransport.CreateHandler(logService);
+        if (logService != null)
+            handler = new LoggingHttpHandler(logService, handler);
 
         _http = new HttpClient(handler);
         _http.BaseAddress = new Uri(ApiUrl);
@@ -141,7 +141,17 @@ public sealed class MangaDexScraper : IScraper
     public async Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
     {
         var atHomeRequestUrl = BuildAtHomeRequestUrl(chapter.Url);
-        var response = await _http.GetFromJsonAsync<JsonElement>(atHomeRequestUrl, ct);
+        using var request = new HttpRequestMessage(HttpMethod.Get, atHomeRequestUrl);
+        request.Headers.CacheControl = new CacheControlHeaderValue
+        {
+            NoCache = true,
+            NoStore = true
+        };
+        request.Headers.Pragma.ParseAdd("no-cache");
+
+        using var httpResponse = await _http.SendAsync(request, ct);
+        httpResponse.EnsureSuccessStatusCode();
+        var response = await httpResponse.Content.ReadFromJsonAsync<JsonElement>(cancellationToken: ct);
                 
         var baseUrl = response.GetProperty("baseUrl").GetString()!;
         var chapterData = response.GetProperty("chapter");

@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Models;
+using NekoSharp.Core.Providers.Comix;
 using NekoSharp.Core.Services;
 using Xunit;
 
@@ -291,6 +292,163 @@ public class DownloadServiceTests
         }
     }
 
+    [Fact]
+    public async Task DownloadChapterAsync_ComixUsesFallbackAndDecodesResponse()
+    {
+        const int seed = 78123;
+        const int encodedLength = 24;
+        var original = CreatePngBytes();
+        var encoded = ComixScraper.DecodeEncodedPrefix(original, seed, encodedLength);
+
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+        {
+            var path = request.RequestUri?.AbsolutePath;
+            if (path?.Contains("/si/", StringComparison.Ordinal) == true)
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+
+            Assert.Contains("/i/", path);
+            Assert.Equal("https://comix.to", request.Headers.GetValues("Origin").Single());
+
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(encoded)
+            };
+            response.Headers.TryAddWithoutValidation("x-enc-seed", seed.ToString());
+            response.Headers.TryAddWithoutValidation("x-enc-len", encodedLength.ToString());
+            return Task.FromResult(response);
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new ComixScraper();
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = new Manga
+        {
+            Name = "Comix Test",
+            Url = "https://comix.to/title/abc-test",
+            SiteName = "Comix"
+        };
+        var chapter = new Chapter
+        {
+            Number = 1,
+            Title = "Chapter 1",
+            Url = "https://comix.to/title/abc-test/123-chapter-1",
+            Pages =
+            [
+                new Page
+                {
+                    Number = 1,
+                    ImageUrl = "https://wowpic.example/si/chapter/001.jpg#scrambled"
+                }
+            ]
+        };
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.Equal(
+                1,
+                handler.GetAttempts("https://wowpic.example/si/chapter/001.jpg"));
+            Assert.Equal(
+                1,
+                handler.GetAttempts("https://wowpic.example/i/chapter/001.jpg"));
+            Assert.Equal(original, await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_InvalidCanvasImage_UsesRenderedFallback()
+    {
+        var renderedImage = CreatePngBytes();
+        var handler = new TrackingHttpMessageHandler((_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(Encoding.UTF8.GetBytes("broken-image"))
+            }));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new CanvasFallbackStubScraper(renderedImage);
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(7, 1);
+        chapter.Pages[0].ImageUrl = "https://img.example/007/001.png#scrambled";
+        chapter.Pages[0].RefererUrl = chapter.Url;
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.Equal(1, scraper.RenderedFallbackCalls);
+            Assert.Equal(1, scraper.LastPageNumber);
+            Assert.Equal(chapter.Url, scraper.LastChapterUrl);
+            Assert.Equal(renderedImage, await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_NormalImage_DoesNotUseRenderedFallback()
+    {
+        var directImage = Encoding.UTF8.GetBytes("normal-direct-response");
+        var handler = new TrackingHttpMessageHandler((_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(directImage)
+            }));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new CanvasFallbackStubScraper(CreatePngBytes());
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(8, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.Equal(0, scraper.RenderedFallbackCalls);
+            Assert.Equal(directImage, await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
     private static DownloadService CreateService(
         HttpClient httpClient,
         TimeSpan[]? attemptTimeouts = null,
@@ -340,6 +498,12 @@ public class DownloadServiceTests
         {
             Content = new ByteArrayContent(Encoding.UTF8.GetBytes("image-bytes"))
         };
+    }
+
+    private static byte[] CreatePngBytes()
+    {
+        return Convert.FromBase64String(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
     }
 
     private static string CreateTempDirectory()
@@ -413,6 +577,68 @@ public class DownloadServiceTests
         {
             _applyAuthentication(request);
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class CanvasFallbackStubScraper :
+        IScraper,
+        ICustomPageDownloadProvider,
+        IRenderedPageFallbackProvider
+    {
+        private readonly byte[] _renderedImage;
+
+        public CanvasFallbackStubScraper(byte[] renderedImage)
+        {
+            _renderedImage = renderedImage;
+        }
+
+        public int RenderedFallbackCalls { get; private set; }
+        public int LastPageNumber { get; private set; }
+        public string? LastChapterUrl { get; private set; }
+        public string Name => "Canvas Fallback Stub";
+        public string BaseUrl => "https://manga.example";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(CreateManga());
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+            => Task.FromResult(chapter.Pages);
+
+        public IReadOnlyList<string> GetPageDownloadCandidates(string imageUrl) => [imageUrl];
+
+        public void ApplyPageDownloadHeaders(HttpRequestMessage request, string imageUrl)
+        {
+        }
+
+        public async Task CopyPageResponseAsync(
+            HttpResponseMessage response,
+            Stream destination,
+            string imageUrl,
+            CancellationToken ct = default)
+        {
+            await response.Content.CopyToAsync(destination, ct);
+        }
+
+        public bool ShouldUseRenderedPageFallback(string imageUrl)
+            => imageUrl.Contains("#scrambled", StringComparison.Ordinal);
+
+        public async Task<bool> TryWriteRenderedPageAsync(
+            string chapterUrl,
+            int pageNumber,
+            string imageUrl,
+            Stream destination,
+            CancellationToken ct = default)
+        {
+            RenderedFallbackCalls++;
+            LastPageNumber = pageNumber;
+            LastChapterUrl = chapterUrl;
+            await destination.WriteAsync(_renderedImage, ct);
+            return true;
         }
     }
 

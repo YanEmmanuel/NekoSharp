@@ -74,10 +74,9 @@ public class DownloadService : IDownloadService
 
     private static HttpClient CreateDefaultHttpClient(LogService? logService, CloudflareCredentialStore? cfStore)
     {
-        var innerHandler = new HttpClientHandler
-        {
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
-        };
+        var innerHandler = MangaDexHttpTransport.CreateHandler(
+            logService,
+            DecompressionMethods.GZip | DecompressionMethods.Deflate);
 
         HttpMessageHandler handler = new CloudflareHandler(
             inner: innerHandler,
@@ -196,6 +195,7 @@ public class DownloadService : IDownloadService
                     page.ImageUrl,
                     filePath,
                     page.RefererUrl ?? chapter.Url,
+                    page.Number,
                     scraper,
                     ct);
             }
@@ -208,6 +208,7 @@ public class DownloadService : IDownloadService
                         page.ImageUrl,
                         tempFile,
                         page.RefererUrl ?? chapter.Url,
+                        page.Number,
                         scraper,
                         ct);
                     await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
@@ -369,10 +370,23 @@ public class DownloadService : IDownloadService
         string url,
         string filePath,
         string referer,
+        int pageNumber,
         IScraper scraper,
         CancellationToken ct)
     {
         var currentUrl = url;
+        var customProvider = scraper as ICustomPageDownloadProvider;
+        var renderedFallbackProvider = scraper as IRenderedPageFallbackProvider;
+        var canUseRenderedFallback =
+            renderedFallbackProvider?.ShouldUseRenderedPageFallback(url) == true;
+        var downloadCandidates = customProvider is not null
+            ? customProvider.GetPageDownloadCandidates(url)
+            : [url];
+        if (downloadCandidates.Count == 0)
+            downloadCandidates = [url];
+
+        var candidateIndex = 0;
+        currentUrl = downloadCandidates[candidateIndex];
         var attempt = 0;
 
         while (true)
@@ -399,6 +413,8 @@ public class DownloadService : IDownloadService
 
                 request.Headers.Add("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5");
 
+                customProvider?.ApplyPageDownloadHeaders(request, currentUrl);
+
                 if (scraper is IAuthenticatedRequestProvider authenticatedProvider)
                     await authenticatedProvider.ApplyRequestAuthenticationAsync(request, ct);
 
@@ -410,6 +426,15 @@ public class DownloadService : IDownloadService
                     HttpCompletionOption.ResponseHeadersRead,
                     timeoutCts.Token);
 
+                if (response.StatusCode == HttpStatusCode.NotFound &&
+                    candidateIndex + 1 < downloadCandidates.Count)
+                {
+                    candidateIndex++;
+                    currentUrl = downloadCandidates[candidateIndex];
+                    _log?.Debug($"[Download] Tentando URL alternativa para página: {currentUrl}");
+                    continue;
+                }
+
                 if (!response.IsSuccessStatusCode && IsTransientStatusCode(response.StatusCode))
                     throw new HttpRequestException(
                         $"Servidor retornou {(int)response.StatusCode} ({response.StatusCode}) para {currentUrl}.",
@@ -419,7 +444,6 @@ public class DownloadService : IDownloadService
                 response.EnsureSuccessStatusCode();
 
                 TryDeleteFile(partialFilePath);
-                await using var contentStream = await response.Content.ReadAsStreamAsync(timeoutCts.Token);
                 await using (var fileStream = new FileStream(
                                  partialFilePath,
                                  FileMode.Create,
@@ -428,7 +452,63 @@ public class DownloadService : IDownloadService
                                  8192,
                                  true))
                 {
-                    await contentStream.CopyToAsync(fileStream, timeoutCts.Token);
+                    if (customProvider is null)
+                    {
+                        await using var contentStream =
+                            await response.Content.ReadAsStreamAsync(timeoutCts.Token);
+                        await contentStream.CopyToAsync(fileStream, timeoutCts.Token);
+                    }
+                    else
+                    {
+                        await customProvider.CopyPageResponseAsync(
+                            response,
+                            fileStream,
+                            currentUrl,
+                            timeoutCts.Token);
+                    }
+                }
+
+                if (canUseRenderedFallback &&
+                    !await IsValidImageFileAsync(partialFilePath, timeoutCts.Token))
+                {
+                    TryDeleteFile(partialFilePath);
+
+                    if (candidateIndex + 1 < downloadCandidates.Count)
+                    {
+                        candidateIndex++;
+                        currentUrl = downloadCandidates[candidateIndex];
+                        _log?.Debug(
+                            $"[Download] Imagem Comix inválida; tentando URL alternativa: {currentUrl}");
+                        continue;
+                    }
+
+                    _log?.Warn(
+                        $"[Download] Imagem Comix inválida na página {pageNumber}; usando fallback de canvas.");
+
+                    await using (var fileStream = new FileStream(
+                                     partialFilePath,
+                                     FileMode.Create,
+                                     FileAccess.Write,
+                                     FileShare.None,
+                                     8192,
+                                     true))
+                    {
+                        var rendered = await renderedFallbackProvider!.TryWriteRenderedPageAsync(
+                            referer,
+                            pageNumber,
+                            url,
+                            fileStream,
+                            ct);
+                        if (!rendered)
+                            throw new TimeoutException(
+                                $"O Comix não renderizou o canvas da página {pageNumber}.");
+                    }
+
+                    if (!await IsValidImageFileAsync(partialFilePath, ct))
+                    {
+                        throw new InvalidDataException(
+                            $"O canvas do Comix gerou uma imagem inválida para a página {pageNumber}.");
+                    }
                 }
 
                 File.Move(partialFilePath, filePath, overwrite: true);
@@ -703,6 +783,12 @@ public class DownloadService : IDownloadService
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, EnsureMangaDexForcePort443(atHomeUri));
             request.Headers.Add("Accept", "application/json");
+            request.Headers.CacheControl = new System.Net.Http.Headers.CacheControlHeaderValue
+            {
+                NoCache = true,
+                NoStore = true
+            };
+            request.Headers.Pragma.ParseAdd("no-cache");
 
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
             response.EnsureSuccessStatusCode();
@@ -778,6 +864,23 @@ public class DownloadService : IDownloadService
         }
         catch
         {
+        }
+    }
+
+    private static async Task<bool> IsValidImageFileAsync(string path, CancellationToken ct)
+    {
+        try
+        {
+            var info = await Image.IdentifyAsync(path, ct);
+            return info is { Width: > 0, Height: > 0 };
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return false;
         }
     }
 
