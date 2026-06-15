@@ -68,6 +68,22 @@ public sealed class ProviderUpdateService
         if (!Directory.Exists(_providersDirectory))
             return [];
 
+        // Apply any pending updates written during previous session while DLLs were locked.
+        foreach (var pendingPath in Directory.GetFiles(_providersDirectory, "*.pending", SearchOption.TopDirectoryOnly)
+                     .Where(static f => f.EndsWith(".dll.pending", StringComparison.OrdinalIgnoreCase)))
+        {
+            var targetPath = pendingPath[..^".pending".Length];
+            try
+            {
+                File.Move(pendingPath, targetPath, overwrite: true);
+                _log?.Info($"[ProviderUpdate] Atualização pendente aplicada: {Path.GetFileName(targetPath)}");
+            }
+            catch (Exception ex)
+            {
+                _log?.Warn($"[ProviderUpdate] Falha ao aplicar atualização pendente {Path.GetFileName(pendingPath)}: {ex.Message}");
+            }
+        }
+
         return Directory.GetFiles(_providersDirectory, "*.dll", SearchOption.TopDirectoryOnly)
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ToArray();
@@ -237,6 +253,7 @@ public sealed class ProviderUpdateService
     private async Task DownloadAssemblyAsync(ProviderPackageManifest package, string targetPath, CancellationToken ct)
     {
         var tempPath = targetPath + ".tmp";
+        var pendingPath = targetPath + ".pending";
 
         try
         {
@@ -260,7 +277,20 @@ public sealed class ProviderUpdateService
                     throw new InvalidOperationException("Checksum SHA256 do provider não confere com o manifesto.");
             }
 
-            File.Move(tempPath, targetPath, true);
+            try
+            {
+                File.Move(tempPath, targetPath, overwrite: true);
+                if (File.Exists(pendingPath))
+                    try { File.Delete(pendingPath); } catch { }
+            }
+            catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+            {
+                // DLL is locked by running app. Save as .pending; applied on next startup.
+                File.Move(tempPath, pendingPath, overwrite: true);
+                _log?.Info(
+                    $"[ProviderUpdate] DLL em uso ({Path.GetFileName(targetPath)}). " +
+                    $"Atualização salva como pendente — será aplicada no próximo início do app.");
+            }
         }
         finally
         {

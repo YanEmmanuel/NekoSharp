@@ -176,6 +176,103 @@ public class ProviderUpdateServiceTests
         }
     }
 
+    [Fact]
+    public void GetInstalledProviderAssemblies_AppliesPendingUpdateBeforeReturning()
+    {
+        var providersDirectory = CreateTempDirectory();
+        try
+        {
+            var dllPath = Path.Combine(providersDirectory, "MeuProvider.dll");
+            var pendingPath = dllPath + ".pending";
+
+            File.WriteAllBytes(dllPath, [0x01]);
+            File.WriteAllBytes(pendingPath, [0x02, 0x03]);
+
+            var service = new ProviderUpdateService(
+                new InMemorySettingsStore(),
+                providersDirectory: providersDirectory);
+
+            var assemblies = service.GetInstalledProviderAssemblies();
+
+            Assert.Single(assemblies);
+            Assert.Equal(dllPath, assemblies[0], StringComparer.OrdinalIgnoreCase);
+            Assert.False(File.Exists(pendingPath));
+            Assert.Equal(new byte[] { 0x02, 0x03 }, File.ReadAllBytes(dllPath));
+        }
+        finally
+        {
+            CleanupTempDirectory(providersDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task UpdateProvidersAsync_LockedDll_SavesPendingAndMarksVersionInstalled()
+    {
+        if (!OperatingSystem.IsWindows())
+            return; // File locking is mandatory only on Windows; pending path is Windows-specific.
+        const string manifestUrl = "https://example.com/providers/manifest.json";
+        const string assemblyUrl = "https://cdn.example/providers/MeuProvider.dll";
+
+        var settings = new InMemorySettingsStore();
+        await settings.SetStringAsync(ProviderUpdateService.SettingsManifestUrlKey, manifestUrl);
+
+        var dllBytes = new byte[] { 0x4D, 0x5A, 0x90, 0x00, 0x01, 0x02, 0x03, 0x04 };
+        var sha256 = Convert.ToHexString(SHA256.HashData(dllBytes));
+        var manifest = $$"""
+                         {
+                           "providers": [
+                             {
+                               "name": "MeuProvider",
+                               "version": "2.0.0",
+                               "assemblyUrl": "{{assemblyUrl}}",
+                               "sha256": "{{sha256}}",
+                               "enabled": true
+                             }
+                           ]
+                         }
+                         """;
+
+        var handler = new StubHttpMessageHandler();
+        handler.AddJson(manifestUrl, manifest);
+        handler.AddBytes(assemblyUrl, dllBytes);
+
+        using var http = new HttpClient(handler);
+        var providersDirectory = CreateTempDirectory();
+        FileStream? lockedStream = null;
+
+        try
+        {
+            var dllPath = Path.Combine(providersDirectory, "MeuProvider.dll");
+            File.WriteAllBytes(dllPath, [0x01]);
+
+            // Lock the DLL to simulate it being loaded by the running app
+            lockedStream = File.Open(dllPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+
+            var service = new ProviderUpdateService(
+                settings,
+                httpClient: http,
+                providersDirectory: providersDirectory);
+
+            var result = await service.UpdateProvidersAsync();
+
+            // Should count as "downloaded" (pending)
+            Assert.Equal(1, result.DownloadedCount);
+
+            var pendingPath = dllPath + ".pending";
+            Assert.True(File.Exists(pendingPath));
+            Assert.Equal(dllBytes, await File.ReadAllBytesAsync(pendingPath));
+
+            // Version key persisted so next startup skips re-download
+            var versionKey = "Providers.DynamicUpdates.InstalledVersion.MeuProvider";
+            Assert.Equal("2.0.0", await settings.GetStringAsync(versionKey));
+        }
+        finally
+        {
+            lockedStream?.Dispose();
+            CleanupTempDirectory(providersDirectory);
+        }
+    }
+
     private static string CreateTempDirectory()
     {
         var path = Path.Combine(Path.GetTempPath(), "NekoSharp.Tests", Guid.NewGuid().ToString("N"));
