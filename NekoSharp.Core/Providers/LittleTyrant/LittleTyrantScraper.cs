@@ -27,6 +27,24 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         @"var\s+pages\s*=\s*(\[[\s\S]*?\])\s*;",
         RegexOptions.Compiled | RegexOptions.Singleline);
 
+    // PuppeteerSharp 21.x crasha ao processar Runtime.consoleAPICalled de certos
+    // args do site ("Specified cast is not valid"), fechando a página. Substituir
+    // console.* por no-op antes dos scripts da página impede o evento CDP.
+    private const string ConsoleSuppressionScript =
+        """
+        (() => {
+            try {
+                const noop = function() {};
+                const methods = ["log","info","warn","error","debug","trace","dir","dirxml",
+                    "table","group","groupCollapsed","groupEnd","count","countReset",
+                    "time","timeLog","timeEnd","assert","profile","profileEnd","clear"];
+                for (const name of methods) {
+                    try { window.console[name] = noop; } catch (e) {}
+                }
+            } catch (e) {}
+        })();
+        """;
+
     private readonly ProviderCookieSessionStore _cookieStore;
     private readonly ProviderAuthStore _credentialStore;
     private readonly CloudflareCredentialStore? _cfStore;
@@ -485,10 +503,11 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         {
             browser = await LaunchBrowserAsync(ct);
             await using var page = await browser.NewPageAsync();
+            await page.EvaluateExpressionOnNewDocumentAsync(ConsoleSuppressionScript);
 
             await page.GoToAsync(LoginUri.ToString(), new NavigationOptions
             {
-                WaitUntil = [WaitUntilNavigation.Networkidle2],
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
                 Timeout = (int)TimeSpan.FromSeconds(60).TotalMilliseconds
             });
 
@@ -583,6 +602,7 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         {
             browser = await LaunchHeadlessBrowserAsync(ct);
             await using var page = await browser.NewPageAsync();
+            await page.EvaluateExpressionOnNewDocumentAsync(ConsoleSuppressionScript);
 
             var cookies = CaptureCurrentCookies();
             if (cookies.Count > 0)
