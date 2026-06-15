@@ -1,4 +1,5 @@
 using System.Net;
+using AngleSharp;
 using NekoSharp.Core.Providers.Comix;
 using Xunit;
 
@@ -234,5 +235,75 @@ public class ComixScraperTests
             $"data:image/png;base64,{Convert.ToBase64String(expected)}");
 
         Assert.Equal(expected, decoded);
+    }
+
+    public static IEnumerable<object[]> DetectImageExtensionCases()
+    {
+        yield return [new byte[] { 0x89, 0x50, 0x4E, 0x47, 0, 0, 0, 0 }, "image/png", ".png"];
+        yield return [new byte[] { 0xFF, 0xD8, 0xFF, 0x00 }, "image/jpeg", ".jpg"];
+        yield return [new byte[] { (byte)'R', (byte)'I', (byte)'F', (byte)'F', 0, 0, 0, 0, (byte)'W', (byte)'E', (byte)'B', (byte)'P' }, "image/webp", ".webp"];
+        yield return [new byte[] { (byte)'G', (byte)'I', (byte)'F', (byte)'8', (byte)'9', (byte)'a' }, "image/gif", ".gif"];
+        yield return [new byte[] { 0x00, 0x01 }, "image/jpeg", ".jpg"];
+    }
+
+    [Theory]
+    [MemberData(nameof(DetectImageExtensionCases))]
+    public void DetectImageExtension_UsesMagicBytesThenMimeType(byte[] bytes, string mimeType, string expected)
+    {
+        Assert.Equal(expected, ComixScraper.DetectImageExtension(bytes, mimeType));
+    }
+
+    [Fact]
+    public void GetMimeTypeFromDataUrl_ReadsMetadataPrefix()
+    {
+        var mimeType = ComixScraper.GetMimeTypeFromDataUrl("data:image/webp;base64,AAAA");
+
+        Assert.Equal("image/webp", mimeType);
+    }
+
+    [Theory]
+    [InlineData("https://cdn.example/page.webp?v3", "https://cdn.example/page.webp")]
+    [InlineData("https://cdn.example/page.webp?v3=1", "https://cdn.example/page.webp")]
+    [InlineData("https://cdn.example/page.webp?foo=1&v3=1&bar=2", "https://cdn.example/page.webp?foo=1&bar=2")]
+    [InlineData("https://cdn.example/page.webp?foo=1", "https://cdn.example/page.webp?foo=1")]
+    public void StripComixVersionQuery_RemovesOnlyV3Marker(string input, string expected)
+    {
+        Assert.Equal(expected, ComixScraper.StripComixVersionQuery(input));
+    }
+
+    [Fact]
+    public async Task BuildMangaInfoFromHtml_UsesHtmlMetadataInsteadOfApiPayload()
+    {
+        const string url = "https://comix.to/title/my91m-ruthless-s-2-uncensored";
+        const string html =
+            """
+            <html>
+              <head>
+                <title>Ignored - Comix</title>
+                <link rel="canonical" href="/title/my91m-ruthless-s-2-uncensored" />
+                <meta property="og:title" content="Ruthless S2 Uncensored" />
+                <meta property="og:description" content="Rendered from HTML page." />
+                <meta property="og:image" content="/covers/ruthless.webp" />
+              </head>
+              <body>
+                <h1>Fallback Heading</h1>
+              </body>
+            </html>
+            """;
+
+        var browser = BrowsingContext.New(Configuration.Default);
+        var document = await browser.OpenAsync(req => req.Content(html).Address(url));
+
+        var manga = ComixScraper.BuildMangaInfoFromHtml(
+            document,
+            url,
+            "my91m",
+            "my91m-ruthless-s-2-uncensored");
+
+        Assert.Equal("Ruthless S2 Uncensored", manga.Name);
+        Assert.Equal("Rendered from HTML page.", manga.Description);
+        Assert.Equal("https://comix.to/covers/ruthless.webp", manga.CoverUrl);
+        Assert.Equal(url, manga.Url);
+        Assert.Equal("Comix", manga.SiteName);
     }
 }

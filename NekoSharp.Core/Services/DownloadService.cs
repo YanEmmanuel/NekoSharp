@@ -32,6 +32,8 @@ public class DownloadService : IDownloadService
     private int _maxConcurrentDownloads = 4;
     private int _adaptiveMaxConcurrentDownloads = int.MaxValue;
     private int _successfulDownloadsSinceThrottle;
+    private static readonly IReadOnlyDictionary<int, RenderedPageDownload> EmptyRenderedPages =
+        new Dictionary<int, RenderedPageDownload>();
 
     private static readonly TimeSpan[] DefaultAttemptTimeouts = [
         TimeSpan.FromSeconds(15),
@@ -127,6 +129,12 @@ public class DownloadService : IDownloadService
                 ct);
         }
 
+        var renderedPagesByNumber = await TryGetRenderedChapterDownloadsAsync(
+            scraper as IRenderedChapterDownloadProvider,
+            chapter,
+            scraper,
+            ct);
+
         var mangaDir = DownloadPaths.GetMangaDirectory(outputDirectory, manga);
         Directory.CreateDirectory(mangaDir);
 
@@ -147,12 +155,13 @@ public class DownloadService : IDownloadService
 
         var tasks = chapter.Pages.Select(async page =>
         {
-            var originalExtension = GetFileExtension(page.ImageUrl);
+            renderedPagesByNumber.TryGetValue(page.Number, out var renderedPage);
+            var sourceExtension = NormalizeImageExtension(renderedPage?.Extension, page.ImageUrl);
                 
             string targetExtension;
             if (targetStartFormat == ImageFormat.Original)
             {
-                targetExtension = originalExtension;
+                targetExtension = sourceExtension;
             }
             else
             {
@@ -161,7 +170,7 @@ public class DownloadService : IDownloadService
                     ImageFormat.Jpeg => ".jpg",
                     ImageFormat.Png => ".png",
                     ImageFormat.WebP => ".webp",
-                    _ => originalExtension
+                    _ => sourceExtension
                 };
             }
                 
@@ -176,12 +185,12 @@ public class DownloadService : IDownloadService
             }
 
             bool needsConversion = targetStartFormat != ImageFormat.Original &&
-                                   !string.Equals(originalExtension, targetExtension, StringComparison.OrdinalIgnoreCase) && 
-                                   !(originalExtension == ".jpeg" && targetExtension == ".jpg");
+                                   !string.Equals(sourceExtension, targetExtension, StringComparison.OrdinalIgnoreCase) &&
+                                   !(sourceExtension == ".jpeg" && targetExtension == ".jpg");
 
             if (targetStartFormat == ImageFormat.Original && compressionPercent > 0)
             {
-                needsConversion = CanReencodeExtension(originalExtension);
+                needsConversion = CanReencodeExtension(sourceExtension);
             }
 
             if (targetStartFormat != ImageFormat.Original && compressionPercent > 0)
@@ -191,26 +200,41 @@ public class DownloadService : IDownloadService
 
             if (!needsConversion)
             {
-                await DownloadFileWithRetryAsync(
-                    page.ImageUrl,
-                    filePath,
-                    page.RefererUrl ?? chapter.Url,
-                    page.Number,
-                    scraper,
-                    ct);
-            }
-            else
-            {
-                var tempFile = Path.Combine(tempDir, $"{page.Number:D3}_tmp{originalExtension}");
-                try
+                if (renderedPage is null)
                 {
                     await DownloadFileWithRetryAsync(
                         page.ImageUrl,
-                        tempFile,
+                        filePath,
                         page.RefererUrl ?? chapter.Url,
                         page.Number,
                         scraper,
                         ct);
+                }
+                else
+                {
+                    await File.WriteAllBytesAsync(filePath, renderedPage.Bytes, ct);
+                }
+            }
+            else
+            {
+                var tempFile = Path.Combine(tempDir, $"{page.Number:D3}_tmp{sourceExtension}");
+                try
+                {
+                    if (renderedPage is null)
+                    {
+                        await DownloadFileWithRetryAsync(
+                            page.ImageUrl,
+                            tempFile,
+                            page.RefererUrl ?? chapter.Url,
+                            page.Number,
+                            scraper,
+                            ct);
+                    }
+                    else
+                    {
+                        await File.WriteAllBytesAsync(tempFile, renderedPage.Bytes, ct);
+                    }
+
                     await ConvertImageAsync(tempFile, filePath, targetStartFormat, compressionPercent, ct);
                 }
                 finally
@@ -291,6 +315,61 @@ public class DownloadService : IDownloadService
 
             try { Directory.Delete(tempDir, true); }
             catch {   }
+        }
+    }
+
+    private async Task<IReadOnlyDictionary<int, RenderedPageDownload>> TryGetRenderedChapterDownloadsAsync(
+        IRenderedChapterDownloadProvider? provider,
+        Chapter chapter,
+        IScraper scraper,
+        CancellationToken ct)
+    {
+        if (provider is null || chapter.Pages.Count == 0)
+            return EmptyRenderedPages;
+
+        try
+        {
+            var renderedPages = await ExecuteProviderOperationWithRetryAsync(
+                () => provider.TryRenderChapterPagesAsync(chapter, chapter.Pages, ct),
+                scraper.Name,
+                "renderizar páginas do capítulo",
+                ct);
+
+            if (renderedPages.Count == 0)
+                return EmptyRenderedPages;
+
+            var normalized = new Dictionary<int, RenderedPageDownload>();
+            foreach (var (pageNumber, renderedPage) in renderedPages)
+            {
+                if (pageNumber <= 0 ||
+                    renderedPage is null ||
+                    renderedPage.Bytes.Length == 0)
+                {
+                    continue;
+                }
+
+                normalized[pageNumber] = renderedPage with
+                {
+                    Extension = NormalizeImageExtension(renderedPage.Extension, string.Empty)
+                };
+            }
+
+            if (normalized.Count == 0)
+                return EmptyRenderedPages;
+
+            _log?.Info(
+                $"[Download] Provider {scraper.Name} renderizou {normalized.Count}/{chapter.Pages.Count} página(s) do capítulo {chapter.Number} no browser.");
+            return normalized;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn(
+                $"[Download] Provider {scraper.Name} falhou ao renderizar páginas do capítulo {chapter.Number} no browser. Usando download HTTP: {ex.Message}");
+            return EmptyRenderedPages;
         }
     }
 
@@ -901,6 +980,24 @@ public class DownloadService : IDownloadService
         {
             return ".jpg";
         }
+    }
+
+    private static string NormalizeImageExtension(string? preferredExtension, string fallbackUrl)
+    {
+        var extension = preferredExtension?.Trim();
+        if (!string.IsNullOrWhiteSpace(extension))
+        {
+            if (!extension.StartsWith(".", StringComparison.Ordinal))
+                extension = "." + extension;
+
+            extension = extension.ToLowerInvariant();
+            if (extension is ".jpg" or ".jpeg" or ".png" or ".gif" or ".webp" or ".avif" or ".bmp")
+                return extension;
+        }
+
+        return string.IsNullOrWhiteSpace(fallbackUrl)
+            ? ".png"
+            : GetFileExtension(fallbackUrl);
     }
 
     private static bool CanReencodeExtension(string extension)

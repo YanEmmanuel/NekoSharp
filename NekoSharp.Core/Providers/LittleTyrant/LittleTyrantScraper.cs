@@ -157,6 +157,15 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             return pages;
         }
 
+        Log?.Debug($"[{Name}] HTTP não expôs páginas para {chapter.Url}. Tentando fallback com browser...");
+        pages = await ExtractPagesWithBrowserFallbackAsync(chapter.Url, ct);
+
+        if (pages.Count > 0)
+        {
+            Log?.Debug($"[{Name}] Extraídas {pages.Count} páginas via browser para {chapter.Url}");
+            return pages;
+        }
+
         throw new InvalidOperationException(
             "Little Tyrant não expôs imagens no capítulo. A sessão pode estar expirada; refaça o login do provider.");
     }
@@ -539,6 +548,83 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
 
             ct.ThrowIfCancellationRequested();
             return await Puppeteer.LaunchAsync(options);
+        }
+    }
+
+    private static async Task<IBrowser> LaunchHeadlessBrowserAsync(CancellationToken ct)
+    {
+        var options = new LaunchOptions
+        {
+            Headless = true,
+            DefaultViewport = null,
+            Args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+        };
+
+        try
+        {
+            ct.ThrowIfCancellationRequested();
+            return await Puppeteer.LaunchAsync(options);
+        }
+        catch
+        {
+            var fetcher = new BrowserFetcher();
+            var installed = await fetcher.DownloadAsync();
+            options.ExecutablePath = fetcher.GetExecutablePath(installed.BuildId);
+
+            ct.ThrowIfCancellationRequested();
+            return await Puppeteer.LaunchAsync(options);
+        }
+    }
+
+    private async Task<List<MangaPage>> ExtractPagesWithBrowserFallbackAsync(string chapterUrl, CancellationToken ct)
+    {
+        IBrowser? browser = null;
+        try
+        {
+            browser = await LaunchHeadlessBrowserAsync(ct);
+            await using var page = await browser.NewPageAsync();
+
+            var cookies = CaptureCurrentCookies();
+            if (cookies.Count > 0)
+            {
+                await page.SetCookieAsync(cookies.Select(kv => new CookieParam
+                {
+                    Name = kv.Key,
+                    Value = kv.Value,
+                    Domain = SiteRootUri.Host,
+                    Path = "/"
+                }).ToArray());
+            }
+
+            var userAgent = _authHttp.DefaultRequestHeaders.UserAgent.ToString();
+            if (!string.IsNullOrWhiteSpace(userAgent))
+                await page.SetUserAgentAsync(userAgent);
+
+            await page.GoToAsync(chapterUrl, new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.Networkidle2],
+                Timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds
+            });
+
+            var html = await page.GetContentAsync();
+            if (string.IsNullOrWhiteSpace(html))
+                return [];
+
+            var document = await OpenDocumentAsync(html, chapterUrl, ct);
+
+            var readerScripts = GetReaderScriptContents(document);
+            var pages = ExtractPagesFromReaderScripts(readerScripts, chapterUrl);
+            if (pages.Count > 0)
+                return pages;
+
+            return ExtractPagesFromReaderScripts(
+                document.QuerySelectorAll("script").Select(static s => s.TextContent),
+                chapterUrl);
+        }
+        finally
+        {
+            if (browser is not null)
+                try { await browser.CloseAsync(); } catch { }
         }
     }
 

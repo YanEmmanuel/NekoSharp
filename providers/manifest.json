@@ -2,9 +2,9 @@
   "providers": [
     {
       "name": "NekoSharp.DynamicProviders",
-      "version": "2026.06.11.15-e06aa8a",
+      "version": "2026.06.14.01-5a7c14f",
       "assemblyUrl": "https://raw.githubusercontent.com/YanEmmanuel/NekoSharp/master/providers/NekoSharp.DynamicProviders.dll",
-      "sha256": "6958EFF9E1585215F587597257E5E32E3CE8328AAA4A639E0BC46AC7145E069E",
+      "sha256": "BEA2505211F10E2E58D6AAECE471ADFE85A2CB130264B5EB0F4A986D853131D0",
       "enabled": true
     }
   ]

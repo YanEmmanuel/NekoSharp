@@ -3,12 +3,15 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using AngleSharp;
+using AngleSharp.Dom;
 using NekoSharp.Core.Interfaces;
 using NekoSharp.Core.Models;
 using NekoSharp.Core.Services;
 using PuppeteerSharp;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Formats.Png;
 using SixLabors.ImageSharp.Formats.Webp;
 using MangaPage = NekoSharp.Core.Models.Page;
 
@@ -17,6 +20,7 @@ namespace NekoSharp.Core.Providers.Comix;
 public sealed class ComixScraper :
     IScraper,
     ICustomPageDownloadProvider,
+    IRenderedChapterDownloadProvider,
     IRenderedPageFallbackProvider
 {
     private const string ApiBaseUrl = "https://comix.to/api/v1/";
@@ -27,7 +31,8 @@ public sealed class ComixScraper :
 
     private static readonly Uri SiteRootUri = new($"{BaseUrlStatic}/");
     private static readonly TimeSpan BrowserPayloadTimeout = TimeSpan.FromSeconds(30);
-    private static readonly SemaphoreSlim RenderedPageFallbackLock = new(1, 1);
+    private static readonly TimeSpan BrowserRenderStepTimeout = TimeSpan.FromSeconds(12);
+    private static readonly SemaphoreSlim BrowserRenderLock = new(1, 1);
     private static readonly Regex ScramblePathRegex = new(
         "/s?i+/",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -133,6 +138,44 @@ public sealed class ComixScraper :
         })();
         """;
 
+    private const string BlobCaptureScript =
+        """
+        (() => {
+            try {
+                Object.defineProperty(navigator, "webdriver", { get: () => undefined });
+            } catch {}
+
+            if (window.__nekosharpComixBlobHookInstalled) return;
+            window.__nekosharpComixBlobHookInstalled = true;
+            window.__nekosharpComixBlobHits = [];
+            window.__nekosharpComixBlobMap = new Map();
+            window.__nekosharpComixBlobErrors = [];
+
+            const originalCreateObjectUrl = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function(blob) {
+                const url = originalCreateObjectUrl(blob);
+                try {
+                    window.__nekosharpComixBlobMap.set(url, blob);
+                    window.__nekosharpComixBlobHits.push({
+                        url,
+                        type: blob && blob.type ? blob.type : "",
+                        size: blob && typeof blob.size === "number" ? blob.size : 0,
+                        ts: Date.now()
+                    });
+                } catch (error) {
+                    window.__nekosharpComixBlobErrors.push(String(error && error.stack || error));
+                }
+
+                return url;
+            };
+
+            URL.revokeObjectURL = function() {
+                // Keep blob mapped for later extraction.
+                return undefined;
+            };
+        })();
+        """;
+
     private readonly HttpClient _http;
     private readonly LogService? _log;
     private readonly CloudflareCredentialStore? _cfStore;
@@ -189,27 +232,11 @@ public sealed class ComixScraper :
     public async Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
     {
         var parsed = ParseSupportedUrl(url);
-        var result = await GetResultAsync($"manga/{Uri.EscapeDataString(parsed.HashId)}", ct);
-
-        var title = GetString(result, "title") ?? $"Comix {parsed.HashId}";
-        var canonicalUrl = BuildMangaUrl(
-            parsed.HashId,
-            GetString(result, "url"),
-            parsed.MangaSegment);
-        var coverUrl =
-            GetNestedString(result, "poster", "large") ??
-            GetNestedString(result, "poster", "medium") ??
-            GetNestedString(result, "poster", "small") ??
-            string.Empty;
-
-        return new Manga
-        {
-            Name = title,
-            CoverUrl = coverUrl,
-            Description = BuildDescription(result),
-            Url = canonicalUrl,
-            SiteName = Name
-        };
+        var mangaUrl = BuildMangaUrl(parsed.HashId, url, parsed.MangaSegment);
+        var document = await LoadHtmlDocumentAsync(mangaUrl, ct);
+        var manga = BuildMangaInfoFromHtml(document, mangaUrl, parsed.HashId, parsed.MangaSegment);
+        _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
+        return manga;
     }
 
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
@@ -320,6 +347,102 @@ public sealed class ComixScraper :
         return imageUrl.Contains("#scrambled", StringComparison.Ordinal);
     }
 
+    public async Task<IReadOnlyDictionary<int, RenderedPageDownload>> TryRenderChapterPagesAsync(
+        Chapter chapter,
+        IReadOnlyList<MangaPage> pages,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(chapter);
+        ArgumentNullException.ThrowIfNull(pages);
+
+        if (pages.Count == 0)
+            return new Dictionary<int, RenderedPageDownload>();
+
+        var protectedPages = pages
+            .Where(static candidate => candidate.Number > 0 && IsProtectedPageUrl(candidate.ImageUrl))
+            .OrderBy(static candidate => candidate.Number)
+            .ToArray();
+        if (protectedPages.Length == 0)
+            return new Dictionary<int, RenderedPageDownload>();
+
+        await BrowserRenderLock.WaitAsync(ct);
+        try
+        {
+            await using var browser = await LaunchBrowserAsync(ct);
+            await using var page = await browser.NewPageAsync();
+            await PrepareBrowserPageAsync(page, chapter.Url);
+            await page.EvaluateExpressionOnNewDocumentAsync(BlobCaptureScript);
+
+            await page.GoToAsync(chapter.Url, new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                Timeout = (int)BrowserPayloadTimeout.TotalMilliseconds
+            });
+
+            var renderedPages = new Dictionary<int, RenderedPageDownload>();
+            foreach (var chapterPage in protectedPages)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                if (!await NavigateReaderToPageAsync(page, chapterPage.Number, ct))
+                {
+                    _log?.Warn(
+                        $"[Comix] Não foi possível navegar até a página {chapterPage.Number} durante captura renderizada.");
+                    continue;
+                }
+
+                var imageDataUrl = await CaptureProtectedReaderPageDataUrlAsync(
+                    page,
+                    chapterPage.Number,
+                    ct);
+                if (string.IsNullOrWhiteSpace(imageDataUrl))
+                {
+                    _log?.Warn(
+                        $"[Comix] Página protegida {chapterPage.Number} não expôs blob/data URL capturável.");
+                    continue;
+                }
+
+                try
+                {
+                    var sourceBytes = DecodeCanvasDataUrl(imageDataUrl);
+                    var sourceExtension = DetectImageExtension(
+                        sourceBytes,
+                        GetMimeTypeFromDataUrl(imageDataUrl));
+                    if (string.IsNullOrWhiteSpace(sourceExtension))
+                        sourceExtension = GetUrlImageExtension(chapterPage.ImageUrl);
+
+                    renderedPages[chapterPage.Number] = new RenderedPageDownload(
+                        chapterPage.Number,
+                        sourceBytes,
+                        sourceExtension);
+                }
+                catch (Exception ex)
+                {
+                    _log?.Warn(
+                        $"[Comix] Falha ao decodificar blob da página {chapterPage.Number}: {ex.Message}");
+                }
+            }
+
+            _log?.Info(
+                $"[Comix] Capturadas {renderedPages.Count}/{protectedPages.Length} página(s) protegidas do capítulo {chapter.Number} via blob.");
+            return renderedPages;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _log?.Warn(
+                $"[Comix] Falha ao renderizar capítulo inteiro no browser ({chapter.Url}): {ex.Message}");
+            return new Dictionary<int, RenderedPageDownload>();
+        }
+        finally
+        {
+            BrowserRenderLock.Release();
+        }
+    }
+
     public async Task<bool> TryWriteRenderedPageAsync(
         string chapterUrl,
         int pageNumber,
@@ -332,12 +455,13 @@ public sealed class ComixScraper :
         ArgumentException.ThrowIfNullOrWhiteSpace(imageUrl);
         ArgumentNullException.ThrowIfNull(destination);
 
-        await RenderedPageFallbackLock.WaitAsync(ct);
+        await BrowserRenderLock.WaitAsync(ct);
         try
         {
             await using var browser = await LaunchBrowserAsync(ct);
             await using var page = await browser.NewPageAsync();
             await PrepareBrowserPageAsync(page, chapterUrl);
+            await page.EvaluateExpressionOnNewDocumentAsync(BlobCaptureScript);
 
             await page.GoToAsync(chapterUrl, new NavigationOptions
             {
@@ -345,12 +469,21 @@ public sealed class ComixScraper :
                 Timeout = (int)BrowserPayloadTimeout.TotalMilliseconds
             });
 
-            var mimeType = GetCanvasMimeType(imageUrl);
             if (!await NavigateReaderToPageAsync(page, pageNumber, ct))
             {
                 _log?.Warn(
                     $"[Comix] Não foi possível navegar até a página {pageNumber} em {chapterUrl}.");
                 return false;
+            }
+
+            var imageDataUrl = await CaptureProtectedReaderPageDataUrlAsync(page, pageNumber, ct);
+            if (!string.IsNullOrWhiteSpace(imageDataUrl))
+            {
+                var blobBytes = DecodeCanvasDataUrl(imageDataUrl);
+                await WriteImageBytesAsync(blobBytes, imageUrl, destination, ct);
+                _log?.Info(
+                    $"[Comix] Blob capturado para página {pageNumber} ({blobBytes.Length} bytes).");
+                return true;
             }
 
             var imageRequestUrl = StripFragment(new Uri(imageUrl))?.ToString() ?? imageUrl;
@@ -381,7 +514,7 @@ public sealed class ComixScraper :
                                      "content-type",
                                      out var contentType)
                                  ? contentType.Split(';', 2)[0]
-                                 : mimeType;
+                                 : GetCanvasMimeType(imageUrl);
             var sourceDataUrl =
                 $"data:{sourceMimeType};base64,{Convert.ToBase64String(sourceBytes)}";
 
@@ -405,7 +538,7 @@ public sealed class ComixScraper :
                 sourceDataUrl);
 
             var canvasBytes = DecodeCanvasDataUrl(canvasDataUrl);
-            await WriteCanvasImageAsync(canvasBytes, imageUrl, destination, ct);
+            await WriteImageBytesAsync(canvasBytes, imageUrl, destination, ct);
             _log?.Info(
                 $"[Comix] Canvas capturado para página {pageNumber} ({canvasBytes.Length} bytes PNG).");
             return true;
@@ -422,8 +555,98 @@ public sealed class ComixScraper :
         }
         finally
         {
-            RenderedPageFallbackLock.Release();
+            BrowserRenderLock.Release();
         }
+    }
+
+    private static async Task<string> CaptureProtectedReaderPageDataUrlAsync(
+        IPage page,
+        int targetPage,
+        CancellationToken ct)
+    {
+        var deadline = DateTimeOffset.UtcNow + BrowserRenderStepTimeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var dataUrl = await page.EvaluateFunctionAsync<string>(
+                """
+                async targetPage => {
+                    const getActivePage = () => {
+                        const active = document.querySelector(".rpage-progress__seg.is-active");
+                        const label = active?.getAttribute("aria-label") || "";
+                        const match = label.match(/(\d+)$/);
+                        return match ? Number(match[1]) : 0;
+                    };
+
+                    const isVisible = element => {
+                        const rect = element.getBoundingClientRect();
+                        if (rect.width < 48 || rect.height < 48) return false;
+
+                        const style = window.getComputedStyle(element);
+                        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") === 0) {
+                            return false;
+                        }
+
+                        return !(rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth);
+                    };
+
+                    const getCandidateSrc = () => {
+                        const targetAlt = `Page ${targetPage}`;
+                        const candidates = [...document.querySelectorAll("img[src]")]
+                            .filter(img =>
+                                isVisible(img) &&
+                                img.complete &&
+                                img.naturalWidth > 16 &&
+                                img.naturalHeight > 16 &&
+                                ((img.currentSrc || img.src || "").startsWith("blob:") ||
+                                 (img.currentSrc || img.src || "").startsWith("data:")))
+                            .map(img => ({
+                                src: img.currentSrc || img.src || "",
+                                alt: img.alt || "",
+                                area: (img.naturalWidth || img.width || 0) * (img.naturalHeight || img.height || 0)
+                            }))
+                            .sort((left, right) => {
+                                const leftExact = left.alt === targetAlt ? 1 : 0;
+                                const rightExact = right.alt === targetAlt ? 1 : 0;
+                                if (leftExact !== rightExact) return rightExact - leftExact;
+                                return right.area - left.area;
+                            });
+
+                        return candidates[0]?.src || "";
+                    };
+
+                    if (getActivePage() !== targetPage)
+                        return "";
+
+                    const src = getCandidateSrc();
+                    if (!src) return "";
+                    if (src.startsWith("data:")) return src;
+
+                    const blob = window.__nekosharpComixBlobMap?.get(src);
+                    if (!blob) return "";
+
+                    try {
+                        return await new Promise(resolve => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(typeof reader.result === "string" ? reader.result : "");
+                            reader.onerror = () => resolve("");
+                            reader.readAsDataURL(blob);
+                        });
+                    } catch (_) {
+                        return "";
+                    }
+                }
+                """,
+                targetPage);
+
+            if (!string.IsNullOrWhiteSpace(dataUrl))
+                return dataUrl;
+
+            await Task.Delay(200, ct);
+        }
+
+        return string.Empty;
     }
 
     private static async Task<bool> NavigateReaderToPageAsync(
@@ -541,6 +764,7 @@ public sealed class ComixScraper :
             var fullUrl = path.StartsWith("http", StringComparison.OrdinalIgnoreCase)
                 ? path
                 : $"{baseUrl}/{path.TrimStart('/')}";
+            fullUrl = StripComixVersionQuery(fullUrl);
             var isScrambled = GetInt(item, "s") == 1 || (index + 1) % 4 == 0;
             if (isScrambled)
                 fullUrl += "#scrambled";
@@ -617,8 +841,8 @@ public sealed class ComixScraper :
         };
     }
 
-    private static async Task WriteCanvasImageAsync(
-        byte[] pngBytes,
+    private static async Task WriteImageBytesAsync(
+        byte[] sourceBytes,
         string imageUrl,
         Stream destination,
         CancellationToken ct)
@@ -627,15 +851,15 @@ public sealed class ComixScraper :
             ? Path.GetExtension(uri.AbsolutePath).ToLowerInvariant()
             : string.Empty;
 
-        if (extension == ".png")
-        {
-            await destination.WriteAsync(pngBytes, ct);
-            return;
-        }
-
-        using var image = Image.Load(pngBytes);
+        using var image = Image.Load(sourceBytes);
         switch (extension)
         {
+            case ".png":
+                await image.SaveAsPngAsync(
+                    destination,
+                    new PngEncoder(),
+                    ct);
+                break;
             case ".jpg":
             case ".jpeg":
                 await image.SaveAsJpegAsync(
@@ -654,9 +878,142 @@ public sealed class ComixScraper :
                     ct);
                 break;
             default:
-                await destination.WriteAsync(pngBytes, ct);
+                await destination.WriteAsync(sourceBytes, ct);
                 break;
         }
+    }
+
+    internal static string DetectImageExtension(byte[] data, string? mimeType = null)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+
+        if (data.Length >= 12 &&
+            data[0] == (byte)'R' &&
+            data[1] == (byte)'I' &&
+            data[2] == (byte)'F' &&
+            data[3] == (byte)'F' &&
+            data[8] == (byte)'W' &&
+            data[9] == (byte)'E' &&
+            data[10] == (byte)'B' &&
+            data[11] == (byte)'P')
+        {
+            return ".webp";
+        }
+
+        if (data.Length >= 3 &&
+            data[0] == 0xFF &&
+            data[1] == 0xD8 &&
+            data[2] == 0xFF)
+        {
+            return ".jpg";
+        }
+
+        if (data.Length >= 8 &&
+            data[0] == 0x89 &&
+            data[1] == 0x50 &&
+            data[2] == 0x4E &&
+            data[3] == 0x47)
+        {
+            return ".png";
+        }
+
+        if (data.Length >= 6)
+        {
+            var header = System.Text.Encoding.ASCII.GetString(data, 0, 6);
+            if (header is "GIF87a" or "GIF89a")
+                return ".gif";
+        }
+
+        return mimeType?.ToLowerInvariant() switch
+        {
+            "image/png" => ".png",
+            "image/jpeg" => ".jpg",
+            "image/jpg" => ".jpg",
+            "image/webp" => ".webp",
+            "image/gif" => ".gif",
+            _ => string.Empty
+        };
+    }
+
+    internal static string GetMimeTypeFromDataUrl(string dataUrl)
+    {
+        if (string.IsNullOrWhiteSpace(dataUrl) ||
+            !dataUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        var separator = dataUrl.IndexOf(',');
+        if (separator <= 5)
+            return string.Empty;
+
+        var metadata = dataUrl[5..separator];
+        var mime = metadata.Split(';', 2)[0].Trim();
+        return mime;
+    }
+
+    private static bool IsProtectedPageUrl(string imageUrl)
+        => imageUrl.Contains("#scrambled", StringComparison.Ordinal);
+
+    private static string GetUrlImageExtension(string imageUrl)
+    {
+        if (!Uri.TryCreate(imageUrl, UriKind.Absolute, out var uri))
+            return ".png";
+
+        return Path.GetExtension(uri.AbsolutePath).ToLowerInvariant() switch
+        {
+            ".jpg" or ".jpeg" => ".jpg",
+            ".png" => ".png",
+            ".webp" => ".webp",
+            ".gif" => ".gif",
+            _ => ".png"
+        };
+    }
+
+    internal static string StripComixVersionQuery(string url)
+    {
+        if (string.IsNullOrWhiteSpace(url) ||
+            (!url.Contains("?v3", StringComparison.OrdinalIgnoreCase) &&
+             !url.Contains("&v3", StringComparison.OrdinalIgnoreCase)))
+        {
+            return url;
+        }
+
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            var fragmentIndex = url.IndexOf('#');
+            var fragment = fragmentIndex >= 0 ? url[fragmentIndex..] : string.Empty;
+            var withoutFragment = fragmentIndex >= 0 ? url[..fragmentIndex] : url;
+            var queryIndex = withoutFragment.IndexOf('?');
+            if (queryIndex < 0)
+                return url;
+
+            var basePart = withoutFragment[..queryIndex];
+            var queryPart = withoutFragment[(queryIndex + 1)..];
+            var filtered = string.Join(
+                "&",
+                queryPart
+                    .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                    .Where(static part => !part.Equals("v3", StringComparison.OrdinalIgnoreCase) &&
+                                          !part.StartsWith("v3=", StringComparison.OrdinalIgnoreCase)));
+
+            return string.IsNullOrWhiteSpace(filtered)
+                ? basePart + fragment
+                : $"{basePart}?{filtered}{fragment}";
+        }
+
+        var cleanedQuery = string.Join(
+            "&",
+            uri.Query
+                .TrimStart('?')
+                .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                .Where(static part => !part.Equals("v3", StringComparison.OrdinalIgnoreCase) &&
+                                      !part.StartsWith("v3=", StringComparison.OrdinalIgnoreCase)));
+
+        return new UriBuilder(uri)
+        {
+            Query = cleanedQuery
+        }.Uri.ToString();
     }
 
     internal static ComixUrlRef ParseSupportedUrl(string url)
@@ -780,15 +1137,97 @@ public sealed class ComixScraper :
             await page.SetCookieAsync(cookies);
     }
 
-    private static async Task<IBrowser> LaunchBrowserAsync(CancellationToken ct)
+    private async Task<IBrowser> LaunchBrowserAsync(CancellationToken ct)
     {
-        var options = new LaunchOptions
+        Exception? systemLaunchFailure = null;
+
+        var systemChrome = FindSystemChrome();
+        if (!string.IsNullOrWhiteSpace(systemChrome))
+        {
+            var tempProfile = CreateTempBrowserProfile();
+            try
+            {
+                _log?.Info($"[Comix] Launching browser: {systemChrome}");
+                var options = CreateBrowserLaunchOptions(systemChrome, tempProfile);
+                ct.ThrowIfCancellationRequested();
+                return await LaunchBrowserInternalAsync(options, tempProfile, ct);
+            }
+            catch (Exception ex)
+            {
+                systemLaunchFailure = ex;
+                _log?.Warn(
+                    $"[Comix] Failed to launch system Chromium ({systemChrome}): {ex.GetType().Name}: {ex.Message}");
+                TryDeleteDirectory(tempProfile);
+            }
+        }
+        else
+        {
+            _log?.Warn("[Comix] No system Chrome/Chromium found. Falling back to BrowserFetcher.");
+        }
+
+        try
+        {
+            var options = CreateBrowserLaunchOptions(executablePath: null, userDataDir: null);
+            ct.ThrowIfCancellationRequested();
+            return await Puppeteer.LaunchAsync(options);
+        }
+        catch (Exception directLaunchEx)
+        {
+            _log?.Warn(
+                $"[Comix] Direct Puppeteer launch failed: {directLaunchEx.GetType().Name}: {directLaunchEx.Message}. Downloading bundled browser...");
+
+            try
+            {
+                var fetcher = new BrowserFetcher();
+                var installed = await fetcher.DownloadAsync();
+                var downloadedBrowserPath = fetcher.GetExecutablePath(installed.BuildId);
+                var tempProfile = CreateTempBrowserProfile();
+                var options = CreateBrowserLaunchOptions(downloadedBrowserPath, tempProfile);
+
+                _log?.Info($"[Comix] Launching downloaded browser: {downloadedBrowserPath}");
+                ct.ThrowIfCancellationRequested();
+                return await LaunchBrowserInternalAsync(options, tempProfile, ct);
+            }
+            catch (Exception fetcherEx)
+            {
+                _log?.Warn(
+                    $"[Comix] BrowserFetcher launch failed: {fetcherEx.GetType().Name}: {fetcherEx.Message}");
+
+                var message = systemLaunchFailure is null
+                    ? $"Failed to launch browser. Direct launch: {directLaunchEx.GetType().Name}: {directLaunchEx.Message}. BrowserFetcher: {fetcherEx.GetType().Name}: {fetcherEx.Message}"
+                    : $"Failed to launch browser. System Chromium: {systemLaunchFailure.GetType().Name}: {systemLaunchFailure.Message}. Direct launch: {directLaunchEx.GetType().Name}: {directLaunchEx.Message}. BrowserFetcher: {fetcherEx.GetType().Name}: {fetcherEx.Message}";
+
+                throw new InvalidOperationException(message, fetcherEx);
+            }
+        }
+    }
+
+    private static LaunchOptions CreateBrowserLaunchOptions(string? executablePath, string? userDataDir)
+    {
+        return new LaunchOptions
         {
             Headless = true,
+            ExecutablePath = executablePath,
+            UserDataDir = userDataDir,
+            Args =
+            [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--start-minimized",
+                "--window-size=1280,850",
+            ],
+            IgnoredDefaultArgs = ["--enable-automation"],
             DefaultViewport = null,
-            Args = ["--no-sandbox", "--disable-setuid-sandbox"]
         };
+    }
 
+    private static async Task<IBrowser> LaunchBrowserInternalAsync(
+        LaunchOptions options,
+        string? tempProfile,
+        CancellationToken ct)
+    {
         try
         {
             ct.ThrowIfCancellationRequested();
@@ -796,12 +1235,66 @@ public sealed class ComixScraper :
         }
         catch
         {
-            var fetcher = new BrowserFetcher();
-            var installed = await fetcher.DownloadAsync();
-            options.ExecutablePath = fetcher.GetExecutablePath(installed.BuildId);
+            if (!string.IsNullOrWhiteSpace(tempProfile))
+                TryDeleteDirectory(tempProfile);
 
-            ct.ThrowIfCancellationRequested();
-            return await Puppeteer.LaunchAsync(options);
+            throw;
+        }
+    }
+
+    private static string CreateTempBrowserProfile()
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(),
+            "nekosharp-comix-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    private static string? FindSystemChrome()
+    {
+        var envChromePath = Environment.GetEnvironmentVariable("CHROME_PATH");
+        if (!string.IsNullOrWhiteSpace(envChromePath) && File.Exists(envChromePath))
+            return envChromePath;
+
+        string[] posixCandidates =
+        [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/usr/bin/brave-browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ];
+
+        var windowsCandidates = new List<string>();
+        foreach (var envVar in new[] { "PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA", "PROGRAMW6432" })
+        {
+            var root = Environment.GetEnvironmentVariable(envVar);
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+
+            windowsCandidates.Add(Path.Combine(root, "Google", "Chrome", "Application", "chrome.exe"));
+            windowsCandidates.Add(Path.Combine(root, "Google", "Chrome Beta", "Application", "chrome.exe"));
+            windowsCandidates.Add(Path.Combine(root, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"));
+        }
+
+        var candidates = OperatingSystem.IsWindows() ? windowsCandidates : posixCandidates.ToList();
+        return candidates.FirstOrDefault(File.Exists);
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(path) && Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
         }
     }
 
@@ -906,6 +1399,12 @@ public sealed class ComixScraper :
         if (!string.IsNullOrWhiteSpace(canonicalUrl))
         {
             var normalized = canonicalUrl.Trim();
+            if (Uri.TryCreate(normalized, UriKind.Absolute, out var absolute) &&
+                absolute.Host.Contains("comix.to", StringComparison.OrdinalIgnoreCase))
+            {
+                return absolute.ToString();
+            }
+
             if (normalized.StartsWith("/title/", StringComparison.OrdinalIgnoreCase))
                 return $"{BaseUrlStatic}{normalized}";
         }
@@ -938,6 +1437,68 @@ public sealed class ComixScraper :
         return string.IsNullOrWhiteSpace(name)
             ? $"Chapter {number}"
             : $"Chapter {number}: {name}";
+    }
+
+    private async Task<IDocument> LoadHtmlDocumentAsync(string url, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Remove("Accept");
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/html"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/xhtml+xml"));
+
+        using var response = await _http.SendAsync(request, ct);
+        var html = await response.Content.ReadAsStringAsync(ct);
+        response.EnsureSuccessStatusCode();
+
+        var browser = BrowsingContext.New(AngleSharp.Configuration.Default);
+        return await browser.OpenAsync(req => req.Content(html).Address(url), ct);
+    }
+
+    internal static Manga BuildMangaInfoFromHtml(
+        IDocument document,
+        string requestedUrl,
+        string fallbackHashId,
+        string fallbackSegment)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentException.ThrowIfNullOrWhiteSpace(requestedUrl);
+        ArgumentException.ThrowIfNullOrWhiteSpace(fallbackHashId);
+
+        var canonicalUrl = BuildMangaUrl(
+            fallbackHashId,
+            GetFirstAttribute(document, "href", "link[rel='canonical']") ??
+            GetFirstAttribute(document, "content", "meta[property='og:url']", "meta[name='twitter:url']"),
+            fallbackSegment);
+
+        var title = NormalizeComixTitle(
+            GetFirstAttribute(document, "content", "meta[property='og:title']", "meta[name='twitter:title']") ??
+            GetFirstText(document, "h1"),
+            document.Title,
+            fallbackHashId);
+
+        var coverUrl = ToAbsoluteUrl(
+                           canonicalUrl,
+                           GetFirstAttribute(document, "content", "meta[property='og:image']", "meta[name='twitter:image']")) ??
+                       ExtractImageSource(document.QuerySelector("img"), canonicalUrl) ??
+                       string.Empty;
+
+        var description =
+            GetFirstAttribute(
+                document,
+                "content",
+                "meta[name='description']",
+                "meta[property='og:description']",
+                "meta[name='twitter:description']") ??
+            string.Empty;
+
+        return new Manga
+        {
+            Name = title,
+            CoverUrl = coverUrl,
+            Description = description.Trim(),
+            Url = canonicalUrl,
+            SiteName = "Comix"
+        };
     }
 
     private static string BuildDescription(JsonElement manga)
@@ -1065,6 +1626,102 @@ public sealed class ComixScraper :
             JsonValueKind.String => bool.TryParse(value.GetString(), out var result) && result,
             _ => false
         };
+    }
+
+    private static string? GetFirstText(IParentNode parent, params string[] selectors)
+    {
+        foreach (var selector in selectors)
+        {
+            var value = parent.QuerySelector(selector)?.TextContent?.Trim();
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return null;
+    }
+
+    private static string? GetFirstAttribute(IParentNode parent, string attribute, params string[] selectors)
+    {
+        foreach (var selector in selectors)
+        {
+            var value = parent.QuerySelector(selector)?.GetAttribute(attribute)?.Trim();
+            if (!string.IsNullOrWhiteSpace(value))
+                return value;
+        }
+
+        return null;
+    }
+
+    private static string? ToAbsoluteUrl(string baseUrl, string? href)
+    {
+        if (string.IsNullOrWhiteSpace(href))
+            return null;
+
+        var trimmedHref = href.Trim();
+        if (Uri.TryCreate(trimmedHref, UriKind.Absolute, out var absolute) &&
+            (absolute.Scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
+             absolute.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)))
+        {
+            return absolute.ToString();
+        }
+
+        return Uri.TryCreate(new Uri(baseUrl), trimmedHref, out var combined)
+            ? combined.ToString()
+            : null;
+    }
+
+    private static string? ExtractImageSource(IElement? imageNode, string refererUrl)
+    {
+        if (imageNode is null)
+            return null;
+
+        var rawSrc = imageNode.GetAttribute("data-src-url") ??
+                     imageNode.GetAttribute("data-src") ??
+                     imageNode.GetAttribute("data-lazy-src") ??
+                     imageNode.GetAttribute("data-lazy") ??
+                     imageNode.GetAttribute("data-url") ??
+                     imageNode.GetAttribute("srcset") ??
+                     imageNode.GetAttribute("src") ??
+                     imageNode.GetAttribute("href");
+
+        var normalized = NormalizeImageSource(rawSrc);
+        return string.IsNullOrWhiteSpace(normalized)
+            ? null
+            : ToAbsoluteUrl(refererUrl, normalized);
+    }
+
+    private static string? NormalizeImageSource(string? rawSrc)
+    {
+        if (string.IsNullOrWhiteSpace(rawSrc))
+            return null;
+
+        var value = rawSrc.Trim();
+        if (value.Contains(','))
+            value = value.Split(',', 2, StringSplitOptions.None)[0].Trim();
+
+        if (value.Contains(' '))
+            value = value.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0];
+
+        return value;
+    }
+
+    private static string NormalizeComixTitle(string? preferredTitle, string? documentTitle, string fallbackHashId)
+    {
+        var candidate = !string.IsNullOrWhiteSpace(preferredTitle)
+            ? preferredTitle.Trim()
+            : documentTitle?.Trim();
+
+        if (string.IsNullOrWhiteSpace(candidate))
+            return $"Comix {fallbackHashId}";
+
+        foreach (var separator in new[] { " - ", " | " })
+        {
+            var suffix = $"{separator}Comix";
+            if (candidate.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return candidate[..^suffix.Length].Trim();
+        }
+
+        return candidate;
     }
 
     internal readonly record struct ComixChapterCandidate(

@@ -293,6 +293,234 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task DownloadChapterAsync_RenderedChapterDownload_UsesBrowserBytesAsPrimarySource()
+    {
+        var renderedImage = CreatePngBytes();
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+            throw new InvalidOperationException($"HTTP inesperado para {request.RequestUri}"));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new RenderedChapterStubScraper((_, pages, _) =>
+            Task.FromResult<IReadOnlyDictionary<int, RenderedPageDownload>>(
+                pages.ToDictionary(
+                    static page => page.Number,
+                    static page => new RenderedPageDownload(page.Number, CreatePngBytes(), ".png"))));
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(10, 2);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.Equal(1, scraper.RenderCalls);
+            Assert.All(chapter.Pages, page =>
+            {
+                Assert.NotNull(page.LocalPath);
+                Assert.EndsWith(".png", page.LocalPath, StringComparison.OrdinalIgnoreCase);
+                Assert.Equal(renderedImage, File.ReadAllBytes(page.LocalPath!));
+                Assert.Equal(0, handler.GetAttempts(page.ImageUrl));
+            });
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_RenderedChapterDownload_ConvertsPngToJpeg()
+    {
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+            throw new InvalidOperationException($"HTTP inesperado para {request.RequestUri}"));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var settings = new InMemorySettingsStore();
+        await settings.SetEnumAsync("Download.ImageFormat", ImageFormat.Jpeg);
+
+        var scraper = new RenderedChapterStubScraper((_, pages, _) =>
+            Task.FromResult<IReadOnlyDictionary<int, RenderedPageDownload>>(
+                pages.ToDictionary(
+                    static page => page.Number,
+                    static page => new RenderedPageDownload(page.Number, CreatePngBytes(), ".png"))));
+        var service = CreateService(httpClient, scraper: scraper, settingsStore: settings);
+        var manga = CreateManga();
+        var chapter = CreateChapter(11, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.NotNull(chapter.Pages[0].LocalPath);
+            Assert.EndsWith(".jpg", chapter.Pages[0].LocalPath, StringComparison.OrdinalIgnoreCase);
+            Assert.True(StartsWithBytes(
+                await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!),
+                0xFF, 0xD8, 0xFF));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_RenderedChapterDownload_ConvertsPngToWebP()
+    {
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+            throw new InvalidOperationException($"HTTP inesperado para {request.RequestUri}"));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var settings = new InMemorySettingsStore();
+        await settings.SetEnumAsync("Download.ImageFormat", ImageFormat.WebP);
+
+        var scraper = new RenderedChapterStubScraper((_, pages, _) =>
+            Task.FromResult<IReadOnlyDictionary<int, RenderedPageDownload>>(
+                pages.ToDictionary(
+                    static page => page.Number,
+                    static page => new RenderedPageDownload(page.Number, CreatePngBytes(), ".png"))));
+        var service = CreateService(httpClient, scraper: scraper, settingsStore: settings);
+        var manga = CreateManga();
+        var chapter = CreateChapter(12, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.NotNull(chapter.Pages[0].LocalPath);
+            Assert.EndsWith(".webp", chapter.Pages[0].LocalPath, StringComparison.OrdinalIgnoreCase);
+            Assert.True(StartsWithBytes(
+                await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!),
+                (byte)'R', (byte)'I', (byte)'F', (byte)'F'));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_RenderedChapterDownload_FallsBackToHttpWhenBatchPartial()
+    {
+        var renderedImage = CreatePngBytes();
+        var httpBytes = Encoding.UTF8.GetBytes("fallback-http-image");
+        var handler = new TrackingHttpMessageHandler((request, _, _) =>
+        {
+            if (request.RequestUri?.ToString() == "https://img.example/013/002.jpg")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(httpBytes)
+                });
+            }
+
+            throw new InvalidOperationException($"HTTP inesperado para {request.RequestUri}");
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new RenderedChapterStubScraper((_, _, _) =>
+            Task.FromResult<IReadOnlyDictionary<int, RenderedPageDownload>>(
+                new Dictionary<int, RenderedPageDownload>
+                {
+                    [1] = new(1, renderedImage, ".png")
+                }));
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(13, 2);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.EndsWith(".png", chapter.Pages[0].LocalPath, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(renderedImage, await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!));
+            Assert.EndsWith(".jpg", chapter.Pages[1].LocalPath, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(httpBytes, await File.ReadAllBytesAsync(chapter.Pages[1].LocalPath!));
+            Assert.Equal(0, handler.GetAttempts("https://img.example/013/001.jpg"));
+            Assert.Equal(1, handler.GetAttempts("https://img.example/013/002.jpg"));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
+    public async Task DownloadChapterAsync_RenderedChapterDownload_FallsBackToHttpWhenBatchFails()
+    {
+        var httpBytes = Encoding.UTF8.GetBytes("full-http-fallback");
+        var handler = new TrackingHttpMessageHandler((_, _, _) =>
+            Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(httpBytes)
+            }));
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var scraper = new RenderedChapterStubScraper((_, _, _) =>
+            throw new InvalidOperationException("browser render failed"));
+        var service = CreateService(httpClient, scraper: scraper);
+        var manga = CreateManga();
+        var chapter = CreateChapter(14, 1);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(
+                manga,
+                chapter,
+                outputDirectory,
+                DownloadFormat.FolderImages);
+
+            Assert.Equal(1, scraper.RenderCalls);
+            Assert.Equal(1, handler.GetAttempts("https://img.example/014/001.jpg"));
+            Assert.Equal(httpBytes, await File.ReadAllBytesAsync(chapter.Pages[0].LocalPath!));
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
     public async Task DownloadChapterAsync_ComixUsesFallbackAndDecodesResponse()
     {
         const int seed = 78123;
@@ -323,7 +551,7 @@ public class DownloadServiceTests
             Timeout = Timeout.InfiniteTimeSpan
         };
 
-        var scraper = new ComixScraper();
+        var scraper = new ComixHttpFallbackStubScraper();
         var service = CreateService(httpClient, scraper: scraper);
         var manga = new Manga
         {
@@ -453,7 +681,8 @@ public class DownloadServiceTests
         HttpClient httpClient,
         TimeSpan[]? attemptTimeouts = null,
         TimeSpan[]? retryDelays = null,
-        IScraper? scraper = null)
+        IScraper? scraper = null,
+        ISettingsStore? settingsStore = null)
     {
         var scraperManager = new ScraperManager();
         scraperManager.Register(scraper ?? new StubScraper());
@@ -461,6 +690,7 @@ public class DownloadServiceTests
         return new DownloadService(
             scraperManager,
             httpClient: httpClient,
+            settingsStore: settingsStore,
             attemptTimeouts: attemptTimeouts,
             retryDelays: retryDelays);
     }
@@ -504,6 +734,20 @@ public class DownloadServiceTests
     {
         return Convert.FromBase64String(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=");
+    }
+
+    private static bool StartsWithBytes(byte[] bytes, params byte[] header)
+    {
+        if (bytes.Length < header.Length)
+            return false;
+
+        for (var index = 0; index < header.Length; index++)
+        {
+            if (bytes[index] != header[index])
+                return false;
+        }
+
+        return true;
     }
 
     private static string CreateTempDirectory()
@@ -642,6 +886,90 @@ public class DownloadServiceTests
         }
     }
 
+    private sealed class RenderedChapterStubScraper : IScraper, IRenderedChapterDownloadProvider
+    {
+        private readonly Func<Chapter, IReadOnlyList<Page>, CancellationToken, Task<IReadOnlyDictionary<int, RenderedPageDownload>>> _renderer;
+
+        public RenderedChapterStubScraper(
+            Func<Chapter, IReadOnlyList<Page>, CancellationToken, Task<IReadOnlyDictionary<int, RenderedPageDownload>>> renderer)
+        {
+            _renderer = renderer;
+        }
+
+        public int RenderCalls { get; private set; }
+        public string Name => "Rendered Chapter Stub";
+        public string BaseUrl => "https://manga.example";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(CreateManga());
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+            => Task.FromResult(chapter.Pages);
+
+        public Task<IReadOnlyDictionary<int, RenderedPageDownload>> TryRenderChapterPagesAsync(
+            Chapter chapter,
+            IReadOnlyList<Page> pages,
+            CancellationToken ct = default)
+        {
+            RenderCalls++;
+            return _renderer(chapter, pages, ct);
+        }
+    }
+
+    private sealed class ComixHttpFallbackStubScraper :
+        IScraper,
+        ICustomPageDownloadProvider,
+        IRenderedChapterDownloadProvider
+    {
+        private readonly ComixScraper _delegate = new();
+
+        public string Name => "Comix";
+        public string BaseUrl => "https://comix.to";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new Manga
+            {
+                Name = "Comix Test",
+                Url = url,
+                SiteName = "Comix"
+            });
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+            => Task.FromResult(chapter.Pages);
+
+        public IReadOnlyList<string> GetPageDownloadCandidates(string imageUrl)
+            => _delegate.GetPageDownloadCandidates(imageUrl);
+
+        public void ApplyPageDownloadHeaders(HttpRequestMessage request, string imageUrl)
+            => _delegate.ApplyPageDownloadHeaders(request, imageUrl);
+
+        public Task CopyPageResponseAsync(
+            HttpResponseMessage response,
+            Stream destination,
+            string imageUrl,
+            CancellationToken ct = default)
+            => _delegate.CopyPageResponseAsync(response, destination, imageUrl, ct);
+
+        public Task<IReadOnlyDictionary<int, RenderedPageDownload>> TryRenderChapterPagesAsync(
+            Chapter chapter,
+            IReadOnlyList<Page> pages,
+            CancellationToken ct = default)
+        {
+            return Task.FromResult<IReadOnlyDictionary<int, RenderedPageDownload>>(
+                new Dictionary<int, RenderedPageDownload>());
+        }
+    }
+
     private sealed class RetryingPagesScraper : IScraper
     {
         private int _pageDiscoveryAttempts;
@@ -672,6 +1000,57 @@ public class DownloadServiceTests
                     RefererUrl = chapter.Url
                 }
             });
+        }
+    }
+
+    private sealed class InMemorySettingsStore : ISettingsStore
+    {
+        private readonly Dictionary<string, string> _values = new(StringComparer.OrdinalIgnoreCase);
+
+        public Task InitializeAsync() => Task.CompletedTask;
+
+        public Task<string?> GetStringAsync(string key, string? defaultValue = null)
+        {
+            return Task.FromResult(_values.TryGetValue(key, out var value) ? value : defaultValue);
+        }
+
+        public Task SetStringAsync(string key, string value)
+        {
+            _values[key] = value;
+            return Task.CompletedTask;
+        }
+
+        public async Task<int> GetIntAsync(string key, int defaultValue = 0)
+        {
+            var raw = await GetStringAsync(key);
+            return int.TryParse(raw, out var parsed) ? parsed : defaultValue;
+        }
+
+        public Task SetIntAsync(string key, int value)
+        {
+            return SetStringAsync(key, value.ToString());
+        }
+
+        public async Task<bool> GetBoolAsync(string key, bool defaultValue = false)
+        {
+            var raw = await GetStringAsync(key);
+            return bool.TryParse(raw, out var parsed) ? parsed : defaultValue;
+        }
+
+        public Task SetBoolAsync(string key, bool value)
+        {
+            return SetStringAsync(key, value.ToString());
+        }
+
+        public async Task<T> GetEnumAsync<T>(string key, T defaultValue) where T : struct, Enum
+        {
+            var raw = await GetStringAsync(key);
+            return Enum.TryParse<T>(raw, true, out var parsed) ? parsed : defaultValue;
+        }
+
+        public Task SetEnumAsync<T>(string key, T value) where T : struct, Enum
+        {
+            return SetStringAsync(key, value.ToString());
         }
     }
 
