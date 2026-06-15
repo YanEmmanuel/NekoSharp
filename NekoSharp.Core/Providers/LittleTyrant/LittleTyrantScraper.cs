@@ -587,24 +587,58 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             var cookies = CaptureCurrentCookies();
             if (cookies.Count > 0)
             {
-                await page.SetCookieAsync(cookies.Select(kv => new CookieParam
-                {
-                    Name = kv.Key,
-                    Value = kv.Value,
-                    Domain = SiteRootUri.Host,
-                    Path = "/"
-                }).ToArray());
+                var origin = SiteRootUri.GetLeftPart(UriPartial.Authority);
+                await page.SetCookieAsync(cookies
+                    .Where(static kv => !string.IsNullOrWhiteSpace(kv.Key))
+                    .Select(kv => new CookieParam
+                    {
+                        Name = kv.Key,
+                        Value = kv.Value,
+                        Url = origin,
+                        Path = "/",
+                        Secure = true
+                    }).ToArray());
             }
 
             var userAgent = _authHttp.DefaultRequestHeaders.UserAgent.ToString();
             if (!string.IsNullOrWhiteSpace(userAgent))
                 await page.SetUserAgentAsync(userAgent);
 
-            await page.GoToAsync(chapterUrl, new NavigationOptions
+            await page.SetExtraHttpHeadersAsync(new Dictionary<string, string>
             {
-                WaitUntil = [WaitUntilNavigation.Networkidle2],
-                Timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds
+                ["Referer"] = SiteRootUri.ToString(),
+                ["Accept-Language"] = "en-US,en;q=0.9"
             });
+
+            var navOptions = new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                Timeout = (int)TimeSpan.FromSeconds(45).TotalMilliseconds
+            };
+
+            try
+            {
+                await page.GoToAsync(chapterUrl, navOptions);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Frame detach (bug de console do PuppeteerSharp / redirect). Tenta novamente.
+                Log?.Debug($"[{Name}] Navegação falhou ({ex.GetType().Name}: {ex.Message}). Tentando novamente.");
+                await page.GoToAsync(chapterUrl, navOptions);
+            }
+
+            try
+            {
+                await page.WaitForSelectorAsync("#secure-manga-reader", new WaitForSelectorOptions
+                {
+                    Timeout = (int)TimeSpan.FromSeconds(15).TotalMilliseconds
+                });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Reader container ausente; tenta extrair do conteúdo atual mesmo assim.
+                Log?.Debug($"[{Name}] Reader não encontrado ({ex.GetType().Name}). Extraindo conteúdo atual.");
+            }
 
             var html = await page.GetContentAsync();
             if (string.IsNullOrWhiteSpace(html))
