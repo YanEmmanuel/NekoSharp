@@ -1,4 +1,6 @@
 using NekoSharp.Core.Providers.LittleTyrant;
+using System.Text;
+using System.Text.Json;
 using Xunit;
 
 namespace NekoSharp.Tests;
@@ -50,6 +52,35 @@ public sealed class LittleTyrantScraperTests
     }
 
     [Fact]
+    public void ExtractPagesFromHuntersScripts_DecryptsPayload()
+    {
+        var urls = new[]
+        {
+            "https://cdn.tiraninha.world/obras/1/001.webp",
+            "https://cdn.tiraninha.world/obras/1/002.webp"
+        };
+        var (payload, key) = EncryptHuntersPayload(urls);
+        var scripts = new[]
+        {
+            $$"""
+            window._HuntersOpts = {
+                payload: "{{payload}}",
+                sk: "{{key}}"
+            };
+            """
+        };
+
+        var pages = LittleTyrantScraper.ExtractPagesFromHuntersScripts(
+            scripts,
+            "https://tiraninha.world/manga/teste/71/");
+
+        Assert.Equal(2, pages.Count);
+        Assert.Equal(urls[0], pages[0].ImageUrl);
+        Assert.Equal(urls[1], pages[1].ImageUrl);
+        Assert.All(pages, page => Assert.Equal("https://tiraninha.world/manga/teste/71/", page.RefererUrl));
+    }
+
+    [Fact]
     public void MergeCookieHeader_PreservesExistingProviderCookies()
     {
         var merged = LittleTyrantScraper.MergeCookieHeader(
@@ -82,5 +113,23 @@ public sealed class LittleTyrantScraperTests
             .ToDictionary(parts => parts[0], parts => parts[1], StringComparer.Ordinal);
         Assert.Equal("new", parsed["cf_clearance"]);
         Assert.Equal("abc123", parsed["wordpress_logged_in_hash"]);
+    }
+
+    private static (string Payload, string Key) EncryptHuntersPayload(IReadOnlyCollection<string> urls)
+    {
+        const string key = "reader-key";
+        var json = JsonSerializer.Serialize(urls);
+        var builder = new StringBuilder(json.Length);
+
+        for (var index = 0; index < json.Length; index++)
+        {
+            var keyIndex = (index + key.Length - 1) % key.Length;
+            builder.Append((char)(json[index] + key[keyIndex]));
+        }
+
+        var encoding = Encoding.GetEncoding("ISO-8859-1");
+        return (
+            Convert.ToBase64String(encoding.GetBytes(builder.ToString())),
+            Convert.ToBase64String(encoding.GetBytes(key)));
     }
 }

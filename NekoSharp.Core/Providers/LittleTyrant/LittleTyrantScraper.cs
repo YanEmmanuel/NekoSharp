@@ -731,6 +731,7 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             windowsCandidates.Add(Path.Combine(root, "Google", "Chrome", "Application", "chrome.exe"));
             windowsCandidates.Add(Path.Combine(root, "Google", "Chrome Beta", "Application", "chrome.exe"));
             windowsCandidates.Add(Path.Combine(root, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"));
+            windowsCandidates.Add(Path.Combine(root, "Microsoft", "Edge", "Application", "msedge.exe"));
         }
 
         var candidates = OperatingSystem.IsWindows() ? windowsCandidates : posixCandidates.ToList();
