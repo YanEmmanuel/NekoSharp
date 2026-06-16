@@ -135,6 +135,44 @@ public class ComixScraperTests
     }
 
     [Fact]
+    public void ParseMangaPayloadFromHtml_ReadsInitialDataQueries()
+    {
+        const string html =
+            """
+            <!DOCTYPE html>
+            <html>
+            <head></head>
+            <body>
+            <script type="application/json" id="initial-data">
+            {
+              "page":"read",
+              "queries":{
+                "[\"manga\",\"detail\",87282]":{
+                  "id":87282,
+                  "hid":"my91m",
+                  "title":"Ruthless S 2 Uncensored",
+                  "url":"/title/my91m-ruthless-s-2-uncensored",
+                  "poster":{
+                    "medium":"https://static.example/cover-medium.jpg",
+                    "large":"https://static.example/cover-large.jpg"
+                  },
+                  "synopsis":"Test synopsis"
+                }
+              }
+            }
+            </script>
+            </body>
+            </html>
+            """;
+
+        var manga = ComixScraper.ParseMangaPayloadFromHtml(html);
+
+        Assert.Equal("my91m", manga.GetProperty("hid").GetString());
+        Assert.Equal("Ruthless S 2 Uncensored", manga.GetProperty("title").GetString());
+        Assert.Equal("/title/my91m-ruthless-s-2-uncensored", manga.GetProperty("url").GetString());
+    }
+
+    [Fact]
     public void GetPageDownloadCandidates_ProvidesAllScramblePathFallbacks()
     {
         var scraper = new ComixScraper();

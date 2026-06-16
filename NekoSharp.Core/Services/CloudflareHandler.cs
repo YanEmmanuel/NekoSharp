@@ -438,6 +438,9 @@ public class CloudflareHandler : DelegatingHandler
                 var deadline = DateTime.UtcNow + _challengeTimeout;
                 var solved = false;
                 string? solvedHtmlContent = null;
+                Dictionary<string, string>? solvedCookies = null;
+                string? solvedUserAgent = null;
+                string? solvedFinalUrl = null;
 
                 while (DateTime.UtcNow < deadline)
                 {
@@ -474,6 +477,34 @@ public class CloudflareHandler : DelegatingHandler
                         catch
                         {
                             solvedHtmlContent = content;
+                        }
+
+                        try
+                        {
+                            var solvedUri = new Uri(targetUrl);
+                            solvedCookies = await CollectCookiesAsync(page, browser, solvedUri);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            _log?.Debug($"[Cloudflare] Early cookie capture failed after challenge ({ex.GetType().Name}).");
+                        }
+
+                        try
+                        {
+                            solvedUserAgent = await GetBrowserUserAgentAsync(page, browser);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            _log?.Debug($"[Cloudflare] Early user-agent capture failed after challenge ({ex.GetType().Name}).");
+                        }
+
+                        try
+                        {
+                            solvedFinalUrl = page.Url;
+                        }
+                        catch
+                        {
+                            solvedFinalUrl = targetUrl;
                         }
 
                         try
@@ -518,7 +549,7 @@ public class CloudflareHandler : DelegatingHandler
                 var uri = new Uri(targetUrl);
                 var host = uri.Host;
 
-                var allCookies = await CollectCookiesAsync(page, browser, uri);
+                var allCookies = solvedCookies ?? await CollectCookiesAsync(page, browser, uri);
                 var hasCfClearance = allCookies.ContainsKey("cf_clearance");
                 _log?.Info($"[Cloudflare] Extracted {allCookies.Count} cookies. cf_clearance present: {hasCfClearance}");
 
@@ -528,7 +559,9 @@ public class CloudflareHandler : DelegatingHandler
                 }
 
                  
-                var userAgent = await GetBrowserUserAgentAsync(page, browser);
+                var userAgent = !string.IsNullOrWhiteSpace(solvedUserAgent)
+                    ? solvedUserAgent
+                    : await GetBrowserUserAgentAsync(page, browser);
                 _log?.Debug($"[Cloudflare] User-Agent: {userAgent}");
 
                 var creds = new CloudflareCredentials
@@ -541,14 +574,21 @@ public class CloudflareHandler : DelegatingHandler
 
                 var htmlContent = solvedHtmlContent ?? string.Empty;
                 string? finalUrl;
-                try
+                if (!string.IsNullOrWhiteSpace(solvedFinalUrl))
                 {
-                    finalUrl = page.Url;
+                    finalUrl = solvedFinalUrl;
                 }
-                catch (Exception ex)
+                else
                 {
-                    _log?.Debug($"[Cloudflare] Failed to capture final page URL before closing browser: {ex.Message}");
-                    finalUrl = targetUrl;
+                    try
+                    {
+                        finalUrl = page.Url;
+                    }
+                    catch (Exception ex)
+                    {
+                        _log?.Debug($"[Cloudflare] Failed to capture final page URL before closing browser: {ex.Message}");
+                        finalUrl = targetUrl;
+                    }
                 }
 
                 BrowserTransportSessions.AddOrUpdate(

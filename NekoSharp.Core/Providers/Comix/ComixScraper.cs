@@ -36,6 +36,9 @@ public sealed class ComixScraper :
     private static readonly Regex ScramblePathRegex = new(
         "/s?i+/",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex InitialDataScriptRegex = new(
+        "<script[^>]*id=[\"']initial-data[\"'][^>]*>(?<json>.*?)</script>",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly string[] ScramblePathFallbacks = ["/si/", "/i/", "/sii/", "/ii/"];
 
     private const string ChapterCaptureScript =
@@ -173,6 +176,34 @@ public sealed class ComixScraper :
                 // Keep blob mapped for later extraction.
                 return undefined;
             };
+    private const string RenderedPageCaptureScript =
+        """
+        (() => {
+            if (window.__nekosharpComixRenderedPageHookInstalled) return;
+
+            const state = window.__nekosharpComixRenderedPageState = {
+                blobs: Object.create(null)
+            };
+            const originalCreate = URL.createObjectURL.bind(URL);
+            const originalRevoke = URL.revokeObjectURL.bind(URL);
+
+            URL.createObjectURL = function(blob) {
+                const url = originalCreate(blob);
+                try {
+                    state.blobs[url] = blob;
+                } catch (_) {}
+                return url;
+            };
+
+            URL.revokeObjectURL = function(url) {
+                try {
+                    if (!state.blobs[url]) {
+                        originalRevoke(url);
+                    }
+                } catch (_) {}
+            };
+
+            window.__nekosharpComixRenderedPageHookInstalled = true;
         })();
         """;
 
@@ -237,18 +268,124 @@ public sealed class ComixScraper :
         var manga = BuildMangaInfoFromHtml(document, mangaUrl, parsed.HashId, parsed.MangaSegment);
         _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
         return manga;
+        try
+        {
+            var manga = await GetMangaInfoFromBrowserAsync(parsed, ct);
+            _log?.Info($"[Comix] Manga info loaded via browser for manga={parsed.HashId}");
+            return manga;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.Warn(
+                $"[Comix] Fallback browser falhou para manga/{parsed.HashId}: {ex.GetType().Name}: {ex.Message}. Tentando HTML.");
+        }
+
+        try
+        {
+            var manga = await GetMangaInfoFromPageAsync(parsed, ct);
+            _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
+            return manga;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.Warn(
+                $"[Comix] Fallback HTML falhou para manga/{parsed.HashId}: {ex.GetType().Name}: {ex.Message}. Tentando API.");
+        }
+
+        var result = await GetResultAsync($"manga/{Uri.EscapeDataString(parsed.HashId)}", ct);
+        return BuildMangaInfo(result, parsed);
+    }
+
+    private async Task<Manga> GetMangaInfoFromPageAsync(ComixUrlRef parsed, CancellationToken ct)
+    {
+        var mangaUrl = $"{BaseUrlStatic}/title/{parsed.MangaSegment}";
+        using var request = new HttpRequestMessage(HttpMethod.Get, mangaUrl);
+        request.Headers.Remove("Accept");
+        request.Headers.TryAddWithoutValidation("Accept", "text/html,application/xhtml+xml");
+
+        using var response = await _http.SendAsync(request, ct);
+        var html = await response.Content.ReadAsStringAsync(ct);
+        response.EnsureSuccessStatusCode();
+
+        var result = ParseMangaPayloadFromHtml(html);
+        return BuildMangaInfo(result, parsed);
+    }
+
+    private async Task<Manga> GetMangaInfoFromBrowserAsync(ComixUrlRef parsed, CancellationToken ct)
+    {
+        var mangaUrl = $"{BaseUrlStatic}/title/{parsed.MangaSegment}";
+        var payload = await CaptureBrowserPayloadAsync(
+            mangaUrl,
+            captureScript: string.Empty,
+            payloadExpression: "() => document.getElementById('initial-data')?.textContent || ''",
+            progressExpression: null,
+            ct);
+
+        using var document = JsonDocument.Parse(payload);
+        if (!document.RootElement.TryGetProperty("queries", out var queries) ||
+            queries.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("queries não encontrado no initial-data via browser do Comix.");
+        }
+
+        foreach (var property in queries.EnumerateObject())
+        {
+            var value = property.Value;
+            if (value.ValueKind != JsonValueKind.Object)
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(GetString(value, "title")) &&
+                !string.IsNullOrWhiteSpace(GetString(value, "hid")))
+            {
+                return BuildMangaInfo(value.Clone(), parsed);
+            }
+        }
+
+        throw new InvalidOperationException("payload de manga não encontrado no initial-data via browser do Comix.");
+    }
+
+    private Manga BuildMangaInfo(JsonElement result, ComixUrlRef parsed)
+    {
+        var title = GetString(result, "title") ?? $"Comix {parsed.HashId}";
+        var canonicalUrl = BuildMangaUrl(
+            parsed.HashId,
+            GetString(result, "url"),
+            parsed.MangaSegment);
+        var coverUrl =
+            GetNestedString(result, "poster", "large") ??
+            GetNestedString(result, "poster", "medium") ??
+            GetNestedString(result, "poster", "small") ??
+            string.Empty;
+
+        return new Manga
+        {
+            Name = title,
+            CoverUrl = coverUrl,
+            Description = BuildDescription(result),
+            Url = canonicalUrl,
+            SiteName = Name
+        };
     }
 
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
     {
         var parsed = ParseSupportedUrl(url);
         var mangaUrl = $"{BaseUrlStatic}/title/{parsed.MangaSegment}";
-        var payload = await CaptureBrowserPayloadAsync(
-            mangaUrl,
-            ChapterCaptureScript,
-            "() => window.__nekosharpComixChapterState?.payload || ''",
-            "() => Object.keys(window.__nekosharpComixChapterState?.pages || {}).length",
-            ct);
+        string payload;
+        try
+        {
+            payload = await FetchChaptersPayloadFromBrowserApiAsync(mangaUrl, parsed.HashId, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.Warn($"[Comix] Browser API de capítulos falhou: {ex.Message}. Tentando captura passiva.");
+            payload = await CaptureBrowserPayloadAsync(
+                mangaUrl,
+                ChapterCaptureScript,
+                "() => window.__nekosharpComixChapterState?.payload || ''",
+                "() => Object.keys(window.__nekosharpComixChapterState?.pages || {}).length",
+                ct);
+        }
 
         var candidates = ParseChapterPayload(payload);
         var chapters = BuildChapterList(parsed.MangaSegment, candidates);
@@ -266,12 +403,22 @@ public sealed class ComixScraper :
                 "Capítulo inválido do Comix. Use uma URL no formato /title/<hash>/<chapterId>.",
                 nameof(chapter));
 
-        var payload = await CaptureBrowserPayloadAsync(
-            chapter.Url,
-            PageCaptureScript,
-            "() => window.__nekosharpComixPagePayload || ''",
-            progressExpression: null,
-            ct);
+        string payload;
+        try
+        {
+            payload = await FetchChapterDetailPayloadFromBrowserApiAsync(chapter.Url, parsed.ChapterId, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.Warn($"[Comix] Browser API de páginas falhou: {ex.Message}. Tentando captura passiva.");
+            payload = await CaptureBrowserPayloadAsync(
+                chapter.Url,
+                PageCaptureScript,
+                "() => window.__nekosharpComixPagePayload || ''",
+                progressExpression: null,
+                ct);
+        }
+
         var pages = ParsePagePayload(payload, chapter.Url);
 
         if (pages.Count == 0)
@@ -461,7 +608,11 @@ public sealed class ComixScraper :
             await using var browser = await LaunchBrowserAsync(ct);
             await using var page = await browser.NewPageAsync();
             await PrepareBrowserPageAsync(page, chapterUrl);
+<<<<<<< HEAD
             await page.EvaluateExpressionOnNewDocumentAsync(BlobCaptureScript);
+=======
+            await page.EvaluateExpressionOnNewDocumentAsync(RenderedPageCaptureScript);
+>>>>>>> a960985 (feat: add ComixProbe project with initial implementation for scraping and probing manga data)
 
             await page.GoToAsync(chapterUrl, new NavigationOptions
             {
@@ -478,7 +629,6 @@ public sealed class ComixScraper :
 
             var imageDataUrl = await CaptureProtectedReaderPageDataUrlAsync(page, pageNumber, ct);
             if (!string.IsNullOrWhiteSpace(imageDataUrl))
-            {
                 var blobBytes = DecodeCanvasDataUrl(imageDataUrl);
                 await WriteImageBytesAsync(blobBytes, imageUrl, destination, ct);
                 _log?.Info(
@@ -539,9 +689,12 @@ public sealed class ComixScraper :
 
             var canvasBytes = DecodeCanvasDataUrl(canvasDataUrl);
             await WriteImageBytesAsync(canvasBytes, imageUrl, destination, ct);
+            var renderedBytes = await CaptureRenderedPageBytesAsync(page, pageNumber, ct);
+            if (renderedBytes.Length == 0)
+
+            await WriteRenderedImageAsync(renderedBytes, imageUrl, destination, ct);
             _log?.Info(
-                $"[Comix] Canvas capturado para página {pageNumber} ({canvasBytes.Length} bytes PNG).");
-            return true;
+                $"[Comix] Página renderizada capturada para página {pageNumber} ({renderedBytes.Length} bytes).");
         }
         catch (OperationCanceledException)
         {
@@ -550,7 +703,7 @@ public sealed class ComixScraper :
         catch (Exception ex)
         {
             _log?.Warn(
-                $"[Comix] Falha ao renderizar canvas da página {pageNumber}: {ex.Message}");
+                $"[Comix] Falha ao capturar página renderizada {pageNumber}: {ex.Message}");
             return false;
         }
         finally
@@ -702,6 +855,69 @@ public sealed class ComixScraper :
         return false;
     }
 
+    private static async Task<byte[]> CaptureRenderedPageBytesAsync(
+        IPage page,
+        int pageNumber,
+        CancellationToken ct)
+    {
+        var deadline = DateTimeOffset.UtcNow + BrowserPayloadTimeout;
+
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var base64 = await page.EvaluateFunctionAsync<string>(
+                """
+                async targetPage => {
+                    const targetAlt = `Page ${targetPage}`;
+                    const image = Array.from(document.querySelectorAll("img"))
+                        .find(img => (img.getAttribute("alt") || "") === targetAlt && img.complete);
+                    if (!image)
+                        return "";
+
+                    const source = image.currentSrc || image.src || "";
+                    if (!source)
+                        return "";
+
+                    const encodeBytes = async bytes => {
+                        let binary = "";
+                        for (let index = 0; index < bytes.length; index += 0x8000) {
+                            binary += String.fromCharCode(...bytes.subarray(index, index + 0x8000));
+                        }
+                        return btoa(binary);
+                    };
+
+                    const blobState = window.__nekosharpComixRenderedPageState?.blobs || {};
+                    let blob = source.startsWith("blob:") ? blobState[source] || null : null;
+
+                    try {
+                        if (!blob) {
+                            const response = await fetch(source);
+                            if (!response.ok)
+                                return "";
+
+                            const bytes = new Uint8Array(await response.arrayBuffer());
+                            return await encodeBytes(bytes);
+                        }
+
+                        const bytes = new Uint8Array(await blob.arrayBuffer());
+                        return await encodeBytes(bytes);
+                    } catch (_) {
+                        return "";
+                    }
+                }
+                """,
+                pageNumber);
+
+            if (!string.IsNullOrWhiteSpace(base64))
+                return Convert.FromBase64String(base64);
+
+            await Task.Delay(200, ct);
+        }
+
+        throw new TimeoutException($"Timed out waiting for rendered Comix page {pageNumber}.");
+    }
+
     internal static List<ComixChapterCandidate> ParseChapterPayload(string json)
     {
         using var document = JsonDocument.Parse(json);
@@ -843,6 +1059,8 @@ public sealed class ComixScraper :
 
     private static async Task WriteImageBytesAsync(
         byte[] sourceBytes,
+    private static async Task WriteRenderedImageAsync(
+        byte[] imageBytes,
         string imageUrl,
         Stream destination,
         CancellationToken ct)
@@ -852,6 +1070,13 @@ public sealed class ComixScraper :
             : string.Empty;
 
         using var image = Image.Load(sourceBytes);
+        if (string.IsNullOrWhiteSpace(extension))
+        {
+            await destination.WriteAsync(imageBytes, ct);
+            return;
+        }
+
+        using var image = Image.Load(imageBytes);
         switch (extension)
         {
             case ".png":
@@ -877,8 +1102,12 @@ public sealed class ComixScraper :
                     },
                     ct);
                 break;
+            case ".png":
+                await image.SaveAsPngAsync(destination, ct);
+                break;
             default:
                 await destination.WriteAsync(sourceBytes, ct);
+                await destination.WriteAsync(imageBytes, ct);
                 break;
         }
     }
@@ -1050,6 +1279,100 @@ public sealed class ComixScraper :
         return result.Clone();
     }
 
+    private async Task<string> FetchChaptersPayloadFromBrowserApiAsync(
+        string mangaUrl,
+        string hashId,
+        CancellationToken ct)
+    {
+        await using var browser = await LaunchBrowserAsync(ct);
+        await using var page = await browser.NewPageAsync();
+        await PrepareBrowserPageAsync(page, mangaUrl);
+
+        await page.GoToAsync(mangaUrl, new NavigationOptions
+        {
+            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+            Timeout = (int)BrowserPayloadTimeout.TotalMilliseconds
+        });
+
+        return await page.EvaluateFunctionAsync<string>(
+            """
+            async targetHashId => {
+                const mainScript = Array.from(document.scripts)
+                    .find(script => script.type === "module" && /\/assets\/build\/.+\/dist\/main-/.test(script.src));
+                if (!mainScript?.src)
+                    throw new Error("Main script do Comix não encontrado.");
+
+                const mainSource = await (await fetch(mainScript.src)).text();
+                const envMatch = mainSource.match(/\.\/(env-[^"'`]+\.js)/);
+                if (!envMatch)
+                    throw new Error("Env script do Comix não encontrado.");
+
+                const envUrl = new URL(envMatch[1], mainScript.src).href;
+                const envModule = await import(envUrl);
+                const chaptersApi = envModule?.c?.chapters;
+                if (typeof chaptersApi !== "function")
+                    throw new Error("envModule.c.chapters não está disponível.");
+
+                const items = [];
+                let pageNumber = 1;
+                while (true) {
+                    const result = await chaptersApi(targetHashId, {
+                        page: pageNumber,
+                        limit: 100
+                    });
+                    const pageItems = Array.isArray(result?.items) ? result.items : [];
+                    items.push(...pageItems);
+                    const meta = result?.meta || result?.pagination || {};
+                    if (!meta?.hasNext)
+                        break;
+                    pageNumber += 1;
+                    if (pageNumber > 50)
+                        break;
+                }
+
+                return JSON.stringify(items);
+            }
+            """,
+            hashId);
+    }
+
+    private async Task<string> FetchChapterDetailPayloadFromBrowserApiAsync(
+        string chapterUrl,
+        int chapterId,
+        CancellationToken ct)
+    {
+        await using var browser = await LaunchBrowserAsync(ct);
+        await using var page = await browser.NewPageAsync();
+        await PrepareBrowserPageAsync(page, chapterUrl);
+
+        await page.GoToAsync(chapterUrl, new NavigationOptions
+        {
+            WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+            Timeout = (int)BrowserPayloadTimeout.TotalMilliseconds
+        });
+
+        return await page.EvaluateFunctionAsync<string>(
+            """
+            async targetChapterId => {
+                const mainScript = Array.from(document.scripts)
+                    .find(script => script.type === "module" && /\/assets\/build\/.+\/dist\/main-/.test(script.src));
+                if (!mainScript?.src)
+                    throw new Error("Main script do Comix não encontrado.");
+
+                const mainSource = await (await fetch(mainScript.src)).text();
+                const envMatch = mainSource.match(/\.\/(env-[^"'`]+\.js)/);
+                if (!envMatch)
+                    throw new Error("Env script do Comix não encontrado.");
+
+                const envUrl = new URL(envMatch[1], mainScript.src).href;
+                const envModule = await import(envUrl);
+                const result = await envModule.b.get(`/chapters/${targetChapterId}`);
+                return JSON.stringify({ result });
+            }
+            """,
+            chapterId);
+    }
+
     private async Task<string> CaptureBrowserPayloadAsync(
         string pageUrl,
         string captureScript,
@@ -1060,7 +1383,8 @@ public sealed class ComixScraper :
         await using var browser = await LaunchBrowserAsync(ct);
         await using var page = await browser.NewPageAsync();
         await PrepareBrowserPageAsync(page, pageUrl);
-        await page.EvaluateExpressionOnNewDocumentAsync(captureScript);
+        if (!string.IsNullOrWhiteSpace(captureScript))
+            await page.EvaluateExpressionOnNewDocumentAsync(captureScript);
 
         await page.GoToAsync(pageUrl, new NavigationOptions
         {
@@ -1541,6 +1865,37 @@ public sealed class ComixScraper :
             sections.Add(string.Join('\n', extras));
 
         return string.Join("\n\n", sections);
+    }
+
+    internal static JsonElement ParseMangaPayloadFromHtml(string html)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(html);
+
+        var match = InitialDataScriptRegex.Match(html);
+        if (!match.Success)
+            throw new InvalidOperationException("initial-data não encontrado no HTML do Comix.");
+
+        var payload = WebUtility.HtmlDecode(match.Groups["json"].Value).Trim();
+        using var document = JsonDocument.Parse(payload);
+        var root = document.RootElement;
+
+        if (!root.TryGetProperty("queries", out var queries) || queries.ValueKind != JsonValueKind.Object)
+            throw new InvalidOperationException("queries não encontrado no initial-data do Comix.");
+
+        foreach (var property in queries.EnumerateObject())
+        {
+            var value = property.Value;
+            if (value.ValueKind != JsonValueKind.Object)
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(GetString(value, "title")) &&
+                !string.IsNullOrWhiteSpace(GetString(value, "hid")))
+            {
+                return value.Clone();
+            }
+        }
+
+        throw new InvalidOperationException("payload de manga não encontrado no initial-data do Comix.");
     }
 
     private static string BuildFancyScore(double score)
