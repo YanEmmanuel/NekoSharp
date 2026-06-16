@@ -176,6 +176,9 @@ public sealed class ComixScraper :
                 // Keep blob mapped for later extraction.
                 return undefined;
             };
+        })();
+        """;
+
     private const string RenderedPageCaptureScript =
         """
         (() => {
@@ -264,15 +267,25 @@ public sealed class ComixScraper :
     {
         var parsed = ParseSupportedUrl(url);
         var mangaUrl = BuildMangaUrl(parsed.HashId, url, parsed.MangaSegment);
-        var document = await LoadHtmlDocumentAsync(mangaUrl, ct);
-        var manga = BuildMangaInfoFromHtml(document, mangaUrl, parsed.HashId, parsed.MangaSegment);
-        _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
-        return manga;
+
         try
         {
-            var manga = await GetMangaInfoFromBrowserAsync(parsed, ct);
+            var document = await LoadHtmlDocumentAsync(mangaUrl, ct);
+            var htmlManga = BuildMangaInfoFromHtml(document, mangaUrl, parsed.HashId, parsed.MangaSegment);
+            _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
+            return htmlManga;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _log?.Warn(
+                $"[Comix] HTML direto falhou para manga/{parsed.HashId}: {ex.GetType().Name}: {ex.Message}. Tentando browser.");
+        }
+
+        try
+        {
+            var browserManga = await GetMangaInfoFromBrowserAsync(parsed, ct);
             _log?.Info($"[Comix] Manga info loaded via browser for manga={parsed.HashId}");
-            return manga;
+            return browserManga;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -282,9 +295,9 @@ public sealed class ComixScraper :
 
         try
         {
-            var manga = await GetMangaInfoFromPageAsync(parsed, ct);
+            var pageManga = await GetMangaInfoFromPageAsync(parsed, ct);
             _log?.Info($"[Comix] Manga info loaded via HTML for manga={parsed.HashId}");
-            return manga;
+            return pageManga;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -608,11 +621,7 @@ public sealed class ComixScraper :
             await using var browser = await LaunchBrowserAsync(ct);
             await using var page = await browser.NewPageAsync();
             await PrepareBrowserPageAsync(page, chapterUrl);
-<<<<<<< HEAD
             await page.EvaluateExpressionOnNewDocumentAsync(BlobCaptureScript);
-=======
-            await page.EvaluateExpressionOnNewDocumentAsync(RenderedPageCaptureScript);
->>>>>>> a960985 (feat: add ComixProbe project with initial implementation for scraping and probing manga data)
 
             await page.GoToAsync(chapterUrl, new NavigationOptions
             {
@@ -629,6 +638,7 @@ public sealed class ComixScraper :
 
             var imageDataUrl = await CaptureProtectedReaderPageDataUrlAsync(page, pageNumber, ct);
             if (!string.IsNullOrWhiteSpace(imageDataUrl))
+            {
                 var blobBytes = DecodeCanvasDataUrl(imageDataUrl);
                 await WriteImageBytesAsync(blobBytes, imageUrl, destination, ct);
                 _log?.Info(
@@ -689,12 +699,9 @@ public sealed class ComixScraper :
 
             var canvasBytes = DecodeCanvasDataUrl(canvasDataUrl);
             await WriteImageBytesAsync(canvasBytes, imageUrl, destination, ct);
-            var renderedBytes = await CaptureRenderedPageBytesAsync(page, pageNumber, ct);
-            if (renderedBytes.Length == 0)
-
-            await WriteRenderedImageAsync(renderedBytes, imageUrl, destination, ct);
             _log?.Info(
-                $"[Comix] Página renderizada capturada para página {pageNumber} ({renderedBytes.Length} bytes).");
+                $"[Comix] Canvas capturado para página {pageNumber} ({canvasBytes.Length} bytes PNG).");
+            return true;
         }
         catch (OperationCanceledException)
         {
@@ -1059,8 +1066,6 @@ public sealed class ComixScraper :
 
     private static async Task WriteImageBytesAsync(
         byte[] sourceBytes,
-    private static async Task WriteRenderedImageAsync(
-        byte[] imageBytes,
         string imageUrl,
         Stream destination,
         CancellationToken ct)
@@ -1072,11 +1077,10 @@ public sealed class ComixScraper :
         using var image = Image.Load(sourceBytes);
         if (string.IsNullOrWhiteSpace(extension))
         {
-            await destination.WriteAsync(imageBytes, ct);
+            await destination.WriteAsync(sourceBytes, ct);
             return;
         }
 
-        using var image = Image.Load(imageBytes);
         switch (extension)
         {
             case ".png":
@@ -1102,12 +1106,8 @@ public sealed class ComixScraper :
                     },
                     ct);
                 break;
-            case ".png":
-                await image.SaveAsPngAsync(destination, ct);
-                break;
             default:
                 await destination.WriteAsync(sourceBytes, ct);
-                await destination.WriteAsync(imageBytes, ct);
                 break;
         }
     }
