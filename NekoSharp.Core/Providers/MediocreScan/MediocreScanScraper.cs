@@ -11,6 +11,11 @@ namespace NekoSharp.Core.Providers.MediocreScan;
 public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 {
     private const string CdnBaseUrl = "https://cdn.mediocrescan.com";
+    private const int MaxJsonAttempts = 6;
+    private const int ErrorBodyPreviewLength = 700;
+    private static readonly SemaphoreSlim ApiRequestGate = new(1, 1);
+    private static readonly object ApiCooldownSync = new();
+    private static DateTimeOffset _nextApiRequestUtc = DateTimeOffset.MinValue;
 
     public string Name => "Mediocre Scan";
     public string BaseUrl => _authProfile.SiteBaseUrl;
@@ -249,22 +254,148 @@ public sealed class MediocreScanScraper : IScraper, ICredentialAuthProvider
 
     private async Task<JsonElement> GetJsonAsync(string relativeUrl, CancellationToken ct)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
-        ApplyRequestHeaders(request);
-
-        using var response = await _http.SendAsync(request, ct);
-
-        var body = await response.Content.ReadAsStringAsync(ct);
-        if (!response.IsSuccessStatusCode)
+        for (var attempt = 0; ; attempt++)
         {
+            await WaitForApiRequestSlotAsync(ct);
+
+            using var request = new HttpRequestMessage(HttpMethod.Get, relativeUrl);
+            ApplyRequestHeaders(request);
+
+            using var response = await _http.SendAsync(request, ct);
+            var body = await response.Content.ReadAsStringAsync(ct);
+
+            if (response.IsSuccessStatusCode)
+            {
+                using var doc = JsonDocument.Parse(body);
+                return doc.RootElement.Clone();
+            }
+
+            if (attempt + 1 < MaxJsonAttempts && IsRetryableApiStatus(response.StatusCode))
+            {
+                var delay = GetApiRetryDelay(response, attempt, body);
+                ReserveApiCooldown(delay);
+                _log?.Warn(
+                    $"[MediocreScan] API/CDN retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'. " +
+                    $"Nova tentativa em {delay.TotalSeconds:0.##}s.");
+                await Task.Delay(delay, ct);
+                continue;
+            }
+
             throw new HttpRequestException(
-                $"Mediocre API retornou {(int)response.StatusCode} ({response.ReasonPhrase}) para '{relativeUrl}'. Body: {body}",
+                BuildApiErrorMessage(relativeUrl, response.StatusCode, response.ReasonPhrase, body),
                 inner: null,
                 response.StatusCode);
         }
+    }
 
-        using var doc = JsonDocument.Parse(body);
-        return doc.RootElement.Clone();
+    internal static string BuildApiErrorMessage(
+        string relativeUrl,
+        HttpStatusCode statusCode,
+        string? reasonPhrase,
+        string body)
+    {
+        return
+            $"Mediocre API retornou {(int)statusCode} ({reasonPhrase}) para '{relativeUrl}'. " +
+            $"Body: {CreateBodyPreview(body)}";
+    }
+
+    internal static string CreateBodyPreview(string body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return string.Empty;
+
+        var singleLine = body
+            .Replace("\r", " ", StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal)
+            .Trim();
+
+        if (singleLine.Length <= ErrorBodyPreviewLength)
+            return singleLine;
+
+        return singleLine[..ErrorBodyPreviewLength] +
+               $"... ({singleLine.Length - ErrorBodyPreviewLength} caractere(s) omitido(s))";
+    }
+
+    private static bool IsRetryableApiStatus(HttpStatusCode statusCode)
+    {
+        return statusCode is HttpStatusCode.RequestTimeout
+            or (HttpStatusCode)429
+            or HttpStatusCode.BadGateway
+            or HttpStatusCode.ServiceUnavailable
+            or HttpStatusCode.GatewayTimeout
+            or HttpStatusCode.InternalServerError;
+    }
+
+    private static TimeSpan GetApiRetryDelay(HttpResponseMessage response, int attempt, string body)
+    {
+        if (response.Headers.RetryAfter?.Delta is { } retryAfterDelta && retryAfterDelta > TimeSpan.Zero)
+            return ClampRetryDelay(retryAfterDelta);
+
+        if (response.Headers.RetryAfter?.Date is { } retryAfterDate)
+        {
+            var retryAfterDateDelay = retryAfterDate - DateTimeOffset.UtcNow;
+            if (retryAfterDateDelay > TimeSpan.Zero)
+                return ClampRetryDelay(retryAfterDateDelay);
+        }
+
+        var cloudflareChallenge = body.Contains("Just a moment", StringComparison.OrdinalIgnoreCase) ||
+                                  body.Contains("challenges.cloudflare.com", StringComparison.OrdinalIgnoreCase);
+        var baseSeconds = cloudflareChallenge || response.StatusCode == (HttpStatusCode)429
+            ? 4d
+            : 1.5d;
+        var exponentialSeconds = baseSeconds * Math.Pow(1.8d, attempt);
+        var jitter = TimeSpan.FromMilliseconds(Random.Shared.Next(250, 900));
+
+        return ClampRetryDelay(TimeSpan.FromSeconds(exponentialSeconds) + jitter);
+    }
+
+    private static TimeSpan ClampRetryDelay(TimeSpan delay)
+    {
+        if (delay < TimeSpan.FromSeconds(1))
+            return TimeSpan.FromSeconds(1);
+
+        return delay > TimeSpan.FromSeconds(45)
+            ? TimeSpan.FromSeconds(45)
+            : delay;
+    }
+
+    private static async Task WaitForApiRequestSlotAsync(CancellationToken ct)
+    {
+        await ApiRequestGate.WaitAsync(ct);
+        try
+        {
+            while (true)
+            {
+                TimeSpan delay;
+                lock (ApiCooldownSync)
+                {
+                    delay = _nextApiRequestUtc - DateTimeOffset.UtcNow;
+                }
+
+                if (delay <= TimeSpan.Zero)
+                    break;
+
+                await Task.Delay(delay, ct);
+            }
+
+            lock (ApiCooldownSync)
+            {
+                _nextApiRequestUtc = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(350);
+            }
+        }
+        finally
+        {
+            ApiRequestGate.Release();
+        }
+    }
+
+    private static void ReserveApiCooldown(TimeSpan delay)
+    {
+        var candidate = DateTimeOffset.UtcNow + delay;
+
+        lock (ApiCooldownSync)
+            if (candidate > _nextApiRequestUtc)
+                _nextApiRequestUtc = candidate;
     }
 
     internal static MediocreUrlRef ParseSupportedUrl(string url)

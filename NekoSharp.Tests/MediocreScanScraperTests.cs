@@ -150,4 +150,18 @@ public class MediocreScanScraperTests
         Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/001.webp", pages[0].ImageUrl);
         Assert.Equal("https://cdn.mediocrescan.com/obras/259/capitulos/124/002.webp", pages[1].ImageUrl);
     }
+
+    [Fact]
+    public void CreateBodyPreview_TruncatesCloudflareChallengeHtml()
+    {
+        var body = "<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>" +
+                   new string('x', 2000) +
+                   "</body></html>";
+
+        var preview = MediocreScanScraper.CreateBodyPreview(body);
+
+        Assert.Contains("Just a moment", preview);
+        Assert.Contains("omitido", preview);
+        Assert.True(preview.Length < body.Length);
+    }
 }

@@ -32,6 +32,9 @@ public class DownloadService : IDownloadService
     private int _maxConcurrentDownloads = 4;
     private int _adaptiveMaxConcurrentDownloads = int.MaxValue;
     private int _successfulDownloadsSinceThrottle;
+    private static readonly SemaphoreSlim MediocreCdnPageGate = new(2, 2);
+    private static readonly object MediocreCdnPageSpacingSync = new();
+    private static DateTimeOffset _nextMediocreCdnPageStartUtc = DateTimeOffset.MinValue;
     private static readonly IReadOnlyDictionary<int, RenderedPageDownload> EmptyRenderedPages =
         new Dictionary<int, RenderedPageDownload>();
 
@@ -480,6 +483,8 @@ public class DownloadService : IDownloadService
             {
                 await _transientFailureGate.WaitBeforeAttemptAsync(ct);
                 await hostThrottle.WaitBeforeAttemptAsync(ct);
+                await using var providerDownloadLease =
+                    await AcquireProviderDownloadSlotAsync(scraper, currentUrl, ct);
                 await using var _ = await AcquireDownloadSlotAsync(ct);
                 await _transientFailureGate.WaitBeforeAttemptAsync(ct);
                 await hostThrottle.WaitBeforeAttemptAsync(ct);
@@ -723,6 +728,50 @@ public class DownloadService : IDownloadService
                 Interlocked.Decrement(ref _waitingDownloadSlots);
             }
         }
+    }
+
+    private static async ValueTask<IAsyncDisposable> AcquireProviderDownloadSlotAsync(
+        IScraper scraper,
+        string url,
+        CancellationToken ct)
+    {
+        if (!IsMediocreCdnPageDownload(scraper, url))
+            return NoopAsyncDisposable.Instance;
+
+        await MediocreCdnPageGate.WaitAsync(ct);
+        try
+        {
+            while (true)
+            {
+                TimeSpan delay;
+                lock (MediocreCdnPageSpacingSync)
+                {
+                    delay = _nextMediocreCdnPageStartUtc - DateTimeOffset.UtcNow;
+                    if (delay <= TimeSpan.Zero)
+                    {
+                        _nextMediocreCdnPageStartUtc = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(180);
+                        return new SemaphoreLease(MediocreCdnPageGate);
+                    }
+                }
+
+                await Task.Delay(delay, ct);
+            }
+        }
+        catch
+        {
+            MediocreCdnPageGate.Release();
+            throw;
+        }
+    }
+
+    private static bool IsMediocreCdnPageDownload(IScraper scraper, string url)
+    {
+        if (!scraper.Name.Equals("Mediocre Scan", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+               uri.Host.Equals("cdn.mediocrescan.com", StringComparison.OrdinalIgnoreCase) &&
+               !uri.AbsolutePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool TryAcquireDownloadSlot()
@@ -1043,6 +1092,33 @@ public class DownloadService : IDownloadService
             Interlocked.Exchange(ref _owner, null)?.ReleaseDownloadSlot();
             return ValueTask.CompletedTask;
         }
+    }
+
+    private sealed class SemaphoreLease : IAsyncDisposable
+    {
+        private SemaphoreSlim? _semaphore;
+
+        public SemaphoreLease(SemaphoreSlim semaphore)
+        {
+            _semaphore = semaphore;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            Interlocked.Exchange(ref _semaphore, null)?.Release();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class NoopAsyncDisposable : IAsyncDisposable
+    {
+        public static readonly NoopAsyncDisposable Instance = new();
+
+        private NoopAsyncDisposable()
+        {
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class HostThrottleState

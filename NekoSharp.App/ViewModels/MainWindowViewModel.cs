@@ -328,7 +328,10 @@ public partial class MainWindowViewModel : ObservableObject
         {
             Directory.CreateDirectory(outputDir);
 
-            var semaphore = new SemaphoreSlim(MaxConcurrentChapters);
+            var effectiveMaxConcurrentChapters = IsMediocreScanManga(manga)
+                ? 1
+                : MaxConcurrentChapters;
+            var semaphore = new SemaphoreSlim(effectiveMaxConcurrentChapters);
             var tasks = chaptersToDownload.Select((chapterVm, index) => Task.Run(async () =>
             {
                 await semaphore.WaitAsync(_cts!.Token);
@@ -405,6 +408,17 @@ public partial class MainWindowViewModel : ObservableObject
                 return false;
             });
         }
+    }
+
+    private static bool IsMediocreScanManga(Manga manga)
+    {
+        if (manga.SiteName.Equals("Mediocre Scan", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return Uri.TryCreate(manga.Url, UriKind.Absolute, out var uri) &&
+               (uri.Host.Equals("mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
+                uri.Host.Equals("www.mediocrescan.com", StringComparison.OrdinalIgnoreCase) ||
+                uri.Host.Equals("back.mediocrescan.com", StringComparison.OrdinalIgnoreCase));
     }
 
     [RelayCommand(CanExecute = nameof(CanFollowCurrentManga))]

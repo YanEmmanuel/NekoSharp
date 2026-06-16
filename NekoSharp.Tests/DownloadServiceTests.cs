@@ -49,6 +49,40 @@ public class DownloadServiceTests
     }
 
     [Fact]
+    public async Task DownloadChapterAsync_MediocreCdnImagesUseProviderConcurrencyLimit()
+    {
+        var handler = new TrackingHttpMessageHandler(async (_, _, cancellationToken) =>
+        {
+            await Task.Delay(120, cancellationToken);
+            return CreateImageResponse();
+        });
+
+        using var httpClient = new HttpClient(handler)
+        {
+            Timeout = Timeout.InfiniteTimeSpan
+        };
+
+        var service = CreateService(httpClient, scraper: new MediocreStubScraper());
+        service.MaxConcurrentDownloads = 8;
+
+        var manga = CreateMediocreManga();
+        var chapter = CreateMediocreChapter(180, 6);
+        var outputDirectory = CreateTempDirectory();
+
+        try
+        {
+            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+
+            Assert.True(handler.MaxObservedConcurrency <= 2,
+                $"Concorrência máxima observada: {handler.MaxObservedConcurrency}");
+        }
+        finally
+        {
+            CleanupTempDirectory(outputDirectory);
+        }
+    }
+
+    [Fact]
     public async Task DownloadChapterAsync_WhenRequestTimesOut_RetriesAndSucceeds()
     {
         var handler = new TrackingHttpMessageHandler(async (request, attempt, cancellationToken) =>
@@ -705,6 +739,16 @@ public class DownloadServiceTests
         };
     }
 
+    private static Manga CreateMediocreManga()
+    {
+        return new Manga
+        {
+            Name = "Mediocre Test",
+            Url = "https://mediocrescan.com/obra/17822",
+            SiteName = "Mediocre Scan"
+        };
+    }
+
     private static Chapter CreateChapter(int number, int pageCount)
     {
         return new Chapter
@@ -717,6 +761,24 @@ public class DownloadServiceTests
                 {
                     Number = pageNumber,
                     ImageUrl = $"https://img.example/{number:D3}/{pageNumber:D3}.jpg"
+                })
+                .ToList()
+        };
+    }
+
+    private static Chapter CreateMediocreChapter(int number, int pageCount)
+    {
+        return new Chapter
+        {
+            Number = number,
+            Title = $"Capítulo {number}",
+            Url = $"https://mediocrescan.com/capitulo/{number}",
+            Pages = Enumerable.Range(1, pageCount)
+                .Select(pageNumber => new Page
+                {
+                    Number = pageNumber,
+                    ImageUrl = $"https://cdn.mediocrescan.com/obras/17822/capitulos/{number}/{pageNumber:D3}.webp",
+                    RefererUrl = "https://mediocrescan.com/"
                 })
                 .ToList()
         };
@@ -792,6 +854,23 @@ public class DownloadServiceTests
         {
             return Task.FromResult(chapter.Pages);
         }
+    }
+
+    private sealed class MediocreStubScraper : IScraper
+    {
+        public string Name => "Mediocre Scan";
+        public string BaseUrl => "https://mediocrescan.com";
+
+        public bool CanHandle(string url) => url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+
+        public Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(CreateMediocreManga());
+
+        public Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
+            => Task.FromResult(new List<Chapter>());
+
+        public Task<List<Page>> GetPagesAsync(Chapter chapter, CancellationToken ct = default)
+            => Task.FromResult(chapter.Pages);
     }
 
     private sealed class AuthenticatedStubScraper : IScraper, IAuthenticatedRequestProvider

@@ -26,6 +26,12 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
     private static readonly Regex ReaderPagesRegex = new(
         @"var\s+pages\s*=\s*(\[[\s\S]*?\])\s*;",
         RegexOptions.Compiled | RegexOptions.Singleline);
+    private static readonly Regex HuntersPayloadRegex = new(
+        @"payload\s*:\s*[""'](?<value>.*?)[""']",
+        RegexOptions.Compiled | RegexOptions.Singleline);
+    private static readonly Regex HuntersKeyRegex = new(
+        @"sk\s*:\s*[""'](?<value>.*?)[""']",
+        RegexOptions.Compiled | RegexOptions.Singleline);
 
     // PuppeteerSharp 21.x crasha ao processar Runtime.consoleAPICalled de certos
     // args do site ("Specified cast is not valid"), fechando a página. Substituir
@@ -155,6 +161,16 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             return pages;
         }
 
+        pages = ExtractPagesFromHuntersScripts(
+            readerScripts,
+            chapter.Url);
+
+        if (pages.Count > 0)
+        {
+            Log?.Debug($"[{Name}] Extraídas {pages.Count} páginas do payload Hunters para {chapter.Url}");
+            return pages;
+        }
+
         pages = ExtractPagesFromReaderScripts(
             document.QuerySelectorAll("script").Select(script => script.TextContent),
             chapter.Url);
@@ -162,6 +178,16 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         if (pages.Count > 0)
         {
             Log?.Debug($"[{Name}] Extraídas {pages.Count} páginas dos scripts da página para {chapter.Url}");
+            return pages;
+        }
+
+        pages = ExtractPagesFromHuntersScripts(
+            document.QuerySelectorAll("script").Select(script => script.TextContent),
+            chapter.Url);
+
+        if (pages.Count > 0)
+        {
+            Log?.Debug($"[{Name}] Extraídas {pages.Count} páginas do payload Hunters da página para {chapter.Url}");
             return pages;
         }
 
@@ -310,6 +336,35 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         return pages;
     }
 
+    internal static List<MangaPage> ExtractPagesFromHuntersScripts(IEnumerable<string?> scripts, string refererUrl)
+    {
+        foreach (var script in scripts)
+        {
+            if (string.IsNullOrWhiteSpace(script))
+                continue;
+
+            var payloadMatch = HuntersPayloadRegex.Match(script);
+            var keyMatch = HuntersKeyRegex.Match(script);
+            if (!payloadMatch.Success || !keyMatch.Success)
+                continue;
+
+            var urls = DecryptHuntersPayload(
+                payloadMatch.Groups["value"].Value,
+                keyMatch.Groups["value"].Value);
+            if (urls.Count == 0)
+                continue;
+
+            return urls.Select((imageUrl, index) => new MangaPage
+            {
+                Number = index + 1,
+                ImageUrl = imageUrl,
+                RefererUrl = refererUrl
+            }).ToList();
+        }
+
+        return [];
+    }
+
     internal static (string Html, bool HasMore, int? NewOffset)? ParseLoadMorePayload(string json)
     {
         using var doc = JsonDocument.Parse(json);
@@ -373,6 +428,33 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
     private static string DecodeBase64Url(string encoded)
     {
         return Encoding.UTF8.GetString(Convert.FromBase64String(encoded)).Trim();
+    }
+
+    private static List<string> DecryptHuntersPayload(string payloadBase64, string keyBase64)
+    {
+        try
+        {
+            var payload = Encoding.GetEncoding("ISO-8859-1").GetString(Convert.FromBase64String(payloadBase64));
+            var key = Encoding.GetEncoding("ISO-8859-1").GetString(Convert.FromBase64String(keyBase64));
+            if (key.Length == 0)
+                return [];
+
+            var builder = new StringBuilder(payload.Length);
+            for (var index = 0; index < payload.Length; index++)
+            {
+                var keyIndex = (index + key.Length - 1) % key.Length;
+                builder.Append((char)(payload[index] - key[keyIndex]));
+            }
+
+            return JsonSerializer.Deserialize<List<string>>(builder.ToString())?
+                .Where(static url => !string.IsNullOrWhiteSpace(url))
+                .Select(static url => url.Trim())
+                .ToList() ?? [];
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     private async Task<IDocument> LoadDocumentWithAuthFallbackAsync(string url, CancellationToken ct)
@@ -501,7 +583,7 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         IBrowser? browser = null;
         try
         {
-            browser = await LaunchBrowserAsync(ct);
+            browser = await LaunchBrowserAsync(headless: false, ct);
             await using var page = await browser.NewPageAsync();
             await page.EvaluateExpressionOnNewDocumentAsync(ConsoleSuppressionScript);
 
@@ -545,54 +627,114 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         }
     }
 
-    private static async Task<IBrowser> LaunchBrowserAsync(CancellationToken ct)
+    private async Task<IBrowser> LaunchBrowserAsync(bool headless, CancellationToken ct)
     {
-        var options = new LaunchOptions
+        var failures = new List<string>();
+        var systemBrowser = FindSystemBrowser();
+
+        if (!string.IsNullOrWhiteSpace(systemBrowser))
         {
-            Headless = false,
-            DefaultViewport = null,
-            Args = ["--no-sandbox", "--disable-setuid-sandbox"]
-        };
+            try
+            {
+                Log?.Info($"[{Name}] Abrindo navegador do sistema: {systemBrowser}");
+                ct.ThrowIfCancellationRequested();
+                return await Puppeteer.LaunchAsync(CreateBrowserLaunchOptions(headless, systemBrowser));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                var failure = $"System browser ({systemBrowser}): {ex.GetType().Name}: {ex.Message}";
+                failures.Add(failure);
+                Log?.Warn($"[{Name}] Falha ao abrir navegador do sistema: {failure}");
+            }
+        }
+        else
+        {
+            Log?.Warn($"[{Name}] Chrome/Chromium/Brave do sistema não encontrado. Tentando launcher padrão do Puppeteer.");
+        }
 
         try
         {
             ct.ThrowIfCancellationRequested();
-            return await Puppeteer.LaunchAsync(options);
+            return await Puppeteer.LaunchAsync(CreateBrowserLaunchOptions(headless, executablePath: null));
         }
-        catch
+        catch (Exception directLaunchEx) when (directLaunchEx is not OperationCanceledException)
         {
-            var fetcher = new BrowserFetcher();
-            var installed = await fetcher.DownloadAsync();
-            options.ExecutablePath = fetcher.GetExecutablePath(installed.BuildId);
+            failures.Add($"Puppeteer default browser: {directLaunchEx.GetType().Name}: {directLaunchEx.Message}");
+            Log?.Warn($"[{Name}] Launcher padrão do Puppeteer falhou: {directLaunchEx.GetType().Name}: {directLaunchEx.Message}");
 
-            ct.ThrowIfCancellationRequested();
-            return await Puppeteer.LaunchAsync(options);
+            try
+            {
+                var fetcher = new BrowserFetcher();
+                var installed = await fetcher.DownloadAsync();
+                var downloadedBrowserPath = fetcher.GetExecutablePath(installed.BuildId);
+
+                Log?.Info($"[{Name}] Abrindo navegador baixado pelo Puppeteer: {downloadedBrowserPath}");
+                ct.ThrowIfCancellationRequested();
+                return await Puppeteer.LaunchAsync(CreateBrowserLaunchOptions(headless, downloadedBrowserPath));
+            }
+            catch (Exception fetcherEx) when (fetcherEx is not OperationCanceledException)
+            {
+                failures.Add($"Downloaded browser: {fetcherEx.GetType().Name}: {fetcherEx.Message}");
+                throw new InvalidOperationException(
+                    "Não foi possível abrir o navegador necessário para o Little Tyrant. " +
+                    string.Join(" | ", failures),
+                    fetcherEx);
+            }
         }
     }
 
-    private static async Task<IBrowser> LaunchHeadlessBrowserAsync(CancellationToken ct)
+    private LaunchOptions CreateBrowserLaunchOptions(bool headless, string? executablePath)
     {
-        var options = new LaunchOptions
+        return new LaunchOptions
         {
-            Headless = true,
+            Headless = headless,
+            ExecutablePath = executablePath,
             DefaultViewport = null,
-            Args = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+            Args =
+            [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--window-size=1280,850"
+            ],
+            IgnoredDefaultArgs = ["--enable-automation"]
         };
+    }
 
-        try
-        {
-            ct.ThrowIfCancellationRequested();
-            return await Puppeteer.LaunchAsync(options);
-        }
-        catch
-        {
-            var fetcher = new BrowserFetcher();
-            var installed = await fetcher.DownloadAsync();
-            options.ExecutablePath = fetcher.GetExecutablePath(installed.BuildId);
+    private static string? FindSystemBrowser()
+    {
+        var envChromePath = Environment.GetEnvironmentVariable("CHROME_PATH");
+        if (!string.IsNullOrWhiteSpace(envChromePath) && File.Exists(envChromePath))
+            return envChromePath;
 
-            ct.ThrowIfCancellationRequested();
-            return await Puppeteer.LaunchAsync(options);
+        string[] posixCandidates =
+        [
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+            "/usr/bin/brave-browser",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ];
+
+        var windowsCandidates = new List<string>();
+        foreach (var envVar in new[] { "PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA", "PROGRAMW6432" })
+        {
+            var root = Environment.GetEnvironmentVariable(envVar);
+            if (string.IsNullOrWhiteSpace(root))
+                continue;
+
+            windowsCandidates.Add(Path.Combine(root, "Google", "Chrome", "Application", "chrome.exe"));
+            windowsCandidates.Add(Path.Combine(root, "Google", "Chrome Beta", "Application", "chrome.exe"));
+            windowsCandidates.Add(Path.Combine(root, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"));
         }
+
+        var candidates = OperatingSystem.IsWindows() ? windowsCandidates : posixCandidates.ToList();
+        return candidates.FirstOrDefault(File.Exists);
     }
 
     private async Task<List<MangaPage>> ExtractPagesWithBrowserFallbackAsync(string chapterUrl, CancellationToken ct)
@@ -600,7 +742,7 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         IBrowser? browser = null;
         try
         {
-            browser = await LaunchHeadlessBrowserAsync(ct);
+            browser = await LaunchBrowserAsync(headless: true, ct);
             await using var page = await browser.NewPageAsync();
             await page.EvaluateExpressionOnNewDocumentAsync(ConsoleSuppressionScript);
 
@@ -660,6 +802,30 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
                 Log?.Debug($"[{Name}] Reader não encontrado ({ex.GetType().Name}). Extraindo conteúdo atual.");
             }
 
+            try
+            {
+                await page.WaitForFunctionAsync(
+                    """
+                    () => {
+                        const pages = Array.isArray(window.pages) ? window.pages : [];
+                        const images = document.querySelectorAll("#secure-manga-reader img, .reading-content img, .page-break img, .manga-reading-content img");
+                        return pages.length > 0 || images.length > 0 || document.documentElement.innerHTML.includes("_HuntersOpts");
+                    }
+                    """,
+                    new WaitForFunctionOptions
+                    {
+                        Timeout = (int)TimeSpan.FromSeconds(20).TotalMilliseconds
+                    });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Log?.Debug($"[{Name}] Browser não sinalizou páginas prontas ({ex.GetType().Name}). Extraindo conteúdo atual.");
+            }
+
+            var runtimePages = await ExtractRuntimePagesAsync(page, chapterUrl);
+            if (runtimePages.Count > 0)
+                return runtimePages;
+
             var html = await page.GetContentAsync();
             if (string.IsNullOrWhiteSpace(html))
                 return [];
@@ -671,8 +837,24 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             if (pages.Count > 0)
                 return pages;
 
-            return ExtractPagesFromReaderScripts(
+            pages = ExtractPagesFromHuntersScripts(readerScripts, chapterUrl);
+            if (pages.Count > 0)
+                return pages;
+
+            pages = ExtractPagesFromReaderScripts(
                 document.QuerySelectorAll("script").Select(static s => s.TextContent),
+                chapterUrl);
+            if (pages.Count > 0)
+                return pages;
+
+            pages = ExtractPagesFromHuntersScripts(
+                document.QuerySelectorAll("script").Select(static s => s.TextContent),
+                chapterUrl);
+            if (pages.Count > 0)
+                return pages;
+
+            return CreatePagesFromNodes(
+                document.QuerySelectorAll("#secure-manga-reader img, .reading-content img, .page-break img, .manga-reading-content img"),
                 chapterUrl);
         }
         finally
@@ -680,6 +862,99 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
             if (browser is not null)
                 try { await browser.CloseAsync(); } catch { }
         }
+    }
+
+    private static async Task<List<MangaPage>> ExtractRuntimePagesAsync(IPage page, string refererUrl)
+    {
+        try
+        {
+            var json = await page.EvaluateFunctionAsync<string>(
+                """
+                () => JSON.stringify({
+                    pages: Array.isArray(window.pages) ? window.pages : [],
+                    images: Array.from(document.querySelectorAll("#secure-manga-reader img, .reading-content img, .page-break img, .manga-reading-content img"))
+                        .map(img => img.currentSrc || img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src") || "")
+                        .filter(Boolean)
+                })
+                """);
+
+            if (string.IsNullOrWhiteSpace(json))
+                return [];
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("pages", out var pagesElement) &&
+                pagesElement.ValueKind == JsonValueKind.Array)
+            {
+                var encodedPages = MapRuntimePageArray(pagesElement, refererUrl);
+                if (encodedPages.Count > 0)
+                    return encodedPages;
+            }
+
+            if (root.TryGetProperty("images", out var imagesElement) &&
+                imagesElement.ValueKind == JsonValueKind.Array)
+            {
+                var imageUrls = imagesElement
+                    .EnumerateArray()
+                    .Where(static item => item.ValueKind == JsonValueKind.String)
+                    .Select(static item => item.GetString()?.Trim())
+                    .Where(static url => !string.IsNullOrWhiteSpace(url))
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+
+                if (imageUrls.Count > 0)
+                {
+                    return imageUrls.Select((imageUrl, index) => new MangaPage
+                    {
+                        Number = index + 1,
+                        ImageUrl = imageUrl!,
+                        RefererUrl = refererUrl
+                    }).ToList();
+                }
+            }
+        }
+        catch
+        {
+        }
+
+        return [];
+    }
+
+    private static List<MangaPage> MapRuntimePageArray(JsonElement pagesElement, string refererUrl)
+    {
+        var pages = new List<MangaPage>();
+        foreach (var item in pagesElement.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+                continue;
+
+            var raw = item.GetString();
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            var imageUrl = raw.Trim();
+            if (!Uri.TryCreate(imageUrl, UriKind.Absolute, out _))
+            {
+                try
+                {
+                    imageUrl = DecodeBase64Url(imageUrl);
+                }
+                catch (FormatException)
+                {
+                    continue;
+                }
+            }
+
+            pages.Add(new MangaPage
+            {
+                Number = pages.Count + 1,
+                ImageUrl = imageUrl,
+                RefererUrl = refererUrl
+            });
+        }
+
+        return pages;
     }
 
     private async Task EnsureStoredSessionLoadedAsync(CancellationToken ct)
