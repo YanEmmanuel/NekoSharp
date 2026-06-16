@@ -81,6 +81,20 @@ public sealed class LittleTyrantScraperTests
     }
 
     [Fact]
+    public void CreateCanvasPlaceholderPages_CreatesRenderablePageEntries()
+    {
+        const string chapterUrl = "https://tiraninha.world/manga/teste/capitulo-71/";
+
+        var pages = LittleTyrantScraper.CreateCanvasPlaceholderPages(chapterUrl, 3);
+
+        Assert.Equal(3, pages.Count);
+        Assert.Equal(1, pages[0].Number);
+        Assert.Contains("#littletyrant-canvas-1", pages[0].ImageUrl);
+        Assert.Contains("#littletyrant-canvas-3", pages[2].ImageUrl);
+        Assert.All(pages, page => Assert.Equal(chapterUrl, page.RefererUrl));
+    }
+
+    [Fact]
     public void MergeCookieHeader_PreservesExistingProviderCookies()
     {
         var merged = LittleTyrantScraper.MergeCookieHeader(

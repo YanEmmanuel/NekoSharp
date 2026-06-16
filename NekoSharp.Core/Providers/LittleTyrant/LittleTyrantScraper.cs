@@ -15,9 +15,15 @@ using MangaPage = NekoSharp.Core.Models.Page;
 
 namespace NekoSharp.Core.Providers.LittleTyrant;
 
-public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvider, IAuthenticatedRequestProvider
+public sealed class LittleTyrantScraper :
+    HtmlScraperBase,
+    ICredentialAuthProvider,
+    IAuthenticatedRequestProvider,
+    IRenderedChapterDownloadProvider,
+    IRenderedPageFallbackProvider
 {
     private const string ProviderKey = "littletyrant";
+    private const string CanvasPageMarker = "#littletyrant-canvas-";
     private static readonly Uri SiteRootUri = new("https://tiraninha.world/");
     private static readonly Uri LoginUri = new("https://tiraninha.world/login/");
     private static readonly Uri UserSettingsUri = new("https://tiraninha.world/user-settings/");
@@ -283,6 +289,48 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
         await _cookieStore.RemoveAsync(ProviderKey, ct);
         await _credentialStore.RemoveLoginSecretAsync(ProviderKey, ct);
         ResetSessionHttpClient();
+    }
+
+    public bool ShouldUseRenderedPageFallback(string imageUrl)
+        => IsCanvasPageUrl(imageUrl);
+
+    public async Task<bool> TryWriteRenderedPageAsync(
+        string chapterUrl,
+        int pageNumber,
+        string imageUrl,
+        Stream destination,
+        CancellationToken ct = default)
+    {
+        if (!IsCanvasPageUrl(imageUrl) || pageNumber <= 0)
+            return false;
+
+        var rendered = await RenderCanvasPagesAsync(chapterUrl, [pageNumber], ct);
+        if (!rendered.TryGetValue(pageNumber, out var page) || page.Bytes.Length == 0)
+            return false;
+
+        await destination.WriteAsync(page.Bytes, ct);
+        return true;
+    }
+
+    public async Task<IReadOnlyDictionary<int, RenderedPageDownload>> TryRenderChapterPagesAsync(
+        Chapter chapter,
+        IReadOnlyList<MangaPage> pages,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(chapter);
+        ArgumentNullException.ThrowIfNull(pages);
+
+        var canvasPages = pages
+            .Where(static page => page.Number > 0 && IsCanvasPageUrl(page.ImageUrl))
+            .Select(static page => page.Number)
+            .Distinct()
+            .Order()
+            .ToArray();
+
+        if (canvasPages.Length == 0)
+            return new Dictionary<int, RenderedPageDownload>();
+
+        return await RenderCanvasPagesAsync(chapter.Url, canvasPages, ct);
     }
 
     public async Task ApplyRequestAuthenticationAsync(
@@ -875,7 +923,8 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
                     pages: Array.isArray(window.pages) ? window.pages : [],
                     images: Array.from(document.querySelectorAll("#secure-manga-reader img, .reading-content img, .page-break img, .manga-reading-content img"))
                         .map(img => img.currentSrc || img.src || img.getAttribute("data-src") || img.getAttribute("data-lazy-src") || "")
-                        .filter(Boolean)
+                        .filter(Boolean),
+                    canvasCount: document.querySelectorAll("#secure-manga-reader canvas.manga-page-canvas, #secure-manga-reader canvas").length
                 })
                 """);
 
@@ -914,12 +963,199 @@ public sealed class LittleTyrantScraper : HtmlScraperBase, ICredentialAuthProvid
                     }).ToList();
                 }
             }
+
+            if (root.TryGetProperty("canvasCount", out var canvasCountElement) &&
+                canvasCountElement.TryGetInt32(out var canvasCount) &&
+                canvasCount > 0)
+            {
+                return CreateCanvasPlaceholderPages(refererUrl, canvasCount);
+            }
         }
         catch
         {
         }
 
         return [];
+    }
+
+    internal static List<MangaPage> CreateCanvasPlaceholderPages(string chapterUrl, int canvasCount)
+    {
+        if (canvasCount <= 0)
+            return [];
+
+        return Enumerable.Range(1, canvasCount)
+            .Select(pageNumber => new MangaPage
+            {
+                Number = pageNumber,
+                ImageUrl = CreateCanvasPageUrl(chapterUrl, pageNumber),
+                RefererUrl = chapterUrl
+            })
+            .ToList();
+    }
+
+    private async Task<IReadOnlyDictionary<int, RenderedPageDownload>> RenderCanvasPagesAsync(
+        string chapterUrl,
+        IReadOnlyCollection<int> pageNumbers,
+        CancellationToken ct)
+    {
+        if (pageNumbers.Count == 0)
+            return new Dictionary<int, RenderedPageDownload>();
+
+        IBrowser? browser = null;
+        try
+        {
+            browser = await LaunchBrowserAsync(headless: true, ct);
+            await using var page = await browser.NewPageAsync();
+            await PrepareBrowserPageAsync(page);
+
+            await page.GoToAsync(chapterUrl, new NavigationOptions
+            {
+                WaitUntil = [WaitUntilNavigation.DOMContentLoaded],
+                Timeout = (int)TimeSpan.FromSeconds(45).TotalMilliseconds
+            });
+
+            await WaitForCanvasPagesAsync(page);
+
+            var rendered = new Dictionary<int, RenderedPageDownload>();
+            foreach (var pageNumber in pageNumbers.Order())
+            {
+                ct.ThrowIfCancellationRequested();
+
+                var dataUrl = await CaptureCanvasPageDataUrlAsync(page, pageNumber);
+                if (string.IsNullOrWhiteSpace(dataUrl))
+                {
+                    Log?.Warn($"[{Name}] Canvas {pageNumber} não retornou PNG renderizado.");
+                    continue;
+                }
+
+                try
+                {
+                    var bytes = DecodeDataUrlBytes(dataUrl);
+                    rendered[pageNumber] = new RenderedPageDownload(pageNumber, bytes, ".png");
+                }
+                catch (Exception ex)
+                {
+                    Log?.Warn($"[{Name}] Falha ao decodificar canvas {pageNumber}: {ex.Message}");
+                }
+            }
+
+            Log?.Info($"[{Name}] Capturados {rendered.Count}/{pageNumbers.Count} canvas(es) do capítulo via browser.");
+            return rendered;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log?.Warn($"[{Name}] Falha ao capturar canvases do capítulo ({chapterUrl}): {ex.Message}");
+            return new Dictionary<int, RenderedPageDownload>();
+        }
+        finally
+        {
+            if (browser is not null)
+                try { await browser.CloseAsync(); } catch { }
+        }
+    }
+
+    private async Task PrepareBrowserPageAsync(IPage page)
+    {
+        await page.EvaluateExpressionOnNewDocumentAsync(ConsoleSuppressionScript);
+
+        var cookies = CaptureCurrentCookies();
+        if (cookies.Count > 0)
+        {
+            var origin = SiteRootUri.GetLeftPart(UriPartial.Authority);
+            await page.SetCookieAsync(cookies
+                .Where(static kv => !string.IsNullOrWhiteSpace(kv.Key))
+                .Select(kv => new CookieParam
+                {
+                    Name = kv.Key,
+                    Value = kv.Value,
+                    Url = origin,
+                    Path = "/",
+                    Secure = true
+                }).ToArray());
+        }
+
+        var userAgent = _authHttp.DefaultRequestHeaders.UserAgent.ToString();
+        if (!string.IsNullOrWhiteSpace(userAgent))
+            await page.SetUserAgentAsync(userAgent);
+
+        await page.SetExtraHttpHeadersAsync(new Dictionary<string, string>
+        {
+            ["Referer"] = SiteRootUri.ToString(),
+            ["Accept-Language"] = "en-US,en;q=0.9"
+        });
+    }
+
+    private static async Task WaitForCanvasPagesAsync(IPage page)
+    {
+        await page.WaitForFunctionAsync(
+            """
+            () => {
+                const canvases = Array.from(document.querySelectorAll("#secure-manga-reader canvas.manga-page-canvas, #secure-manga-reader canvas"));
+                return canvases.some(canvas => canvas.width > 0 && canvas.height > 0);
+            }
+            """,
+            new WaitForFunctionOptions
+            {
+                Timeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds
+            });
+    }
+
+    private static async Task<string> CaptureCanvasPageDataUrlAsync(IPage page, int pageNumber)
+    {
+        return await page.EvaluateFunctionAsync<string>(
+            """
+            async pageNumber => {
+                const canvases = Array.from(document.querySelectorAll("#secure-manga-reader canvas.manga-page-canvas, #secure-manga-reader canvas"));
+                const canvas = canvases[pageNumber - 1];
+                if (!canvas || canvas.width <= 0 || canvas.height <= 0) return "";
+
+                canvas.scrollIntoView({ block: "center", inline: "nearest" });
+                await new Promise(requestAnimationFrame);
+                await new Promise(requestAnimationFrame);
+
+                return await new Promise(resolve => {
+                    try {
+                        canvas.toBlob(blob => {
+                            if (!blob) {
+                                resolve("");
+                                return;
+                            }
+
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(String(reader.result || ""));
+                            reader.onerror = () => resolve("");
+                            reader.readAsDataURL(blob);
+                        }, "image/png");
+                    } catch (e) {
+                        resolve("");
+                    }
+                });
+            }
+            """,
+            pageNumber);
+    }
+
+    private static byte[] DecodeDataUrlBytes(string dataUrl)
+    {
+        var commaIndex = dataUrl.IndexOf(',');
+        if (commaIndex < 0)
+            throw new FormatException("Data URL inválida.");
+
+        return Convert.FromBase64String(dataUrl[(commaIndex + 1)..]);
+    }
+
+    private static string CreateCanvasPageUrl(string chapterUrl, int pageNumber)
+    {
+        return $"{chapterUrl.TrimEnd('/')}/{CanvasPageMarker}{pageNumber}";
+    }
+
+    private static bool IsCanvasPageUrl(string imageUrl)
+    {
+        return imageUrl.Contains(CanvasPageMarker, StringComparison.Ordinal);
     }
 
     private static List<MangaPage> MapRuntimePageArray(JsonElement pagesElement, string refererUrl)
