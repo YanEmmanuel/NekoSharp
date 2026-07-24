@@ -10,12 +10,16 @@ namespace NekoSharp.Core.Providers.fbsquadx;
 
 public sealed class fbsquadxScraper : IScraper
 {
+    private static readonly SemaphoreSlim RequestGate = new(1, 1);
+    private static DateTimeOffset _nextRequestUtc = DateTimeOffset.MinValue;
+
     public string Name => "fbsquadx";
     public string BaseUrl => "https://fbsquadx.com";
 
     private readonly HttpClient _http;
     private readonly IBrowsingContext _browser;
     private readonly LogService? _log;
+    private readonly bool _rateLimit;
 
     public fbsquadxScraper() : this(null, null, null) { }
     public fbsquadxScraper(LogService? logService) : this(logService, null, null) { }
@@ -24,19 +28,34 @@ public sealed class fbsquadxScraper : IScraper
     public fbsquadxScraper(IBrowsingContext browser) : this(null, null, browser) { }
     public fbsquadxScraper(LogService? logService, IBrowsingContext browser) : this(logService, null, browser) { }
 
+    internal fbsquadxScraper(HttpMessageHandler handler)
+        : this(null, null, null, handler, rateLimit: false) { }
+
     private fbsquadxScraper(LogService? logService, CloudflareCredentialStore? cfStore, IBrowsingContext? browser)
+        : this(logService, cfStore, browser, null, rateLimit: true) { }
+
+    private fbsquadxScraper(
+        LogService? logService,
+        CloudflareCredentialStore? cfStore,
+        IBrowsingContext? browser,
+        HttpMessageHandler? handler,
+        bool rateLimit)
     {
         _log = logService;
         _browser = browser ?? BrowsingContext.New(Configuration.Default);
+        _rateLimit = rateLimit;
 
-        HttpMessageHandler inner = new CloudflareHandler(
-            inner: new HttpClientHandler(),
-            logService: logService,
-            store: cfStore);
+        if (handler is null)
+        {
+            HttpMessageHandler inner = new CloudflareHandler(
+                inner: new HttpClientHandler(),
+                logService: logService,
+                store: cfStore);
 
-        HttpMessageHandler handler = logService != null
-            ? new LoggingHttpHandler(logService, inner)
-            : inner;
+            handler = logService != null
+                ? new LoggingHttpHandler(logService, inner)
+                : inner;
+        }
 
         _http = new HttpClient(handler);
         _http.BaseAddress = new Uri("https://fbsquadx.com/");
@@ -48,7 +67,8 @@ public sealed class fbsquadxScraper : IScraper
 
     public bool CanHandle(string url)
     {
-        return url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
+        return !string.IsNullOrWhiteSpace(url) &&
+               url.StartsWith(BaseUrl, StringComparison.OrdinalIgnoreCase);
     }
 
     public async Task<Manga> GetMangaInfoAsync(string url, CancellationToken ct = default)
@@ -56,7 +76,7 @@ public sealed class fbsquadxScraper : IScraper
         if (string.IsNullOrWhiteSpace(url))
             throw new ArgumentException("URL invalida do fbsquadx.", nameof(url));
 
-        var html = await _http.GetStringAsync(url, ct);
+        var html = await GetHtmlAsync(url, ct);
         var doc = await _browser.OpenAsync(req => req.Content(html).Address(url), ct);
 
         var coverImg = doc.QuerySelector<IHtmlImageElement>("div.summary_image img");
@@ -87,17 +107,32 @@ public sealed class fbsquadxScraper : IScraper
 
     public async Task<List<Chapter>> GetChaptersAsync(string url, CancellationToken ct = default)
     {
-        var response = await _http.GetStringAsync(url, ct);
+        var response = await GetHtmlAsync(url, ct);
         var doc = await _browser.OpenAsync(req => req.Content(response).Address(url), ct);
-
-        var chapters = new List<Chapter>();
 
         var chapterLinks = doc.QuerySelectorAll("li.wp-manga-chapter > a, li.wp-manga-chapter a")
             .OfType<IElement>()
             .DistinctBy(link => link.GetAttribute("href") ?? string.Empty)
             .ToList();
 
+        if (chapterLinks.Count == 0 && doc.QuerySelector("div[id^='manga-chapters-holder']") is not null)
+        {
+            var endpoint = $"{url.TrimEnd('/')}/ajax/chapters";
+            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint);
+            request.Headers.Referrer = new Uri(url);
+            request.Headers.Add("X-Requested-With", "XMLHttpRequest");
+
+            response = await SendForHtmlAsync(request, ct);
+            doc = await _browser.OpenAsync(req => req.Content(response).Address(endpoint), ct);
+            chapterLinks = doc.QuerySelectorAll("li.wp-manga-chapter > a, li.wp-manga-chapter a")
+                .OfType<IElement>()
+                .DistinctBy(link => link.GetAttribute("href") ?? string.Empty)
+                .ToList();
+        }
+
         _log?.Debug($"[{Name}] Chapter selector matched {chapterLinks.Count} nodes for {url}");
+
+        var chapters = new List<Chapter>(chapterLinks.Count);
 
         foreach (var link in chapterLinks)
         {
@@ -113,7 +148,9 @@ public sealed class fbsquadxScraper : IScraper
             if (Uri.TryCreate(urlChapter, UriKind.Relative, out var relative))
                 urlChapter = new Uri(_http.BaseAddress!, relative).ToString();
 
-             
+            if (!urlChapter.Contains("style=list", StringComparison.OrdinalIgnoreCase))
+                urlChapter += urlChapter.Contains('?') ? "&style=list" : "?style=list";
+
             var title = rawTitle.Contains(" - ")
                 ? rawTitle.Split(" - ", 2)[1].Trim()
                 : rawTitle;
@@ -143,9 +180,7 @@ public sealed class fbsquadxScraper : IScraper
         req.Headers.Referrer = new Uri(chapter.Url);
         req.Headers.UserAgent.ParseAdd("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
 
-        using var res = await _http.SendAsync(req, ct);
-        res.EnsureSuccessStatusCode();
-        var html = await res.Content.ReadAsStringAsync(ct);
+        var html = await SendForHtmlAsync(req, ct);
 
         var doc = await _browser.OpenAsync(r => r.Content(html).Address(chapter.Url), ct);
 
@@ -172,10 +207,48 @@ public sealed class fbsquadxScraper : IScraper
             pages.Add(new Page
             {
                 Number = index++,
-                ImageUrl = src
+                ImageUrl = src,
+                RefererUrl = chapter.Url
             });
         }
 
         return pages;
+    }
+
+    private async Task<string> GetHtmlAsync(string url, CancellationToken ct)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        return await SendForHtmlAsync(request, ct);
+    }
+
+    private async Task<string> SendForHtmlAsync(HttpRequestMessage request, CancellationToken ct)
+    {
+        if (_rateLimit)
+            await WaitForRequestSlotAsync(ct);
+
+        using var response = await _http.SendAsync(request, ct);
+
+        if (response.RequestMessage?.RequestUri?.AbsolutePath.Contains("wp-login.php", StringComparison.OrdinalIgnoreCase) == true)
+            throw new IOException("É necessário realizar o login via WebView para acessar a fonte.");
+
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadAsStringAsync(ct);
+    }
+
+    private static async Task WaitForRequestSlotAsync(CancellationToken ct)
+    {
+        await RequestGate.WaitAsync(ct);
+        try
+        {
+            var delay = _nextRequestUtc - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero)
+                await Task.Delay(delay, ct);
+
+            _nextRequestUtc = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(2);
+        }
+        finally
+        {
+            RequestGate.Release();
+        }
     }
 }
