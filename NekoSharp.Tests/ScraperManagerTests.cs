@@ -13,20 +13,20 @@ public class ScraperManagerTests
 
         manager.DiscoverAndRegisterAll();
 
-        var scraper = manager.GetScraperForUrl("https://flowermanga.org/manga/please-bully-me-miss-villainess/");
+        var scraper = manager.GetScraperForUrl("https://flowermangas.net/manga/please-bully-me-miss-villainess/");
 
         Assert.NotNull(scraper);
         Assert.Equal("FlowerManga.net", scraper.Name);
     }
 
     [Fact]
-    public void DiscoverAndRegisterAll_WithDynamicProvidersPackage_RegistersFlowerMangaDotNetOrg()
+    public void DiscoverAndRegisterAll_WithDynamicProvidersPackage_RegistersFlowerMangaDotNet()
     {
         var manager = new ScraperManager();
 
         manager.DiscoverAndRegisterAll(externalAssemblyPaths: [FindDynamicProvidersPackage()]);
 
-        var scraper = manager.GetScraperForUrl("https://flowermanga.org/manga/please-bully-me-miss-villainess/");
+        var scraper = manager.GetScraperForUrl("https://flowermangas.net/manga/please-bully-me-miss-villainess/");
 
         Assert.NotNull(scraper);
         Assert.Equal("FlowerManga.net", scraper.Name);
