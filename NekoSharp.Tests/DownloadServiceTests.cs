@@ -123,19 +123,14 @@ public class DownloadServiceTests
     }
 
     [Fact]
-    public async Task DownloadChapterAsync_WhenTransientFailuresExceedRetrySchedule_KeepsRetrying()
+    public async Task DownloadChapterAsync_WhenTransientFailuresExceedRetrySchedule_StopsAfterFourAttempts()
     {
         var handler = new TrackingHttpMessageHandler((_, attempt, _) =>
         {
-            if (attempt <= 4)
-            {
-                throw new HttpRequestException(
-                    "servidor temporariamente indisponível",
-                    null,
-                    HttpStatusCode.ServiceUnavailable);
-            }
-
-            return Task.FromResult(CreateImageResponse());
+            throw new HttpRequestException(
+                "servidor temporariamente indisponível",
+                null,
+                HttpStatusCode.ServiceUnavailable);
         });
 
         using var httpClient = new HttpClient(handler)
@@ -145,7 +140,12 @@ public class DownloadServiceTests
 
         var service = CreateService(
             httpClient,
-            attemptTimeouts: [TimeSpan.FromMilliseconds(200)],
+            attemptTimeouts: [
+                TimeSpan.FromMilliseconds(200),
+                TimeSpan.FromMilliseconds(200),
+                TimeSpan.FromMilliseconds(200),
+                TimeSpan.FromMilliseconds(200)
+            ],
             retryDelays: [TimeSpan.FromMilliseconds(10)]);
 
         var manga = CreateManga();
@@ -154,10 +154,10 @@ public class DownloadServiceTests
 
         try
         {
-            await service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages);
+            await Assert.ThrowsAsync<HttpRequestException>(() =>
+                service.DownloadChapterAsync(manga, chapter, outputDirectory, DownloadFormat.FolderImages));
 
-            Assert.Equal(5, handler.GetAttempts(chapter.Pages[0].ImageUrl));
-            Assert.True(File.Exists(chapter.Pages[0].LocalPath));
+            Assert.Equal(4, handler.GetAttempts(chapter.Pages[0].ImageUrl));
         }
         finally
         {

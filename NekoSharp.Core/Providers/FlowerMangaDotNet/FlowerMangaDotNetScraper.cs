@@ -13,6 +13,6 @@ public sealed class FlowerMangaDotNetScraper : WordPressMadaraScraper
     public FlowerMangaDotNetScraper(LogService? logService) : this(logService, null) { }
 
     public FlowerMangaDotNetScraper(LogService? logService, CloudflareCredentialStore? cfStore)
-        : base("https://flowermangas.net", logService, cfStore)
+        : base("https://flowermanga.org", logService, cfStore)
     { }
 }

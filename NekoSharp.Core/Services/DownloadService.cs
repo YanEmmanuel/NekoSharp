@@ -608,6 +608,9 @@ public class DownloadService : IDownloadService
                     $"Tempo esgotado ao baixar {currentUrl} na tentativa {attemptNumber}.",
                     ex);
 
+                if (attemptNumber >= _attemptTimeouts.Length)
+                    throw timeoutException;
+
                 currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
                 var cooldown = hostThrottle.ReportFailure(timeoutLike: true);
                 await PauseAndRetryAsync(currentUrl, attemptNumber, cooldown, timeout, timeoutException, ct);
@@ -615,6 +618,10 @@ public class DownloadService : IDownloadService
             catch (Exception ex) when (IsTransientDownloadException(ex))
             {
                 TryDeleteFile(partialFilePath);
+
+                if (attemptNumber >= _attemptTimeouts.Length)
+                    throw;
+
                 currentUrl = await TryRefreshTransientDownloadUrlAsync(currentUrl, referer, ct);
 
                 var timeoutLike = ex is TimeoutException ||
